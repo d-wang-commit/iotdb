@@ -27,6 +27,7 @@ import org.apache.iotdb.commons.enums.HandleSystemErrorStrategy;
 import org.apache.iotdb.commons.enums.PipeRateAverage;
 import org.apache.iotdb.commons.i18n.ConfigMessages;
 import org.apache.iotdb.commons.pipe.config.PipeConfig;
+import org.apache.iotdb.commons.queryengine.utils.DateTimeUtils;
 import org.apache.iotdb.commons.utils.FileUtils;
 import org.apache.iotdb.commons.utils.KillPoint.KillPoint;
 import org.apache.iotdb.rpc.RpcUtils;
@@ -44,6 +45,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 
 import static org.apache.iotdb.commons.conf.IoTDBConstant.KB;
@@ -171,15 +173,20 @@ public class CommonConfig {
   private HandleSystemErrorStrategy handleSystemErrorStrategy =
       HandleSystemErrorStrategy.CHANGE_TO_READ_ONLY;
 
-  /** Status of current system. */
-  private volatile NodeStatus status = NodeStatus.Running;
+  /** Status and reason of the current system, published as one atomic snapshot. */
+  private final AtomicReference<NodeStatusSnapshot> nodeStatusSnapshot =
+      new AtomicReference<>(new NodeStatusSnapshot(NodeStatus.Running, null));
+
+  /**
+   * Maximum length of the error message embedded in the UnrecoverableError status reason, keeping
+   * the reason bounded in heartbeats and SHOW results.
+   */
+  private static final int MAX_STATUS_REASON_LENGTH = 256;
 
   private NodeStatus lastStatus = NodeStatus.Unknown;
   private String lastStatusReason = "";
 
   private volatile boolean isStopping = false;
-
-  private volatile String statusReason = null;
 
   private final int TTimePartitionSlotTransmitLimit = 1000;
 
@@ -791,8 +798,30 @@ public class CommonConfig {
     this.handleSystemErrorStrategy = handleSystemErrorStrategy;
   }
 
-  public void handleUnrecoverableError() {
-    handleSystemErrorStrategy.handle();
+  /**
+   * Handles an unrecoverable error with the given exception. The ReadOnly status reason is
+   * assembled here so that all call sites share one format: "UnrecoverableError, <timestamp>,
+   * <error message>". The error message is truncated to {@link #MAX_STATUS_REASON_LENGTH}
+   * characters so that the reason published in heartbeats and SHOW results stays bounded.
+   */
+  public void handleUnrecoverableError(Throwable e) {
+    String errorMessage =
+        e.getMessage() == null || e.getMessage().isEmpty()
+            ? e.getClass().getSimpleName()
+            : e.getMessage();
+    if (errorMessage.length() > MAX_STATUS_REASON_LENGTH) {
+      errorMessage = errorMessage.substring(0, MAX_STATUS_REASON_LENGTH) + "...";
+    }
+    handleUnrecoverableError(
+        NodeStatus.UNRECOVERABLE_ERROR
+            + ", "
+            + DateTimeUtils.convertLongToDate(System.currentTimeMillis(), "ms")
+            + ", "
+            + errorMessage);
+  }
+
+  public void handleUnrecoverableError(String errorReason) {
+    handleSystemErrorStrategy.handle(errorReason);
   }
 
   public double getDiskSpaceWarningThreshold() {
@@ -824,26 +853,63 @@ public class CommonConfig {
   }
 
   public boolean isReadOnly() {
-    return status == NodeStatus.ReadOnly;
+    return nodeStatusSnapshot.get().status() == NodeStatus.ReadOnly;
   }
 
   public boolean isRunning() {
-    return status == NodeStatus.Running;
+    return nodeStatusSnapshot.get().status() == NodeStatus.Running;
   }
 
   public NodeStatus getNodeStatus() {
-    return status;
+    return nodeStatusSnapshot.get().status();
   }
 
-  public synchronized void setNodeStatus(NodeStatus newStatus) {
-    if (status == newStatus) {
+  /**
+   * Returns the current node status and its reason from one immutable snapshot.
+   *
+   * <p>Callers that need both values should use this method instead of reading them separately.
+   */
+  public NodeStatusSnapshot getNodeStatusSnapshot() {
+    return nodeStatusSnapshot.get();
+  }
+
+  /**
+   * Sets the node status, clearing the status reason. A write of the same status keeps the current
+   * snapshot unchanged, so an existing reason (e.g. ReadOnly + DiskFull) is preserved.
+   */
+  public void setNodeStatus(NodeStatus newStatus) {
+    setNodeStatusWithReason(newStatus, null);
+  }
+
+  /**
+   * Atomically updates the node status and reason. For ReadOnly the write is priority-guarded by
+   * {@link #setReadOnlyWithReason}. The status reason is only meaningful for ReadOnly: avoid
+   * passing a non-null reason together with another status (it would be displayed as e.g.
+   * Running(reason) in SHOW CLUSTER, and no production code does this) — the value is still written
+   * through for generality.
+   */
+  public void setNodeStatusWithReason(NodeStatus newStatus, String newReason) {
+    if (newStatus == NodeStatus.ReadOnly) {
+      setReadOnlyWithReason(newReason);
       return;
     }
+    while (true) {
+      NodeStatusSnapshot current = nodeStatusSnapshot.get();
+      if (current.status() == newStatus && Objects.equals(current.reason(), newReason)) {
+        return;
+      }
+      if (nodeStatusSnapshot.compareAndSet(current, new NodeStatusSnapshot(newStatus, newReason))) {
+        logNodeStatusChange(current.status(), newStatus);
+        return;
+      }
+    }
+  }
 
-    logger.info(ConfigMessages.SET_SYSTEM_MODE, status, newStatus);
-    this.status = newStatus;
-    this.statusReason = null;
-
+  private void logNodeStatusChange(NodeStatus oldStatus, NodeStatus newStatus) {
+    if (oldStatus == newStatus) {
+      return;
+    }
+    logger.info(ConfigMessages.SET_SYSTEM_MODE, oldStatus, newStatus);
     switch (newStatus) {
       case ReadOnly:
         logger.warn(ConfigMessages.STATUS_CHANGE_TO_READ_ONLY);
@@ -856,13 +922,71 @@ public class CommonConfig {
     }
   }
 
-  public String getStatusReason() {
-    return statusReason;
+  /**
+   * Sets the node status to ReadOnly with the given reason, respecting reason priority: Stopping >
+   * Manual > UnrecoverableError > DiskFull. If a ReadOnly reason with equal or higher priority is
+   * already set, this call is a no-op (in particular, an UnrecoverableError keeps the first reason
+   * that was set). Non-ReadOnly statuses are always overridden. A null reason is treated as the
+   * legacy/unclassified ReadOnly with the lowest priority: it can only enter from a non-ReadOnly
+   * status and can never override a classified reason.
+   */
+  private void setReadOnlyWithReason(String reason) {
+    int newPriority = getReadOnlyReasonPriority(reason);
+    while (true) {
+      NodeStatusSnapshot current = nodeStatusSnapshot.get();
+      if (current.status() == NodeStatus.ReadOnly
+          && getReadOnlyReasonPriority(current.reason()) >= newPriority) {
+        return;
+      }
+      NodeStatusSnapshot updated = new NodeStatusSnapshot(NodeStatus.ReadOnly, reason);
+      if (nodeStatusSnapshot.compareAndSet(current, updated)) {
+        logNodeStatusChange(current.status(), NodeStatus.ReadOnly);
+        return;
+      }
+    }
   }
 
-  public void setStatusReason(String statusReason) {
-    this.statusReason = statusReason;
+  /**
+   * Priority of ReadOnly reasons. Higher wins. Unknown reasons and null are treated as the lowest
+   * priority so that classified reasons can always override legacy/unknown ones.
+   */
+  private static int getReadOnlyReasonPriority(String reason) {
+    if (reason == null) {
+      return 0;
+    }
+    if (reason.startsWith(NodeStatus.UNRECOVERABLE_ERROR)) {
+      return 2;
+    }
+    switch (reason) {
+      case NodeStatus.STOPPING:
+        return 4;
+      case NodeStatus.MANUAL:
+        return 3;
+      case NodeStatus.DISK_FULL:
+        return 1;
+      default:
+        return 0;
+    }
   }
+
+  public String getStatusReason() {
+    return nodeStatusSnapshot.get().reason();
+  }
+
+  /** Atomically replaces the node status when the expected snapshot is still current. */
+  public boolean compareAndSetNodeStatus(
+      NodeStatusSnapshot expectedSnapshot, NodeStatusSnapshot newSnapshot) {
+    if (!nodeStatusSnapshot.compareAndSet(expectedSnapshot, newSnapshot)) {
+      return false;
+    }
+    if (expectedSnapshot.status() != newSnapshot.status()) {
+      logger.info(ConfigMessages.SET_SYSTEM_MODE, expectedSnapshot.status(), newSnapshot.status());
+    }
+    return true;
+  }
+
+  /** Immutable pair of node status and status reason. */
+  public record NodeStatusSnapshot(NodeStatus status, String reason) {}
 
   public int getTTimePartitionSlotTransmitLimit() {
     return TTimePartitionSlotTransmitLimit;

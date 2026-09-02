@@ -64,18 +64,38 @@ public class IoTDBSetSystemStatusTableIT {
               () -> {
                 ResultSet resultSet = statement.executeQuery("SHOW DATANODES");
                 int num = 0;
+                int manualReasonNum = 0;
                 try {
                   while (resultSet.next()) {
                     String status = resultSet.getString("Status");
                     if (status.equals("ReadOnly")) {
                       num++;
                     }
+                    // The ReadOnly requested through SQL is reported with the Manual reason.
+                    if ("Manual".equals(resultSet.getString("StatusReason"))) {
+                      manualReasonNum++;
+                    }
                   }
                 } catch (InconsistentDataException e) {
                   return false;
                 }
-                return num == EnvFactory.getEnv().getDataNodeWrapperList().size();
+                return num == EnvFactory.getEnv().getDataNodeWrapperList().size()
+                    && manualReasonNum == EnvFactory.getEnv().getDataNodeWrapperList().size();
               });
+
+      // The table-model NODES view shows the plain status: ReadOnly without a merged reason
+      // string such as "ReadOnly(Manual)".
+      try (ResultSet nodesResultSet =
+          statement.executeQuery("select * from information_schema.nodes")) {
+        int dataNodeNum = 0;
+        while (nodesResultSet.next()) {
+          if ("DataNode".equals(nodesResultSet.getString("node_type"))) {
+            dataNodeNum++;
+            Assert.assertEquals("ReadOnly", nodesResultSet.getString("status"));
+          }
+        }
+        Assert.assertEquals(EnvFactory.getEnv().getDataNodeWrapperList().size(), dataNodeNum);
+      }
 
       statement.execute("SET SYSTEM TO RUNNING ON CLUSTER");
       Awaitility.await()
