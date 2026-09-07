@@ -252,7 +252,8 @@ public class SessionPoolIT {
       node.stop();
       EnvFactory.getEnv()
           .ensureNodeStatus(
-              Collections.singletonList(node), Collections.singletonList(NodeStatus.Unknown));
+              // A gracefully stopped DataNode is reported as Stopped by its shutdown hook
+              Collections.singletonList(node), Collections.singletonList(NodeStatus.Stopped));
       // user does not know what happens.
       while (wrapper.hasNext()) {
         wrapper.next();
@@ -263,7 +264,8 @@ public class SessionPoolIT {
       node.stop();
       EnvFactory.getEnv()
           .ensureNodeStatus(
-              Collections.singletonList(node), Collections.singletonList(NodeStatus.Unknown));
+              // A gracefully stopped DataNode is reported as Stopped by its shutdown hook
+              Collections.singletonList(node), Collections.singletonList(NodeStatus.Stopped));
       node.start();
       EnvFactory.getEnv()
           .ensureNodeStatus(
@@ -289,7 +291,8 @@ public class SessionPoolIT {
         node.stop();
         EnvFactory.getEnv()
             .ensureNodeStatus(
-                Collections.singletonList(node), Collections.singletonList(NodeStatus.Unknown));
+                // A gracefully stopped DataNode is reported as Stopped by its shutdown hook
+                Collections.singletonList(node), Collections.singletonList(NodeStatus.Stopped));
         node.start();
         EnvFactory.getEnv()
             .ensureNodeStatus(
@@ -345,7 +348,8 @@ public class SessionPoolIT {
     node.stop();
     EnvFactory.getEnv()
         .ensureNodeStatus(
-            Collections.singletonList(node), Collections.singletonList(NodeStatus.Unknown));
+            // A gracefully stopped DataNode is reported as Stopped by its shutdown hook
+            Collections.singletonList(node), Collections.singletonList(NodeStatus.Stopped));
     pool = EnvFactory.getEnv().getSessionPool(1);
     // all this ten data will fail.
     write10Data(pool, false);

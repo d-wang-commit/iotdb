@@ -33,7 +33,10 @@ public enum NodeStatus {
   Removing("Removing"),
 
   /** Only query statements are permitted */
-  ReadOnly("ReadOnly");
+  ReadOnly("ReadOnly"),
+
+  /** Node was stopped intentionally and reported its shutdown */
+  Stopped("Stopped");
 
   /**
    * Reasons for entering ReadOnly. These strings cross node RPCs and are compared literally (e.g.
@@ -77,6 +80,7 @@ public enum NodeStatus {
       case ReadOnly:
         return true;
       case Unknown:
+      case Stopped:
         return false;
       default:
         throw new UnsupportedOperationException(

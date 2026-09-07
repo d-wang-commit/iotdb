@@ -104,7 +104,7 @@ public class IoTDBAutoRegionGroupExtension2IT {
       EnvFactory.getEnv()
           .ensureNodeStatus(
               Collections.singletonList(EnvFactory.getEnv().getDataNodeWrapper(1)),
-              Collections.singletonList(NodeStatus.Unknown));
+              Collections.singletonList(NodeStatus.Stopped));
 
       // Create 3 DataPartitions to extend 3 DataRegionGroups
       for (int i = 0; i < testMinDataRegionGroupNum; i++) {
