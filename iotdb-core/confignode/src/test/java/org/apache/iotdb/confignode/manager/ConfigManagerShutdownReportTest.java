@@ -86,6 +86,9 @@ public class ConfigManagerShutdownReportTest {
     // The shared LoadManager mock keeps interactions from previous tests; the never() checks
     // below must only consider the current test.
     clearInvocations(LOAD_MANAGER);
+    when(LOAD_MANAGER.forceUpdateNodeCache(
+            any(NodeType.class), anyInt(), any(NodeHeartbeatSample.class)))
+        .thenReturn(SUCCESS_STATUS);
   }
 
   @Test
@@ -141,5 +144,27 @@ public class ConfigManagerShutdownReportTest {
             eq(NodeType.ConfigNode),
             eq(CONFIG_NODE_ID),
             argThat(sample -> sample.getStatus() == NodeStatus.Stopped));
+  }
+
+  @Test
+  public void testReportDataNodeShutdownPropagatesPersistenceFailure() {
+    when(LOAD_MANAGER.getNodeStatus(DATA_NODE_ID)).thenReturn(NodeStatus.Running);
+    TSStatus failure = RpcUtils.getStatus(TSStatusCode.EXECUTE_STATEMENT_ERROR);
+    when(LOAD_MANAGER.forceUpdateNodeCache(
+            eq(NodeType.DataNode), eq(DATA_NODE_ID), any(NodeHeartbeatSample.class)))
+        .thenReturn(failure);
+
+    Assert.assertSame(failure, CONFIG_MANAGER_SPY.reportDataNodeShutdown(DATA_NODE_LOCATION));
+  }
+
+  @Test
+  public void testReportConfigNodeShutdownPropagatesPersistenceFailure() {
+    when(LOAD_MANAGER.getNodeStatus(CONFIG_NODE_ID)).thenReturn(NodeStatus.Running);
+    TSStatus failure = RpcUtils.getStatus(TSStatusCode.EXECUTE_STATEMENT_ERROR);
+    when(LOAD_MANAGER.forceUpdateNodeCache(
+            eq(NodeType.ConfigNode), eq(CONFIG_NODE_ID), any(NodeHeartbeatSample.class)))
+        .thenReturn(failure);
+
+    Assert.assertSame(failure, CONFIG_MANAGER_SPY.reportConfigNodeShutdown(CONFIG_NODE_LOCATION));
   }
 }

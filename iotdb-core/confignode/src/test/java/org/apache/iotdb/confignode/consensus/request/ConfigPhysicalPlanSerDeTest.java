@@ -35,6 +35,7 @@ import org.apache.iotdb.common.rpc.thrift.TThrottleQuota;
 import org.apache.iotdb.common.rpc.thrift.TTimePartitionSlot;
 import org.apache.iotdb.common.rpc.thrift.TTimedQuota;
 import org.apache.iotdb.common.rpc.thrift.ThrottleType;
+import org.apache.iotdb.commons.cluster.NodeStatus;
 import org.apache.iotdb.commons.consensus.index.impl.IoTProgressIndex;
 import org.apache.iotdb.commons.consensus.index.impl.MinimumProgressIndex;
 import org.apache.iotdb.commons.exception.IllegalPathException;
@@ -73,6 +74,7 @@ import org.apache.iotdb.confignode.consensus.request.write.auth.AuthorTreePlan;
 import org.apache.iotdb.confignode.consensus.request.write.confignode.ApplyConfigNodePlan;
 import org.apache.iotdb.confignode.consensus.request.write.confignode.RemoveConfigNodePlan;
 import org.apache.iotdb.confignode.consensus.request.write.confignode.UpdateClusterIdPlan;
+import org.apache.iotdb.confignode.consensus.request.write.confignode.UpdateNodeStatusPlan;
 import org.apache.iotdb.confignode.consensus.request.write.cq.ActiveCQPlan;
 import org.apache.iotdb.confignode.consensus.request.write.cq.AddCQPlan;
 import org.apache.iotdb.confignode.consensus.request.write.cq.DropCQPlan;
@@ -214,6 +216,22 @@ import static org.apache.iotdb.common.rpc.thrift.TConsensusGroupType.SchemaRegio
 import static org.junit.Assert.assertEquals;
 
 public class ConfigPhysicalPlanSerDeTest {
+
+  @Test
+  public void testUpdateNodeStatusPlan() throws IOException {
+    for (NodeStatus status : NodeStatus.values()) {
+      for (NodeStatus statusToClear : new NodeStatus[] {NodeStatus.Stopped, NodeStatus.Removing}) {
+        UpdateNodeStatusPlan original = new UpdateNodeStatusPlan(37, status, statusToClear);
+        UpdateNodeStatusPlan restored =
+            (UpdateNodeStatusPlan)
+                ConfigPhysicalPlan.Factory.create(original.serializeToByteBuffer());
+        Assert.assertEquals(original, restored);
+        Assert.assertEquals(37, restored.getNodeId());
+        Assert.assertEquals(status, restored.getStatus());
+        Assert.assertEquals(statusToClear, restored.getStatusToClear());
+      }
+    }
+  }
 
   @Test
   public void RegisterDataNodePlanTest() throws IOException {
