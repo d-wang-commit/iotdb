@@ -24,9 +24,7 @@ import org.apache.iotdb.common.rpc.thrift.TDataNodeLocation;
 import org.apache.iotdb.common.rpc.thrift.TEndPoint;
 import org.apache.iotdb.common.rpc.thrift.TSStatus;
 import org.apache.iotdb.commons.cluster.NodeStatus;
-import org.apache.iotdb.commons.cluster.NodeType;
 import org.apache.iotdb.confignode.manager.load.LoadManager;
-import org.apache.iotdb.confignode.manager.load.cache.node.NodeHeartbeatSample;
 import org.apache.iotdb.rpc.RpcUtils;
 import org.apache.iotdb.rpc.TSStatusCode;
 
@@ -39,13 +37,12 @@ import java.io.IOException;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -83,63 +80,82 @@ public class ConfigManagerShutdownReportTest {
 
   @Before
   public void clearPreviousInteractions() {
-    // The shared LoadManager mock keeps interactions from previous tests; the never() checks
-    // below must only consider the current test.
+    // The shared LoadManager mock keeps interactions from previous tests; verification must only
+    // consider calls from the current test.
     clearInvocations(LOAD_MANAGER);
+    when(LOAD_MANAGER.updateNodeStatus(anyInt(), any(NodeStatus.class), eq(false)))
+        .thenReturn(SUCCESS_STATUS);
   }
 
   @Test
-  public void testReportDataNodeShutdownSkipsRemovingDataNode() {
+  public void testReportDataNodeShutdownUpdatesRemovingDataNodeThroughCache() {
     when(LOAD_MANAGER.getNodeStatus(DATA_NODE_ID)).thenReturn(NodeStatus.Removing);
 
     Assert.assertEquals(
         SUCCESS_STATUS.getCode(),
         CONFIG_MANAGER_SPY.reportDataNodeShutdown(DATA_NODE_LOCATION).getCode());
 
-    // Removing has the highest priority: the Stopped report must not overwrite it.
-    verify(LOAD_MANAGER, never())
-        .forceUpdateNodeCache(any(NodeType.class), anyInt(), any(NodeHeartbeatSample.class));
+    verify(LOAD_MANAGER).updateNodeStatus(eq(DATA_NODE_ID), eq(NodeStatus.Stopped), eq(false));
   }
 
   @Test
-  public void testReportDataNodeShutdownMarksRunningDataNodeStopped() {
-    when(LOAD_MANAGER.getNodeStatus(DATA_NODE_ID)).thenReturn(NodeStatus.Running);
+  public void testReportDataNodeShutdownRequestsStoppedStatus() {
+    when(LOAD_MANAGER.getNodeStatus(DATA_NODE_ID)).thenReturn(NodeStatus.Stopped);
 
     Assert.assertEquals(
         SUCCESS_STATUS.getCode(),
         CONFIG_MANAGER_SPY.reportDataNodeShutdown(DATA_NODE_LOCATION).getCode());
 
-    verify(LOAD_MANAGER)
-        .forceUpdateNodeCache(
-            eq(NodeType.DataNode),
-            eq(DATA_NODE_ID),
-            argThat(sample -> sample.getStatus() == NodeStatus.Stopped));
+    verify(LOAD_MANAGER).updateNodeStatus(eq(DATA_NODE_ID), eq(NodeStatus.Stopped), eq(false));
   }
 
   @Test
-  public void testReportConfigNodeShutdownSkipsRemovingConfigNode() {
+  public void testReportConfigNodeShutdownUpdatesRemovingConfigNodeThroughCache() {
     when(LOAD_MANAGER.getNodeStatus(CONFIG_NODE_ID)).thenReturn(NodeStatus.Removing);
 
     Assert.assertEquals(
         SUCCESS_STATUS.getCode(),
         CONFIG_MANAGER_SPY.reportConfigNodeShutdown(CONFIG_NODE_LOCATION).getCode());
 
-    verify(LOAD_MANAGER, never())
-        .forceUpdateNodeCache(any(NodeType.class), anyInt(), any(NodeHeartbeatSample.class));
+    verify(LOAD_MANAGER).updateNodeStatus(eq(CONFIG_NODE_ID), eq(NodeStatus.Stopped), eq(false));
   }
 
   @Test
-  public void testReportConfigNodeShutdownMarksRunningConfigNodeStopped() {
-    when(LOAD_MANAGER.getNodeStatus(CONFIG_NODE_ID)).thenReturn(NodeStatus.Running);
+  public void testReportConfigNodeShutdownRequestsStoppedStatus() {
+    when(LOAD_MANAGER.getNodeStatus(CONFIG_NODE_ID)).thenReturn(NodeStatus.Stopped);
 
     Assert.assertEquals(
         SUCCESS_STATUS.getCode(),
         CONFIG_MANAGER_SPY.reportConfigNodeShutdown(CONFIG_NODE_LOCATION).getCode());
 
-    verify(LOAD_MANAGER)
-        .forceUpdateNodeCache(
-            eq(NodeType.ConfigNode),
-            eq(CONFIG_NODE_ID),
-            argThat(sample -> sample.getStatus() == NodeStatus.Stopped));
+    verify(LOAD_MANAGER).updateNodeStatus(eq(CONFIG_NODE_ID), eq(NodeStatus.Stopped), eq(false));
+  }
+
+  @Test
+  public void testReportDataNodeShutdownPropagatesPersistenceFailure() {
+    TSStatus failure = RpcUtils.getStatus(TSStatusCode.EXECUTE_STATEMENT_ERROR);
+    when(LOAD_MANAGER.updateNodeStatus(eq(DATA_NODE_ID), eq(NodeStatus.Stopped), eq(false)))
+        .thenReturn(failure);
+
+    for (NodeStatus currentStatus : new NodeStatus[] {NodeStatus.Running, NodeStatus.Removing}) {
+      when(LOAD_MANAGER.getNodeStatus(DATA_NODE_ID)).thenReturn(currentStatus);
+      Assert.assertSame(failure, CONFIG_MANAGER_SPY.reportDataNodeShutdown(DATA_NODE_LOCATION));
+    }
+    verify(LOAD_MANAGER, times(2))
+        .updateNodeStatus(eq(DATA_NODE_ID), eq(NodeStatus.Stopped), eq(false));
+  }
+
+  @Test
+  public void testReportConfigNodeShutdownPropagatesPersistenceFailure() {
+    TSStatus failure = RpcUtils.getStatus(TSStatusCode.EXECUTE_STATEMENT_ERROR);
+    when(LOAD_MANAGER.updateNodeStatus(eq(CONFIG_NODE_ID), eq(NodeStatus.Stopped), eq(false)))
+        .thenReturn(failure);
+
+    for (NodeStatus currentStatus : new NodeStatus[] {NodeStatus.Running, NodeStatus.Removing}) {
+      when(LOAD_MANAGER.getNodeStatus(CONFIG_NODE_ID)).thenReturn(currentStatus);
+      Assert.assertSame(failure, CONFIG_MANAGER_SPY.reportConfigNodeShutdown(CONFIG_NODE_LOCATION));
+    }
+    verify(LOAD_MANAGER, times(2))
+        .updateNodeStatus(eq(CONFIG_NODE_ID), eq(NodeStatus.Stopped), eq(false));
   }
 }

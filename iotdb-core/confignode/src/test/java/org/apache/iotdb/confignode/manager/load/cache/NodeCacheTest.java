@@ -19,6 +19,10 @@
 package org.apache.iotdb.confignode.manager.load.cache;
 
 import org.apache.iotdb.commons.cluster.NodeStatus;
+import org.apache.iotdb.confignode.conf.ConfigNodeConfig;
+import org.apache.iotdb.confignode.conf.ConfigNodeDescriptor;
+import org.apache.iotdb.confignode.manager.load.cache.node.AINodeHeartbeatCache;
+import org.apache.iotdb.confignode.manager.load.cache.node.BaseNodeCache;
 import org.apache.iotdb.confignode.manager.load.cache.node.ConfigNodeHeartbeatCache;
 import org.apache.iotdb.confignode.manager.load.cache.node.DataNodeHeartbeatCache;
 import org.apache.iotdb.confignode.manager.load.cache.node.NodeHeartbeatSample;
@@ -35,7 +39,7 @@ public class NodeCacheTest {
     long currentTime = System.nanoTime();
     dataNodeHeartbeatCache.cacheHeartbeatSample(
         new NodeHeartbeatSample(currentTime, NodeStatus.Running));
-    dataNodeHeartbeatCache.updateCurrentStatistics(false);
+    dataNodeHeartbeatCache.updateNodeStatistics();
     Assert.assertEquals(NodeStatus.Running, dataNodeHeartbeatCache.getNodeStatus());
     Assert.assertEquals(0, dataNodeHeartbeatCache.getLoadScore());
 
@@ -44,105 +48,118 @@ public class NodeCacheTest {
     currentTime = System.nanoTime();
     configNodeHeartbeatCache.cacheHeartbeatSample(
         new NodeHeartbeatSample(currentTime, NodeStatus.Running));
-    configNodeHeartbeatCache.updateCurrentStatistics(false);
+    configNodeHeartbeatCache.updateNodeStatistics();
     Assert.assertEquals(NodeStatus.Running, configNodeHeartbeatCache.getNodeStatus());
     Assert.assertEquals(0, configNodeHeartbeatCache.getLoadScore());
   }
 
   @Test
   public void stoppedStatusStickyAndRevivalTest() {
-    // Test DataNode heartbeat cache
-    DataNodeHeartbeatCache dataNodeHeartbeatCache = new DataNodeHeartbeatCache(1);
-    // A fresh Stopped report (shutdown hook) marks the node as Stopped
-    dataNodeHeartbeatCache.cacheHeartbeatSample(
-        new NodeHeartbeatSample(System.nanoTime(), NodeStatus.Stopped));
-    dataNodeHeartbeatCache.updateCurrentStatistics(true);
-    Assert.assertEquals(NodeStatus.Stopped, dataNodeHeartbeatCache.getNodeStatus());
-    Assert.assertEquals(Long.MAX_VALUE, dataNodeHeartbeatCache.getLoadScore());
+    for (BaseNodeCache cache :
+        new BaseNodeCache[] {
+          new DataNodeHeartbeatCache(1),
+          new ConfigNodeHeartbeatCache(ConfigNodeHeartbeatCache.CURRENT_NODE_ID + 1),
+          new AINodeHeartbeatCache(3)
+        }) {
+      String cacheType = cache.getClass().getSimpleName();
+      cache.cacheHeartbeatSample(new NodeHeartbeatSample(NodeStatus.Stopped));
+      cache.updateNodeStatistics();
+      Assert.assertEquals(cacheType, NodeStatus.Stopped, cache.getNodeStatus());
+      Assert.assertEquals(cacheType, Long.MAX_VALUE, cache.getLoadScore());
 
-    // A forced Unknown update (e.g. heartbeat connection failure) must not refresh Stopped
-    dataNodeHeartbeatCache.cacheHeartbeatSample(new NodeHeartbeatSample(NodeStatus.Unknown));
-    dataNodeHeartbeatCache.updateCurrentStatistics(true);
-    Assert.assertEquals(NodeStatus.Stopped, dataNodeHeartbeatCache.getNodeStatus());
+      // Unknown observations cannot undo a reported stop.
+      cache.cacheHeartbeatSample(new NodeHeartbeatSample(NodeStatus.Unknown));
+      cache.updateNodeStatistics();
+      Assert.assertEquals(cacheType, NodeStatus.Stopped, cache.getNodeStatus());
 
-    // Periodic updates must not refresh Stopped to Unknown either
-    dataNodeHeartbeatCache.updateCurrentStatistics(false);
-    Assert.assertEquals(NodeStatus.Stopped, dataNodeHeartbeatCache.getNodeStatus());
+      // A live heartbeat revives a stopped node.
+      cache.cacheHeartbeatSample(new NodeHeartbeatSample(NodeStatus.Running));
+      cache.updateNodeStatistics();
+      Assert.assertEquals(cacheType, NodeStatus.Running, cache.getNodeStatus());
+      Assert.assertEquals(cacheType, 0, cache.getLoadScore());
 
-    // A live heartbeat (e.g. the node restarted) revives the node
-    dataNodeHeartbeatCache.cacheHeartbeatSample(
-        new NodeHeartbeatSample(System.nanoTime(), NodeStatus.Running));
-    dataNodeHeartbeatCache.updateCurrentStatistics(false);
-    Assert.assertEquals(NodeStatus.Running, dataNodeHeartbeatCache.getNodeStatus());
+      // A stopped node can still enter removal.
+      cache.cacheHeartbeatSample(new NodeHeartbeatSample(NodeStatus.Stopped));
+      cache.updateNodeStatistics();
+      Assert.assertEquals(cacheType, NodeStatus.Stopped, cache.getNodeStatus());
+      cache.cacheHeartbeatSample(new NodeHeartbeatSample(NodeStatus.Removing));
+      cache.updateNodeStatistics();
+      Assert.assertEquals(cacheType, NodeStatus.Removing, cache.getNodeStatus());
 
-    // Removing has the highest priority: it refreshes Stopped
-    dataNodeHeartbeatCache.cacheHeartbeatSample(
-        new NodeHeartbeatSample(System.nanoTime(), NodeStatus.Stopped));
-    dataNodeHeartbeatCache.updateCurrentStatistics(true);
-    Assert.assertEquals(NodeStatus.Stopped, dataNodeHeartbeatCache.getNodeStatus());
-    dataNodeHeartbeatCache.cacheHeartbeatSample(
-        new NodeHeartbeatSample(System.nanoTime(), NodeStatus.Removing));
-    dataNodeHeartbeatCache.updateCurrentStatistics(true);
-    Assert.assertEquals(NodeStatus.Removing, dataNodeHeartbeatCache.getNodeStatus());
-    // And the Stopped report must not refresh Removing
-    dataNodeHeartbeatCache.cacheHeartbeatSample(
-        new NodeHeartbeatSample(System.nanoTime(), NodeStatus.Stopped));
-    dataNodeHeartbeatCache.updateCurrentStatistics(true);
-    Assert.assertEquals(NodeStatus.Removing, dataNodeHeartbeatCache.getNodeStatus());
-    // A forced Unknown update (e.g. heartbeat connection failure) must not refresh Removing
-    // either
-    dataNodeHeartbeatCache.cacheHeartbeatSample(new NodeHeartbeatSample(NodeStatus.Unknown));
-    dataNodeHeartbeatCache.updateCurrentStatistics(true);
-    Assert.assertEquals(NodeStatus.Removing, dataNodeHeartbeatCache.getNodeStatus());
-    // An explicit management status change (e.g. rollback to Running) still applies
-    dataNodeHeartbeatCache.cacheHeartbeatSample(
-        new NodeHeartbeatSample(System.nanoTime(), NodeStatus.Running));
-    dataNodeHeartbeatCache.updateCurrentStatistics(true);
-    Assert.assertEquals(NodeStatus.Running, dataNodeHeartbeatCache.getNodeStatus());
+      // Ordinary updates, including fresh Running, must not cancel removal.
+      for (NodeStatus observed :
+          new NodeStatus[] {NodeStatus.Stopped, NodeStatus.Unknown, NodeStatus.Running}) {
+        cache.cacheHeartbeatSample(new NodeHeartbeatSample(observed));
+        cache.updateNodeStatistics();
+        Assert.assertEquals(cacheType, NodeStatus.Removing, cache.getNodeStatus());
+        Assert.assertEquals(cacheType, Long.MAX_VALUE, cache.getLoadScore());
+      }
 
-    // Test ConfigNode heartbeat cache
-    ConfigNodeHeartbeatCache configNodeHeartbeatCache = new ConfigNodeHeartbeatCache(2);
-    configNodeHeartbeatCache.cacheHeartbeatSample(
-        new NodeHeartbeatSample(System.nanoTime(), NodeStatus.Stopped));
-    configNodeHeartbeatCache.updateCurrentStatistics(true);
-    Assert.assertEquals(NodeStatus.Stopped, configNodeHeartbeatCache.getNodeStatus());
+      // Management restores the requested state explicitly, including offline states.
+      for (NodeStatus restored :
+          new NodeStatus[] {NodeStatus.Unknown, NodeStatus.Stopped, NodeStatus.Running}) {
+        cache.updateNodeStatus(NodeStatus.Removing, true);
+        cache.updateNodeStatus(restored, true);
+        Assert.assertEquals(cacheType, restored, cache.getNodeStatus());
+        cache.updateNodeStatistics();
+        Assert.assertEquals(cacheType, restored, cache.getNodeStatus());
+      }
+    }
+  }
 
-    // A forced Unknown update (e.g. heartbeat connection failure) must not refresh Stopped
-    configNodeHeartbeatCache.cacheHeartbeatSample(new NodeHeartbeatSample(NodeStatus.Unknown));
-    configNodeHeartbeatCache.updateCurrentStatistics(true);
-    Assert.assertEquals(NodeStatus.Stopped, configNodeHeartbeatCache.getNodeStatus());
+  @Test
+  public void testConnectionFailureIsNotUndoneByPreviousRunningHeartbeat() {
+    for (BaseNodeCache cache :
+        new BaseNodeCache[] {
+          new DataNodeHeartbeatCache(1),
+          new ConfigNodeHeartbeatCache(ConfigNodeHeartbeatCache.CURRENT_NODE_ID + 1),
+          new AINodeHeartbeatCache(3)
+        }) {
+      cache.cacheHeartbeatSample(new NodeHeartbeatSample(NodeStatus.Running));
+      cache.updateNodeStatistics();
+      Assert.assertEquals(NodeStatus.Running, cache.getNodeStatus());
 
-    // Periodic updates must not refresh Stopped to Unknown either
-    configNodeHeartbeatCache.updateCurrentStatistics(false);
-    Assert.assertEquals(NodeStatus.Stopped, configNodeHeartbeatCache.getNodeStatus());
+      cache.updateNodeStatus(NodeStatus.Unknown, false);
+      Assert.assertEquals(NodeStatus.Unknown, cache.getNodeStatus());
+      Assert.assertEquals(Long.MAX_VALUE, cache.getLoadScore());
+      cache.updateNodeStatistics();
+      Assert.assertEquals(NodeStatus.Unknown, cache.getNodeStatus());
+    }
+  }
 
-    // A live heartbeat revives the ConfigNode
-    configNodeHeartbeatCache.cacheHeartbeatSample(
-        new NodeHeartbeatSample(System.nanoTime(), NodeStatus.Running));
-    configNodeHeartbeatCache.updateCurrentStatistics(false);
-    Assert.assertEquals(NodeStatus.Running, configNodeHeartbeatCache.getNodeStatus());
+  @Test
+  public void testExplicitStatusUpdateDoesNotRequireLiveHeartbeat() {
+    ConfigNodeConfig config = ConfigNodeDescriptor.getInstance().getConf();
+    String detector = config.getFailureDetector();
+    long timeout = config.getFailureDetectorFixedThresholdInMs();
+    config.setFailureDetector(IFailureDetector.FIXED_DETECTOR);
+    config.setFailureDetectorFixedThresholdInMs(0);
+    try {
+      for (BaseNodeCache cache :
+          new BaseNodeCache[] {
+            new DataNodeHeartbeatCache(1),
+            new ConfigNodeHeartbeatCache(ConfigNodeHeartbeatCache.CURRENT_NODE_ID + 1),
+            new AINodeHeartbeatCache(3)
+          }) {
+        cache.cacheHeartbeatSample(new NodeHeartbeatSample(0, NodeStatus.Running));
+        cache.updateNodeStatistics();
+        Assert.assertEquals(NodeStatus.Unknown, cache.getNodeStatus());
 
-    // Removing has the highest priority: the Stopped report must not refresh it
-    configNodeHeartbeatCache.cacheHeartbeatSample(
-        new NodeHeartbeatSample(System.nanoTime(), NodeStatus.Stopped));
-    configNodeHeartbeatCache.updateCurrentStatistics(true);
-    Assert.assertEquals(NodeStatus.Stopped, configNodeHeartbeatCache.getNodeStatus());
-    configNodeHeartbeatCache.cacheHeartbeatSample(
-        new NodeHeartbeatSample(System.nanoTime(), NodeStatus.Removing));
-    configNodeHeartbeatCache.updateCurrentStatistics(true);
-    Assert.assertEquals(NodeStatus.Removing, configNodeHeartbeatCache.getNodeStatus());
-    configNodeHeartbeatCache.cacheHeartbeatSample(
-        new NodeHeartbeatSample(System.nanoTime(), NodeStatus.Stopped));
-    configNodeHeartbeatCache.updateCurrentStatistics(true);
-    Assert.assertEquals(NodeStatus.Removing, configNodeHeartbeatCache.getNodeStatus());
-    // Unlike the DataNode cache, the ConfigNode cache unconditionally keeps Removing against any
-    // update (pre-existing guard), including forced ones
-    configNodeHeartbeatCache.cacheHeartbeatSample(new NodeHeartbeatSample(NodeStatus.Unknown));
-    configNodeHeartbeatCache.updateCurrentStatistics(true);
-    Assert.assertEquals(NodeStatus.Removing, configNodeHeartbeatCache.getNodeStatus());
-    configNodeHeartbeatCache.cacheHeartbeatSample(
-        new NodeHeartbeatSample(System.nanoTime(), NodeStatus.Running));
-    configNodeHeartbeatCache.updateCurrentStatistics(true);
-    Assert.assertEquals(NodeStatus.Removing, configNodeHeartbeatCache.getNodeStatus());
+        // A shutdown report is known information even when heartbeat detection says unavailable.
+        cache.updateNodeStatus(NodeStatus.Stopped, false);
+        Assert.assertEquals(NodeStatus.Stopped, cache.getNodeStatus());
+        Assert.assertEquals(Long.MAX_VALUE, cache.getLoadScore());
+        cache.updateNodeStatistics();
+        Assert.assertEquals(NodeStatus.Stopped, cache.getNodeStatus());
+
+        cache.updateNodeStatus(NodeStatus.Unknown, false);
+        Assert.assertEquals(NodeStatus.Stopped, cache.getNodeStatus());
+        cache.updateNodeStatus(NodeStatus.Unknown, true);
+        Assert.assertEquals(NodeStatus.Unknown, cache.getNodeStatus());
+      }
+    } finally {
+      config.setFailureDetector(detector);
+      config.setFailureDetectorFixedThresholdInMs(timeout);
+    }
   }
 }
