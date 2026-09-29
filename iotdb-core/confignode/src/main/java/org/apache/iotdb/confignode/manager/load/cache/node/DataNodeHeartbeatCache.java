@@ -46,10 +46,10 @@ public class DataNodeHeartbeatCache extends BaseNodeCache {
   }
 
   @Override
-  public synchronized void updateCurrentStatistics(boolean forceUpdate) {
+  protected NodeStatistics calculateCurrentStatistics(boolean forceUpdate) {
     // The Removing status can not be updated
     if (!forceUpdate && NodeStatus.Removing.equals(getNodeStatus())) {
-      return;
+      return (NodeStatistics) currentStatistics.get();
     }
 
     NodeHeartbeatSample lastSample;
@@ -99,12 +99,11 @@ public class DataNodeHeartbeatCache extends BaseNodeCache {
     // TODO: Construct load score module
     long loadScore = NodeStatus.isNormalStatus(status) ? 0 : Long.MAX_VALUE;
 
-    currentStatistics.set(new NodeStatistics(currentNanoTime, status, statusReason, loadScore));
-
     if (forceUpdate) {
       LOGGER.debug(
           ManagerMessages.FORCE_UPDATE_NODECACHE_STATUS_CURRENTNANOTIME, status, currentNanoTime);
     }
+    return new NodeStatistics(currentNanoTime, status, statusReason, loadScore);
   }
 
   public double getFreeDiskSpace() {

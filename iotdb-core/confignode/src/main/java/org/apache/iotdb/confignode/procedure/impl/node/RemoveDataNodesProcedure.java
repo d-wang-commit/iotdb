@@ -159,6 +159,8 @@ public class RemoveDataNodesProcedure extends AbstractNodeProcedure<RemoveDataNo
             e);
         if (getCycles() > RETRY_THRESHOLD) {
           setFailure(new ProcedureException(ProcedureMessages.STATE_STUCK_AT + state));
+        } else {
+          setNextState(state);
         }
       }
     }
@@ -211,7 +213,7 @@ public class RemoveDataNodesProcedure extends AbstractNodeProcedure<RemoveDataNo
         dataNodeLocation.getDataNodeId(), dataNodeLocation.getInternalEndPoint().getIp());
   }
 
-  private void checkRegionStatusAndStopDataNode(ConfigNodeProcedureEnv env) {
+  private void checkRegionStatusAndStopDataNode(ConfigNodeProcedureEnv env) throws IOException {
     List<TRegionReplicaSet> replicaSets =
         env.getConfigManager().getPartitionManager().getAllReplicaSets();
     List<TDataNodeLocation> rollBackDataNodes = new ArrayList<>();

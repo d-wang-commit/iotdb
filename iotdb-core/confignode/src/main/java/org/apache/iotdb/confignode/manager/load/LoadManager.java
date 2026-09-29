@@ -22,6 +22,7 @@ package org.apache.iotdb.confignode.manager.load;
 import org.apache.iotdb.common.rpc.thrift.TConsensusGroupId;
 import org.apache.iotdb.common.rpc.thrift.TConsensusGroupType;
 import org.apache.iotdb.common.rpc.thrift.TRegionReplicaSet;
+import org.apache.iotdb.common.rpc.thrift.TSStatus;
 import org.apache.iotdb.common.rpc.thrift.TSeriesPartitionSlot;
 import org.apache.iotdb.commons.cluster.NodeStatus;
 import org.apache.iotdb.commons.cluster.NodeType;
@@ -33,6 +34,7 @@ import org.apache.iotdb.confignode.consensus.request.write.region.CreateRegionGr
 import org.apache.iotdb.confignode.exception.DatabaseNotExistsException;
 import org.apache.iotdb.confignode.exception.NoAvailableRegionGroupException;
 import org.apache.iotdb.confignode.exception.NotEnoughDataNodeException;
+import org.apache.iotdb.confignode.i18n.ManagerMessages;
 import org.apache.iotdb.confignode.manager.IManager;
 import org.apache.iotdb.confignode.manager.load.balancer.PartitionBalancer;
 import org.apache.iotdb.confignode.manager.load.balancer.RegionBalancer;
@@ -47,6 +49,7 @@ import org.apache.iotdb.confignode.manager.load.service.StatisticsService;
 import org.apache.iotdb.confignode.manager.load.service.TopologyService;
 import org.apache.iotdb.confignode.manager.partition.RegionGroupStatus;
 import org.apache.iotdb.confignode.rpc.thrift.TTimeSlotList;
+import org.apache.iotdb.rpc.TSStatusCode;
 
 import java.util.List;
 import java.util.Map;
@@ -209,7 +212,12 @@ public class LoadManager {
       return false;
     }
 
-    loadCache.updateNodeStatistics(false);
+    if (!loadCache.updateNodeStatistics(false)) {
+      // In particular, do not serve as leader until its own old Stopped marker is cleared.
+      loadReadyReason =
+          ManagerMessages.MESSAGE_CONFIGNODE_LEADER_IS_WAITING_FOR_NODE_STATUS_PERSISTENCE_8CA96809;
+      return false;
+    }
     eventService.checkAndBroadcastNodeStatisticsChangeEventIfNecessary();
 
     List<String> unreadyReasons = loadCache.getNodeHeartbeatUnreadyReasons();
@@ -344,23 +352,22 @@ public class LoadManager {
    * @param nodeId Specified NodeId
    * @param heartbeatSample Specified NodeHeartbeatSample
    */
-  public void forceUpdateNodeCache(
+  public TSStatus forceUpdateNodeCache(
       NodeType nodeType, int nodeId, NodeHeartbeatSample heartbeatSample) {
-    switch (nodeType) {
-      case ConfigNode:
-        loadCache.cacheConfigNodeHeartbeatSample(nodeId, heartbeatSample);
-        break;
-      case DataNode:
-        loadCache.cacheDataNodeHeartbeatSample(nodeId, heartbeatSample);
-        break;
-      case AINode:
-        loadCache.cacheAINodeHeartbeatSample(nodeId, heartbeatSample);
-        break;
-      default:
-        break;
+    TSStatus status = loadCache.forceUpdateNodeCache(nodeId, heartbeatSample);
+    if (status.getCode() == TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
+      eventService.checkAndBroadcastNodeStatisticsChangeEventIfNecessary();
     }
-    loadCache.updateNodeStatistics(true);
-    eventService.checkAndBroadcastNodeStatisticsChangeEventIfNecessary();
+    return status;
+  }
+
+  /** Apply an explicit removal or rollback, including rollback to an offline state. */
+  public TSStatus setNodeStatus(int nodeId, NodeStatus nodeStatus) {
+    TSStatus status = loadCache.setNodeStatus(nodeId, nodeStatus);
+    if (status.getCode() == TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
+      eventService.checkAndBroadcastNodeStatisticsChangeEventIfNecessary();
+    }
+    return status;
   }
 
   /**
@@ -371,7 +378,7 @@ public class LoadManager {
    */
   public void removeNodeCache(int nodeId) {
     loadCache.removeNodeCache(nodeId);
-    loadCache.updateNodeStatistics(true);
+    loadCache.updateNodeStatistics(false);
     eventService.checkAndBroadcastNodeStatisticsChangeEventIfNecessary();
   }
 

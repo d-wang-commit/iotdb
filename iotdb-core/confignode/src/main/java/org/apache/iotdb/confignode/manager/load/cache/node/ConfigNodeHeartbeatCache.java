@@ -36,22 +36,25 @@ public class ConfigNodeHeartbeatCache extends BaseNodeCache {
   public static final NodeStatistics CURRENT_NODE_STATISTICS =
       new NodeStatistics(0, NodeStatus.Running, null, 0);
 
+  private final boolean isCurrentNode;
+
   /** Constructor for create ConfigNodeHeartbeatCache with default NodeStatistics. */
   public ConfigNodeHeartbeatCache(int configNodeId) {
     super(configNodeId);
+    this.isCurrentNode = configNodeId == CURRENT_NODE_ID;
   }
 
   /** Constructor only for ConfigNode-leader. */
   public ConfigNodeHeartbeatCache(int configNodeId, NodeStatistics statistics) {
-    super(configNodeId);
+    this(configNodeId);
     this.currentStatistics.set(statistics);
   }
 
   @Override
-  public synchronized void updateCurrentStatistics(boolean forceUpdate) {
+  protected NodeStatistics calculateCurrentStatistics(boolean forceUpdate) {
     // Skip itself and the Removing status can not be updated
-    if (nodeId == CURRENT_NODE_ID || NodeStatus.Removing.equals(getNodeStatus())) {
-      return;
+    if (isCurrentNode || NodeStatus.Removing.equals(getNodeStatus())) {
+      return (NodeStatistics) currentStatistics.get();
     }
 
     NodeHeartbeatSample lastSample;
@@ -87,6 +90,6 @@ public class ConfigNodeHeartbeatCache extends BaseNodeCache {
     // TODO: Construct load score module
     long loadScore = NodeStatus.isNormalStatus(status) ? 0 : Long.MAX_VALUE;
 
-    currentStatistics.set(new NodeStatistics(currentNanoTime, status, null, loadScore));
+    return new NodeStatistics(currentNanoTime, status, null, loadScore);
   }
 }

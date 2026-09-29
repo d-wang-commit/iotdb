@@ -37,7 +37,7 @@ public class AINodeHeartbeatCache extends BaseNodeCache {
   }
 
   @Override
-  public void updateCurrentStatistics(boolean forceUpdate) {
+  protected NodeStatistics calculateCurrentStatistics(boolean forceUpdate) {
     NodeHeartbeatSample lastSample;
     final List<AbstractHeartbeatSample> heartbeatHistory;
     /* Update Node status */
@@ -69,7 +69,8 @@ public class AINodeHeartbeatCache extends BaseNodeCache {
         new NodeStatistics(currentNanoTime, status, statusReason, loadScore);
     if (!currentStatistics.get().equals(newStatistics)) {
       // Update the current NodeStatistics if necessary
-      currentStatistics.set(newStatistics);
+      return newStatistics;
     }
+    return (NodeStatistics) currentStatistics.get();
   }
 }

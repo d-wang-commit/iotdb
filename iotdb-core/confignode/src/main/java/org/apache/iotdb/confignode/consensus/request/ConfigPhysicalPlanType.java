@@ -29,6 +29,7 @@ public enum ConfigPhysicalPlanType {
   RemoveConfigNode((short) 1),
   UpdateVersionInfo((short) 2),
   UpdateClusterId((short) 3),
+  UpdateNodeStatus((short) 4),
 
   /** DataNode. */
   RegisterDataNode((short) 100),

@@ -27,11 +27,14 @@ import org.apache.iotdb.common.rpc.thrift.TDataNodeConfiguration;
 import org.apache.iotdb.common.rpc.thrift.TDataNodeLocation;
 import org.apache.iotdb.common.rpc.thrift.TEndPoint;
 import org.apache.iotdb.common.rpc.thrift.TRegionReplicaSet;
+import org.apache.iotdb.common.rpc.thrift.TSStatus;
 import org.apache.iotdb.commons.cluster.NodeStatus;
 import org.apache.iotdb.commons.cluster.NodeType;
 import org.apache.iotdb.commons.cluster.RegionStatus;
 import org.apache.iotdb.confignode.conf.ConfigNodeConfig;
 import org.apache.iotdb.confignode.conf.ConfigNodeDescriptor;
+import org.apache.iotdb.confignode.consensus.request.write.confignode.UpdateNodeStatusPlan;
+import org.apache.iotdb.confignode.i18n.ConfigNodeMessages;
 import org.apache.iotdb.confignode.i18n.ManagerMessages;
 import org.apache.iotdb.confignode.manager.IManager;
 import org.apache.iotdb.confignode.manager.ProcedureManager;
@@ -49,6 +52,8 @@ import org.apache.iotdb.confignode.manager.load.cache.region.RegionGroupStatisti
 import org.apache.iotdb.confignode.manager.load.cache.region.RegionHeartbeatSample;
 import org.apache.iotdb.confignode.manager.load.cache.region.RegionStatistics;
 import org.apache.iotdb.confignode.manager.partition.RegionGroupStatus;
+import org.apache.iotdb.consensus.exception.ConsensusException;
+import org.apache.iotdb.rpc.TSStatusCode;
 
 import org.apache.thrift.annotation.Nullable;
 import org.slf4j.Logger;
@@ -103,6 +108,7 @@ public class LoadCache {
   private final Map<Integer, Set<TEndPoint>> confirmedConfigNodeMap;
   private Map<Integer, Set<Integer>> topologyGraph;
   private final AtomicBoolean topologyUpdated;
+  private IManager configManager;
 
   public LoadCache() {
     this.nodeCacheMap = new ConcurrentHashMap<>();
@@ -117,6 +123,7 @@ public class LoadCache {
   }
 
   public void initHeartbeatCache(final IManager configManager) {
+    this.configManager = configManager;
     initNodeHeartbeatCache(
         configManager.getNodeManager().getRegisteredConfigNodes(),
         configManager.getNodeManager().getRegisteredDataNodes(),
@@ -148,10 +155,11 @@ public class LoadCache {
           }
         });
     // Force set itself and never update
-    nodeCacheMap.put(
-        ConfigNodeHeartbeatCache.CURRENT_NODE_ID,
+    ConfigNodeHeartbeatCache currentNodeCache =
         new ConfigNodeHeartbeatCache(
-            CURRENT_NODE_ID, ConfigNodeHeartbeatCache.CURRENT_NODE_STATISTICS));
+            CURRENT_NODE_ID, ConfigNodeHeartbeatCache.CURRENT_NODE_STATISTICS);
+    nodeCacheMap.put(CURRENT_NODE_ID, currentNodeCache);
+    currentNodeCache.initializeNodeStatus(null, this::updateNodeStatus);
 
     // Init DataNodeHeartbeatCache
     registeredDataNodes.forEach(
@@ -233,7 +241,63 @@ public class LoadCache {
         nodeCacheMap.put(nodeId, new AINodeHeartbeatCache(nodeId));
         break;
     }
+    if (configManager != null && nodeType != NodeType.AINode) {
+      nodeCacheMap
+          .get(nodeId)
+          .initializeNodeStatus(
+              configManager.getNodeManager().getPersistedNodeStatus(nodeId),
+              this::updateNodeStatus);
+    }
     heartbeatProcessingMap.put(nodeId, new AtomicBoolean(false));
+  }
+
+  private TSStatus updateNodeStatus(BaseNodeCache cache, NodeStatus status) {
+    int nodeId = cache.getNodeId();
+    if (nodeCacheMap.get(nodeId) != cache) {
+      return new TSStatus(TSStatusCode.EXECUTE_STATEMENT_ERROR.getStatusCode());
+    }
+    NodeStatus persistedStatus =
+        status == NodeStatus.Stopped || status == NodeStatus.Removing ? status : null;
+    if (configManager.getNodeManager().getPersistedNodeStatus(nodeId) == persistedStatus) {
+      return new TSStatus(TSStatusCode.SUCCESS_STATUS.getStatusCode());
+    }
+    NodeStatus statusToClear =
+        cache.getNodeStatus() == NodeStatus.Removing ? NodeStatus.Removing : NodeStatus.Stopped;
+    try {
+      return configManager
+          .getConsensusManager()
+          .write(new UpdateNodeStatusPlan(nodeId, status, statusToClear));
+    } catch (ConsensusException e) {
+      LOGGER.warn(ConfigNodeMessages.FAILED_IN_THE_WRITE_API_EXECUTING_THE_CONSENSUS_LAYER_DUE, e);
+      return new TSStatus(TSStatusCode.EXECUTE_STATEMENT_ERROR.getStatusCode())
+          .setMessage(e.getMessage());
+    }
+  }
+
+  /**
+   * Keep the management sample and its committed statistics in the same per-node critical section.
+   */
+  public TSStatus forceUpdateNodeCache(int nodeId, NodeHeartbeatSample sample) {
+    BaseNodeCache cache = nodeCacheMap.get(nodeId);
+    if (cache == null) {
+      return new TSStatus(TSStatusCode.INTERNAL_SERVER_ERROR.getStatusCode());
+    }
+    synchronized (cache) {
+      boolean managementUpdate = sample.getStatus() != NodeStatus.Unknown;
+      // Stamp a management command while holding the cache lock, so an intervening heartbeat
+      // cannot discard a shutdown report that we are about to acknowledge.
+      cache.cacheHeartbeatSample(
+          managementUpdate ? new NodeHeartbeatSample(sample.getStatus()) : sample);
+      // A broken connection is not an explicit rollback of Removing.
+      return cache.updateNodeStatistics(managementUpdate);
+    }
+  }
+
+  public TSStatus setNodeStatus(int nodeId, NodeStatus status) {
+    BaseNodeCache cache = nodeCacheMap.get(nodeId);
+    return cache == null
+        ? new TSStatus(TSStatusCode.INTERNAL_SERVER_ERROR.getStatusCode())
+        : cache.setNodeStatus(status);
   }
 
   /**
@@ -366,10 +430,14 @@ public class LoadCache {
   }
 
   /** Update the NodeStatistics of all Nodes. */
-  public void updateNodeStatistics(boolean forceUpdate) {
-    nodeCacheMap
-        .values()
-        .forEach(baseNodeCache -> baseNodeCache.updateCurrentStatistics(forceUpdate));
+  public boolean updateNodeStatistics(boolean forceUpdate) {
+    boolean success = true;
+    for (BaseNodeCache cache : nodeCacheMap.values()) {
+      success &=
+          cache.updateNodeStatistics(forceUpdate).getCode()
+              == TSStatusCode.SUCCESS_STATUS.getStatusCode();
+    }
+    return success;
   }
 
   /** Update the RegionGroupStatistics of all RegionGroups. */
@@ -506,7 +574,9 @@ public class LoadCache {
           }
           if ((nodeCache instanceof ConfigNodeHeartbeatCache
                   || nodeCache instanceof DataNodeHeartbeatCache)
-              && !nodeCache.hasHeartbeatSample()) {
+              && !nodeCache.hasHeartbeatSample()
+              && nodeCache.getNodeStatus() != NodeStatus.Stopped
+              && nodeCache.getNodeStatus() != NodeStatus.Removing) {
             unreadyNodes.add(nodeId);
           }
         });

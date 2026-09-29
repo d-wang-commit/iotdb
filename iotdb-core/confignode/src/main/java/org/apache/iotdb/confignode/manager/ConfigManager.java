@@ -588,9 +588,13 @@ public class ConfigManager implements IManager {
             dataNodeId);
       } else {
         // Force updating the target DataNode's status to Stopped
-        getLoadManager()
-            .forceUpdateNodeCache(
-                NodeType.DataNode, dataNodeId, new NodeHeartbeatSample(NodeStatus.Stopped));
+        status =
+            getLoadManager()
+                .forceUpdateNodeCache(
+                    NodeType.DataNode, dataNodeId, new NodeHeartbeatSample(NodeStatus.Stopped));
+        if (status.getCode() != TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
+          return status;
+        }
         LOGGER.info(
             ManagerMessages.LOG_THE_DATANODE_WILL_BE_SHUTDOWN_SOON_MARK_IT_AS_STOPPED_05CF8A45,
             dataNodeId);
@@ -1648,9 +1652,13 @@ public class ConfigManager implements IManager {
             configNodeId);
       } else {
         // Force updating the target ConfigNode's status to Stopped
-        getLoadManager()
-            .forceUpdateNodeCache(
-                NodeType.ConfigNode, configNodeId, new NodeHeartbeatSample(NodeStatus.Stopped));
+        status =
+            getLoadManager()
+                .forceUpdateNodeCache(
+                    NodeType.ConfigNode, configNodeId, new NodeHeartbeatSample(NodeStatus.Stopped));
+        if (status.getCode() != TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
+          return status;
+        }
         LOGGER.info(
             ManagerMessages.LOG_THE_CONFIGNODE_WILL_BE_SHUTDOWN_SOON_MARK_IT_AS_STOPPED_D2A64AFD,
             configNodeId);
