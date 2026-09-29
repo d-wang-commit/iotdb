@@ -707,4 +707,6 @@ public final class ManagerMessages {
       MESSAGE_ARG_PLEASE_MANUALLY_CHECK_LATER_WHETHER_THE_PROCEDURE_IS_EXECUTED_SUCCESSFULLY_A82B739D =
           "%s 请稍后手动检查该 Procedure 是否执行成功。";
 
+  public static final String MESSAGE_CONFIGNODE_LEADER_IS_WAITING_FOR_NODE_STATUS_PERSISTENCE_8CA96809 =
+      "ConfigNode leader 正在等待节点状态持久化。";
 }

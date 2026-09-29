@@ -119,7 +119,6 @@ import org.apache.iotdb.confignode.manager.cq.CQManager;
 import org.apache.iotdb.confignode.manager.externalservice.ExternalServiceInfo;
 import org.apache.iotdb.confignode.manager.externalservice.ExternalServiceManager;
 import org.apache.iotdb.confignode.manager.load.LoadManager;
-import org.apache.iotdb.confignode.manager.load.cache.node.NodeHeartbeatSample;
 import org.apache.iotdb.confignode.manager.node.ClusterNodeStartUtils;
 import org.apache.iotdb.confignode.manager.node.NodeManager;
 import org.apache.iotdb.confignode.manager.node.NodeMetrics;
@@ -578,19 +577,23 @@ public class ConfigManager implements IManager {
 
   @Override
   public TSStatus reportDataNodeShutdown(TDataNodeLocation dataNodeLocation) {
+
     TSStatus status = confirmLeader();
     if (status.getCode() == TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
       int dataNodeId = dataNodeLocation.getDataNodeId();
+
+      status = getLoadManager().updateNodeStatus(dataNodeId, NodeStatus.Stopped, false);
+      if (status.getCode() != TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
+
+        return status;
+      }
+
       if (NodeStatus.Removing.equals(getLoadManager().getNodeStatus(dataNodeId))) {
-        // Removing has the highest priority and can not be refreshed by the Stopped report
+
         LOGGER.info(
             ManagerMessages.LOG_THE_DATANODE_IS_REMOVING_SKIP_MARKING_IT_AS_STOPPED_90F95D71,
             dataNodeId);
       } else {
-        // Force updating the target DataNode's status to Stopped
-        getLoadManager()
-            .forceUpdateNodeCache(
-                NodeType.DataNode, dataNodeId, new NodeHeartbeatSample(NodeStatus.Stopped));
         LOGGER.info(
             ManagerMessages.LOG_THE_DATANODE_WILL_BE_SHUTDOWN_SOON_MARK_IT_AS_STOPPED_05CF8A45,
             dataNodeId);
@@ -1638,19 +1641,23 @@ public class ConfigManager implements IManager {
 
   @Override
   public TSStatus reportConfigNodeShutdown(TConfigNodeLocation configNodeLocation) {
+
     TSStatus status = confirmLeader();
     if (status.getCode() == TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
       int configNodeId = configNodeLocation.getConfigNodeId();
+
+      status = getLoadManager().updateNodeStatus(configNodeId, NodeStatus.Stopped, false);
+      if (status.getCode() != TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
+
+        return status;
+      }
+
       if (NodeStatus.Removing.equals(getLoadManager().getNodeStatus(configNodeId))) {
-        // Removing has the highest priority and can not be refreshed by the Stopped report
+
         LOGGER.info(
             ManagerMessages.LOG_THE_CONFIGNODE_IS_REMOVING_SKIP_MARKING_IT_AS_STOPPED_41B041A3,
             configNodeId);
       } else {
-        // Force updating the target ConfigNode's status to Stopped
-        getLoadManager()
-            .forceUpdateNodeCache(
-                NodeType.ConfigNode, configNodeId, new NodeHeartbeatSample(NodeStatus.Stopped));
         LOGGER.info(
             ManagerMessages.LOG_THE_CONFIGNODE_WILL_BE_SHUTDOWN_SOON_MARK_IT_AS_STOPPED_D2A64AFD,
             configNodeId);

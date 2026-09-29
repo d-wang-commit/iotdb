@@ -19,49 +19,84 @@
 
 package org.apache.iotdb.confignode.manager.load.cache.node;
 
+import org.apache.iotdb.common.rpc.thrift.TSStatus;
 import org.apache.iotdb.commons.cluster.NodeStatus;
 import org.apache.iotdb.confignode.manager.load.cache.AbstractLoadCache;
+import org.apache.iotdb.rpc.TSStatusCode;
 
-/**
- * NodeCache caches the NodeHeartbeatSamples of a Node. Update and cache the current statistics of
- * the Node based on the latest NodeHeartbeatSample.
- */
+import java.util.function.BiFunction;
+
 public abstract class BaseNodeCache extends AbstractLoadCache {
 
   protected final int nodeId;
 
-  /** Constructor for NodeCache with default NodeStatistics. */
+  private BiFunction<BaseNodeCache, NodeStatus, TSStatus> nodeStatusPersister;
+
   protected BaseNodeCache(int nodeId) {
     super();
     this.nodeId = nodeId;
-    this.currentStatistics.set(NodeStatistics.generateDefaultNodeStatistics());
+    currentStatistics.set(NodeStatistics.generateDefaultNodeStatistics());
   }
 
   public int getNodeId() {
     return nodeId;
   }
 
-  /**
-   * TODO: The loadScore of each Node will be changed to Double
-   *
-   * @return The latest load score of a node, the higher the score the higher the load
-   */
+  public synchronized void initializeNodeStatus(
+      NodeStatus persistedStatus,
+      BiFunction<BaseNodeCache, NodeStatus, TSStatus> nodeStatusPersister) {
+    this.nodeStatusPersister = nodeStatusPersister;
+    slidingWindow.clear();
+    if (persistedStatus != null) {
+      currentStatistics.set(
+          new NodeStatistics(System.nanoTime(), persistedStatus, null, Long.MAX_VALUE));
+    }
+  }
+
+  public synchronized TSStatus updateNodeStatistics() {
+    return updateCurrentStatistics(calculateCurrentStatistics(), false);
+  }
+
+  public synchronized TSStatus updateNodeStatus(NodeStatus status, boolean force) {
+    NodeHeartbeatSample sample = new NodeHeartbeatSample(status);
+    cacheHeartbeatSample(sample);
+    return updateCurrentStatistics(
+        new NodeStatistics(
+            sample.getSampleLogicalTimestamp(),
+            status,
+            null,
+            NodeStatus.isNormalStatus(status) ? 0 : Long.MAX_VALUE),
+        force);
+  }
+
+  private TSStatus updateCurrentStatistics(NodeStatistics statistics, boolean force) {
+    NodeStatus status = NodeStatus.transition(getNodeStatus(), statistics.getStatus(), force);
+    if (status != statistics.getStatus()) {
+      statistics =
+          new NodeStatistics(statistics.getStatisticsNanoTimestamp(), status, null, Long.MAX_VALUE);
+    }
+    if (nodeStatusPersister != null) {
+      TSStatus result = nodeStatusPersister.apply(this, statistics.getStatus());
+      if (result.getCode() != TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
+        return result;
+      }
+    }
+    currentStatistics.set(statistics);
+    return new TSStatus(TSStatusCode.SUCCESS_STATUS.getStatusCode());
+  }
+
+  protected abstract NodeStatistics calculateCurrentStatistics();
+
   public long getLoadScore() {
     return ((NodeStatistics) currentStatistics.get()).getLoadScore();
   }
 
-  /**
-   * @return The current status of the Node.
-   */
   public NodeStatus getNodeStatus() {
     return ((NodeStatistics) currentStatistics.get()).getStatus();
   }
 
-  /**
-   * @return The reason why lead to current NodeStatus.
-   */
   public String getNodeStatusWithReason() {
-    NodeStatistics statistics = (NodeStatistics) this.currentStatistics.get();
+    NodeStatistics statistics = (NodeStatistics) currentStatistics.get();
     return statistics.getStatusReason() == null
         ? statistics.getStatus().getStatus()
         : statistics.getStatus().getStatus() + "(" + statistics.getStatusReason() + ")";

@@ -728,4 +728,6 @@ public final class ManagerMessages {
       MESSAGE_ARG_PLEASE_MANUALLY_CHECK_LATER_WHETHER_THE_PROCEDURE_IS_EXECUTED_SUCCESSFULLY_A82B739D =
           "%s Please manually check later whether the procedure is executed successfully.";
 
+  public static final String MESSAGE_CONFIGNODE_LEADER_IS_WAITING_FOR_NODE_STATUS_PERSISTENCE_8CA96809 =
+      "ConfigNode leader is waiting for node status persistence.";
 }

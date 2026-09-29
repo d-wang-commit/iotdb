@@ -72,19 +72,17 @@ public abstract class AbstractLoadCache {
    *
    * @param newHeartbeatSample The latest heartbeat sample.
    */
-  public void cacheHeartbeatSample(AbstractHeartbeatSample newHeartbeatSample) {
-    synchronized (slidingWindow) {
-      // Only sequential heartbeats are accepted.
-      // And un-sequential heartbeats will be discarded.
-      if (getLastSample() == null
-          || getLastSample().getSampleLogicalTimestamp()
-              <= newHeartbeatSample.getSampleLogicalTimestamp()) {
-        slidingWindow.add(newHeartbeatSample);
-      }
+  public synchronized void cacheHeartbeatSample(AbstractHeartbeatSample newHeartbeatSample) {
+    // Only sequential heartbeats are accepted.
+    // And un-sequential heartbeats will be discarded.
+    if (getLastSample() == null
+        || getLastSample().getSampleLogicalTimestamp()
+            <= newHeartbeatSample.getSampleLogicalTimestamp()) {
+      slidingWindow.add(newHeartbeatSample);
+    }
 
-      if (slidingWindow.size() > MAXIMUM_WINDOW_SIZE) {
-        slidingWindow.remove(0);
-      }
+    if (slidingWindow.size() > MAXIMUM_WINDOW_SIZE) {
+      slidingWindow.remove(0);
     }
   }
 
@@ -100,11 +98,6 @@ public abstract class AbstractLoadCache {
   public boolean hasHeartbeatSample() {
     return getLastSample() != null;
   }
-
-  /**
-   * Update currentStatistics based on the latest heartbeat sample that cached in the slidingWindow.
-   */
-  public abstract void updateCurrentStatistics(boolean forceUpdate);
 
   public AbstractStatistics getCurrentStatistics() {
     return currentStatistics.get();
