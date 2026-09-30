@@ -36,57 +36,35 @@ public class ConfigNodeHeartbeatCache extends BaseNodeCache {
   public static final NodeStatistics CURRENT_NODE_STATISTICS =
       new NodeStatistics(0, NodeStatus.Running, null, 0);
 
+  private final boolean isCurrentNode;
+
   /** Constructor for create ConfigNodeHeartbeatCache with default NodeStatistics. */
   public ConfigNodeHeartbeatCache(int configNodeId) {
+
     super(configNodeId);
+    this.isCurrentNode = configNodeId == CURRENT_NODE_ID;
   }
 
   /** Constructor only for ConfigNode-leader. */
   public ConfigNodeHeartbeatCache(int configNodeId, NodeStatistics statistics) {
-    super(configNodeId);
+
+    this(configNodeId);
     this.currentStatistics.set(statistics);
   }
 
   @Override
-  public synchronized void updateCurrentStatistics(boolean forceUpdate) {
-    // Skip itself and the Removing status can not be updated
-    if (nodeId == CURRENT_NODE_ID || NodeStatus.Removing.equals(getNodeStatus())) {
-      return;
+  protected NodeStatistics calculateCurrentStatistics() {
+    if (isCurrentNode) {
+      return (NodeStatistics) currentStatistics.get();
     }
-
-    NodeHeartbeatSample lastSample;
-    // Update Node status
-    NodeStatus status;
     long currentNanoTime = System.nanoTime();
-    final List<AbstractHeartbeatSample> heartbeatHistory;
-    synchronized (slidingWindow) {
-      lastSample = (NodeHeartbeatSample) getLastSample();
-      heartbeatHistory = Collections.unmodifiableList(slidingWindow);
-
-      if (lastSample == null) {
-        /* First heartbeat not received from this ConfigNode, status is UNKNOWN */
-        status = NodeStatus.Unknown;
-      } else if (!failureDetector.isAvailable(nodeId, heartbeatHistory)) {
-        /* Failure detector decides that this ConfigNode is UNKNOWN */
-        status = NodeStatus.Unknown;
-      } else {
-        status = lastSample.getStatus();
-      }
-    }
-
-    // The Stopped status is sticky: heartbeat-driven updates (heartbeat failure, failure
-    // detection) must not refresh a gracefully stopped node back to Unknown. A live status
-    // reported by a heartbeat (e.g. Running after the node restarts) still revives it. Removing
-    // needs no extra protection here: the guard above unconditionally keeps it.
-    if (NodeStatus.Stopped.equals(getNodeStatus()) && NodeStatus.Unknown.equals(status)) {
-      status = NodeStatus.Stopped;
-    }
-
-    /* Update loadScore */
-    // Only consider Running ConfigNode as available currently
-    // TODO: Construct load score module
-    long loadScore = NodeStatus.isNormalStatus(status) ? 0 : Long.MAX_VALUE;
-
-    currentStatistics.set(new NodeStatistics(currentNanoTime, status, null, loadScore));
+    NodeHeartbeatSample lastSample = (NodeHeartbeatSample) getLastSample();
+    List<AbstractHeartbeatSample> heartbeatHistory = Collections.unmodifiableList(slidingWindow);
+    NodeStatus status =
+        lastSample == null || !failureDetector.isAvailable(nodeId, heartbeatHistory)
+            ? NodeStatus.Unknown
+            : lastSample.getStatus();
+    return new NodeStatistics(
+        currentNanoTime, status, null, NodeStatus.isNormalStatus(status) ? 0 : Long.MAX_VALUE);
   }
 }

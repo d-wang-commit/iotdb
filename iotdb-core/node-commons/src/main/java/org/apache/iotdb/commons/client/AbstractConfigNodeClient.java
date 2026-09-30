@@ -19,6 +19,7 @@
 
 package org.apache.iotdb.commons.client;
 
+import org.apache.iotdb.common.rpc.thrift.TAINodeLocation;
 import org.apache.iotdb.common.rpc.thrift.TConfigNodeLocation;
 import org.apache.iotdb.common.rpc.thrift.TDataNodeLocation;
 import org.apache.iotdb.common.rpc.thrift.TEndPoint;
@@ -546,6 +547,11 @@ public abstract class AbstractConfigNodeClient<C extends AbstractConfigNodeClien
 
   @Override
   public TSStatus reportDataNodeShutdown(TDataNodeLocation dataNodeLocation) throws TException {
+    return null;
+  }
+
+  @Override
+  public TSStatus reportAINodeShutdown(TAINodeLocation aiNodeLocation) throws TException {
     return null;
   }
 

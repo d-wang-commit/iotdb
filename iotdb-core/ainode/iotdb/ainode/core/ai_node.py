@@ -18,6 +18,7 @@
 import os
 import signal
 import threading
+from contextlib import closing
 from datetime import datetime
 
 import psutil
@@ -87,7 +88,8 @@ class AINode:
     def __init__(self):
         self._rpc_service = None
         self._rpc_handler = None
-        self._stop_event = None
+        self._stop_event = threading.Event()
+        self._stop_lock = threading.RLock()
 
     def start(self):
         _check_path_permission()
@@ -144,8 +146,8 @@ class AINode:
         logger.info("IoTDB-AINode has successfully started.")
 
         # Register stop hook
-        self._stop_event = threading.Event()
         signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
 
         self._rpc_service.join()
 
@@ -158,7 +160,21 @@ class AINode:
         self.stop()
 
     def stop(self):
-        if not self._stop_event.is_set():
+        with self._stop_lock:
+            if self._stop_event.is_set():
+                return
             self._stop_event.set()
-            self._rpc_handler.stop()
+
+        try:
+            with closing(
+                ClientManager().borrow_config_node_client(timeout_ms=2000)
+            ) as client:
+                client.report_shutdown(_generate_configuration().location)
+        except Exception as e:
+            logger.warning("Failed to report AINode shutdown to ConfigNode:", e)
+        finally:
+            # Keep the RPC service thread alive until reporting and cleanup finish.
             self._rpc_service.stop()
+
+    def is_stopping(self) -> bool:
+        return self._stop_event.is_set()

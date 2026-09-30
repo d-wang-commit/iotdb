@@ -67,7 +67,10 @@ class AINodeRPCServiceHandler(IAINodeRPCService.Iface):
         return get_status(TSStatusCode.SUCCESS_STATUS, "AINode stopped successfully.")
 
     def getAIHeartbeat(self, req: TAIHeartbeatReq) -> TAIHeartbeatResp:
-        return ClusterManager.get_heart_beat(req)
+        response = ClusterManager.get_heart_beat(req)
+        if self._ainode.is_stopping():
+            response.status = "Stopped"
+        return response
 
     def showAIDevices(self) -> TShowAIDevicesResp:
         device_id_map = {"cpu": "cpu"}

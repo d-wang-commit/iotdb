@@ -404,6 +404,11 @@ public class ConfigNodeRPCServiceProcessor implements IConfigNodeRPCService.Ifac
   }
 
   @Override
+  public TSStatus reportAINodeShutdown(TAINodeLocation aiNodeLocation) {
+    return configManager.reportAINodeShutdown(aiNodeLocation);
+  }
+
+  @Override
   public TDataNodeConfigurationResp getDataNodeConfiguration(int dataNodeID) {
     GetDataNodeConfigurationPlan queryReq = new GetDataNodeConfigurationPlan(dataNodeID);
     DataNodeConfigurationResp queryResp =

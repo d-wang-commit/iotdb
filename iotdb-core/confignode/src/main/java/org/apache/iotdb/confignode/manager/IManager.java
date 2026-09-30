@@ -19,6 +19,7 @@
 
 package org.apache.iotdb.confignode.manager;
 
+import org.apache.iotdb.common.rpc.thrift.TAINodeLocation;
 import org.apache.iotdb.common.rpc.thrift.TConfigNodeLocation;
 import org.apache.iotdb.common.rpc.thrift.TConsensusGroupId;
 import org.apache.iotdb.common.rpc.thrift.TDataNodeLocation;
@@ -341,6 +342,9 @@ public interface IManager {
    * @return AINodeToStatusResp
    */
   TSStatus removeAINode();
+
+  /** Report an AINode shutdown, retaining Removing if removal is already in progress. */
+  TSStatus reportAINodeShutdown(TAINodeLocation aiNodeLocation);
 
   /**
    * Report that the specified DataNode will be shutdown.

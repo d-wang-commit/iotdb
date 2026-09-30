@@ -26,7 +26,6 @@ import org.apache.iotdb.common.rpc.thrift.TDataNodeLocation;
 import org.apache.iotdb.common.rpc.thrift.TRegionReplicaSet;
 import org.apache.iotdb.common.rpc.thrift.TSStatus;
 import org.apache.iotdb.commons.cluster.NodeStatus;
-import org.apache.iotdb.commons.cluster.NodeType;
 import org.apache.iotdb.commons.cluster.RegionStatus;
 import org.apache.iotdb.commons.service.metric.MetricService;
 import org.apache.iotdb.commons.utils.NodeUrlUtils;
@@ -43,7 +42,6 @@ import org.apache.iotdb.confignode.manager.ConfigManager;
 import org.apache.iotdb.confignode.manager.lease.DataNodeContactTracker;
 import org.apache.iotdb.confignode.manager.load.balancer.region.GreedyCopySetRegionGroupAllocator;
 import org.apache.iotdb.confignode.manager.load.balancer.region.IRegionGroupAllocator;
-import org.apache.iotdb.confignode.manager.load.cache.node.NodeHeartbeatSample;
 import org.apache.iotdb.confignode.manager.load.cache.region.RegionHeartbeatSample;
 import org.apache.iotdb.confignode.manager.partition.PartitionMetrics;
 import org.apache.iotdb.confignode.persistence.node.NodeInfo;
@@ -55,6 +53,7 @@ import org.apache.iotdb.rpc.TSStatusCode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -140,7 +139,8 @@ public class RemoveDataNodeHandler {
    *     Removing, Running, etc.)
    */
   public void changeDataNodeStatus(
-      List<TDataNodeLocation> removedDataNodes, Map<Integer, NodeStatus> nodeStatusMap) {
+      List<TDataNodeLocation> removedDataNodes, Map<Integer, NodeStatus> nodeStatusMap)
+      throws IOException {
     LOGGER.info(
         ProcedureMessages.BEGIN_TO_CHANGE_DATANODE_STATUS_NODESTATUSMAP,
         REMOVE_DATANODE_PROCESS,
@@ -158,27 +158,50 @@ public class RemoveDataNodeHandler {
     CnToDnInternalServiceAsyncRequestManager.getInstance()
         .sendAsyncRequestWithRetry(changeDataNodeStatusContext);
 
+    IOException failure = null;
     for (Map.Entry<Integer, TSStatus> entry :
         changeDataNodeStatusContext.getResponseMap().entrySet()) {
       int dataNodeId = entry.getKey();
+
       NodeStatus nodeStatus = nodeStatusMap.get(dataNodeId);
-      RegionStatus regionStatus = RegionStatus.valueOf(nodeStatus.getStatus());
 
       if (!isSucceed(entry.getValue())) {
-        LOGGER.error(
-            ProcedureMessages.FAILED_TO_CHANGE_DATANODE_STATUS_DATANODEID_NODESTATUS,
-            REMOVE_DATANODE_PROCESS,
-            dataNodeId,
-            nodeStatus);
-        continue;
+
+        NodeStatus currentStatus = configManager.getLoadManager().getNodeStatus(dataNodeId);
+        // Offline removal/rollback does not require an unreachable DataNode to acknowledge.
+        // A previously committed Removing transition is also safe to retry.
+
+        boolean offlineOrAlreadyRemoving =
+            nodeStatus == NodeStatus.Unknown
+                || nodeStatus == NodeStatus.Stopped
+                || (nodeStatus == NodeStatus.Removing
+                    && (currentStatus == NodeStatus.Unknown
+                        || currentStatus == NodeStatus.Stopped
+                        || currentStatus == NodeStatus.Removing));
+        if (!offlineOrAlreadyRemoving) {
+          LOGGER.error(
+              ProcedureMessages.FAILED_TO_CHANGE_DATANODE_STATUS_DATANODEID_NODESTATUS,
+              REMOVE_DATANODE_PROCESS,
+              dataNodeId,
+              nodeStatus);
+
+          failure = new IOException(entry.getValue().toString());
+          continue;
+        }
       }
 
       // Force updating NodeStatus
+
       long currentTime = System.nanoTime();
-      configManager
-          .getLoadManager()
-          .forceUpdateNodeCache(
-              NodeType.DataNode, dataNodeId, new NodeHeartbeatSample(currentTime, nodeStatus));
+
+      TSStatus status =
+          configManager.getLoadManager().trySetNodeStatus(dataNodeId, nodeStatus, true);
+      if (!isSucceed(status)) {
+        // Do not advance the persisted procedure state before its node status is durable.
+
+        failure = new IOException(status.toString());
+        continue;
+      }
 
       LOGGER.info(
           ProcedureMessages.FORCE_UPDATE_NODECACHE_DATANODEID_NODESTATUS_CURRENTTIME,
@@ -188,7 +211,13 @@ public class RemoveDataNodeHandler {
           currentTime);
 
       // Force update RegionStatus
+
+      RegionStatus regionStatus =
+          nodeStatus == NodeStatus.Stopped
+              ? RegionStatus.Unknown
+              : RegionStatus.valueOf(nodeStatus.getStatus());
       if (regionStatus != RegionStatus.Removing) {
+
         Map<TConsensusGroupId, Map<Integer, RegionHeartbeatSample>> heartbeatSampleMap =
             new TreeMap<>();
         configManager
@@ -202,6 +231,10 @@ public class RemoveDataNodeHandler {
                             dataNodeId, new RegionHeartbeatSample(currentTime, regionStatus))));
         configManager.getLoadManager().forceUpdateRegionGroupCache(heartbeatSampleMap);
       }
+    }
+    if (failure != null) {
+
+      throw failure;
     }
   }
 
@@ -450,15 +483,25 @@ public class RemoveDataNodeHandler {
    *
    * @param removedDataNodes the list of DataNodeLocations to be removed
    */
-  public void removeDataNodePersistence(List<TDataNodeLocation> removedDataNodes) {
+  public void removeDataNodePersistence(List<TDataNodeLocation> removedDataNodes)
+      throws IOException {
     // Remove consensus record
     try {
-      configManager.getConsensusManager().write(new RemoveDataNodePlan(removedDataNodes));
+
+      TSStatus status =
+          configManager.getConsensusManager().write(new RemoveDataNodePlan(removedDataNodes));
+      if (!isSucceed(status)) {
+
+        throw new IOException(status.toString());
+      }
     } catch (ConsensusException e) {
       LOGGER.warn(ConfigNodeMessages.FAILED_IN_THE_WRITE_API_EXECUTING_THE_CONSENSUS_LAYER_DUE, e);
+
+      throw new IOException(e);
     }
 
     // Adjust maxRegionGroupNum
+
     configManager.getClusterSchemaManager().adjustMaxRegionGroupNum();
 
     // Remove metrics

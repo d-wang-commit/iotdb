@@ -21,6 +21,7 @@ package org.apache.iotdb.confignode.procedure.impl.node;
 
 import org.apache.iotdb.common.rpc.thrift.TAINodeLocation;
 import org.apache.iotdb.common.rpc.thrift.TSStatus;
+import org.apache.iotdb.commons.cluster.NodeStatus;
 import org.apache.iotdb.commons.utils.ThriftCommonsSerDeUtils;
 import org.apache.iotdb.confignode.client.sync.CnToAnSyncRequestType;
 import org.apache.iotdb.confignode.client.sync.SyncAINodeClientPool;
@@ -66,6 +67,24 @@ public class RemoveAINodeProcedure extends AbstractNodeProcedure<RemoveAINodeSta
     try {
       switch (state) {
         case NODE_STOP:
+          if (!env.getConfigManager()
+              .getNodeManager()
+              .getRegisteredAINode(removedAINode.getAiNodeId())
+              .isSetLocation()) {
+            setNextState(RemoveAINodeState.NODE_REMOVE);
+            break;
+          }
+          TSStatus status =
+              env.getConfigManager()
+                  .getLoadManager()
+                  .trySetNodeStatus(removedAINode.getAiNodeId(), NodeStatus.Removing, false);
+          if (status.getCode() != TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
+            throw new ProcedureException(
+                String.format(
+                    ProcedureMessages.FAIL_TO_REMOVE_AINODE_ON_CONFIG_NODES,
+                    removedAINode,
+                    status.getMessage()));
+          }
           TSStatus resp =
               (TSStatus)
                   SyncAINodeClientPool.getInstance()
@@ -98,6 +117,7 @@ public class RemoveAINodeProcedure extends AbstractNodeProcedure<RemoveAINodeSta
                     removedAINode,
                     response.getMessage()));
           }
+          env.getConfigManager().getLoadManager().removeNodeCache(removedAINode.getAiNodeId());
           return Flow.NO_MORE_STATE;
         default:
           throw new UnsupportedOperationException(
@@ -121,6 +141,8 @@ public class RemoveAINodeProcedure extends AbstractNodeProcedure<RemoveAINodeSta
                       removedAINode,
                       state,
                       e.getMessage())));
+        } else {
+          setNextState(state);
         }
       }
     }

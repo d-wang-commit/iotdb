@@ -49,18 +49,27 @@ class ClientManager(object):
         self._config_node_endpoint = (
             AINodeDescriptor().get_config().get_ain_target_config_node_list()
         )
+        self._config_nodes = []
 
-    def borrow_config_node_client(self):
-        return ConfigNodeClient(config_leader=self._config_node_endpoint)
+    def borrow_config_node_client(self, timeout_ms=None):
+        return ConfigNodeClient(
+            config_leader=self._config_node_endpoint,
+            timeout_ms=timeout_ms,
+            config_nodes=self._config_nodes,
+        )
+
+    def update_config_nodes(self, config_nodes):
+        self._config_nodes = list(config_nodes)
 
 
 class ConfigNodeClient(object):
-    def __init__(self, config_leader: TEndPoint):
+    def __init__(self, config_leader: TEndPoint, timeout_ms=None, config_nodes=None):
         self._config_leader = config_leader
-        self._config_nodes = []
+        self._config_nodes = list(config_nodes or [])
         self._cursor = 0
         self._transport = None
         self._client = None
+        self._timeout_ms = timeout_ms
 
         self._MSG_RECONNECTION_FAIL = (
             "Fail to connect to any config node. Please check status of ConfigNodes"
@@ -82,9 +91,6 @@ class ConfigNodeClient(object):
                     self._config_leader,
                 )
                 self._config_leader = None
-
-        if self._transport is not None:
-            self._transport.close()
 
         try_host_num = 0
         while try_host_num < len(self._config_nodes):
@@ -109,6 +115,7 @@ class ConfigNodeClient(object):
         raise TException(self._MSG_RECONNECTION_FAIL)
 
     def _connect(self, target_config_node: TEndPoint) -> None:
+        self.close()
         if AINodeDescriptor().get_config().get_ain_internal_ssl_enabled():
             import ssl
             import sys
@@ -133,11 +140,13 @@ class ConfigNodeClient(object):
             )
         else:
             socket = TSocket.TSocket(target_config_node.ip, target_config_node.port)
+        socket.setTimeout(self._timeout_ms)
         transport = TTransport.TFramedTransport(socket)
         if not transport.isOpen():
             try:
                 transport.open()
             except TTransport.TTransportException as e:
+                transport.close()
                 logger.error("TTransportException: {}".format(e))
                 raise e
 
@@ -145,7 +154,13 @@ class ConfigNodeClient(object):
             protocol = TCompactProtocol.TCompactProtocol(transport)
         else:
             protocol = TBinaryProtocol.TBinaryProtocol(transport)
+        self._transport = transport
         self._client = IConfigNodeRPCService.Client(protocol)
+
+    def close(self) -> None:
+        if self._transport is not None:
+            self._transport.close()
+            self._transport = None
 
     def _wait_and_reconnect(self) -> None:
         # wait to start the next try
@@ -191,7 +206,10 @@ class ConfigNodeClient(object):
                     verify_success(
                         resp.status, "An error occurs when calling node_register()"
                     )
-                    self._config_nodes = resp.configNodeList
+                    self._config_nodes = [
+                        node.internalEndPoint for node in resp.configNodeList
+                    ]
+                    ClientManager().update_config_nodes(self._config_nodes)
                     return resp.aiNodeId
             except TTransport.TException:
                 logger.warning(
@@ -222,7 +240,10 @@ class ConfigNodeClient(object):
                     verify_success(
                         resp.status, "An error occurs when calling node_restart()"
                     )
-                    self._config_nodes = resp.configNodeList
+                    self._config_nodes = [
+                        node.internalEndPoint for node in resp.configNodeList
+                    ]
+                    ClientManager().update_config_nodes(self._config_nodes)
                     return resp.status
             except TTransport.TException:
                 logger.warning(
@@ -251,6 +272,19 @@ class ConfigNodeClient(object):
                 )
                 self._config_leader = None
             self._wait_and_reconnect()
+        raise TException(self._MSG_RECONNECTION_FAIL)
+
+    def report_shutdown(self, location: TAINodeLocation) -> None:
+        for attempt in range(self._RETRY_NUM):
+            try:
+                status = self._client.reportAINodeShutdown(location)
+                if not self._update_config_node_leader(status):
+                    verify_success(status, "Failed to report AINode shutdown")
+                    return
+            except TTransport.TException:
+                self._config_leader = None
+            if attempt + 1 < self._RETRY_NUM:
+                self._wait_and_reconnect()
         raise TException(self._MSG_RECONNECTION_FAIL)
 
     def get_ainode_configuration(self, node_id: int) -> map:

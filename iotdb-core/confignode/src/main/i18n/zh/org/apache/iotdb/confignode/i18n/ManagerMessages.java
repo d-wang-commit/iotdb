@@ -486,10 +486,8 @@ public final class ManagerMessages {
       "成功传输 config region 快照 {}。";
   public static final String THERE_IS_NO_RUNNING_DATANODE_TO_EXECUTE_CQ =
       "没有处于 RUNNING 状态的 DataNode 可用于执行 CQ {}";
-  public static final String LOG_THE_CONFIGNODE_IS_REMOVING_SKIP_MARKING_IT_AS_STOPPED_41B041A3 =
-      "ConfigNode-{} 当前处于 Removing 状态，跳过将其标记为 Stopped";
-  public static final String LOG_THE_CONFIGNODE_WILL_BE_SHUTDOWN_SOON_MARK_IT_AS_STOPPED_D2A64AFD =
-      "ConfigNode-{} 即将关闭，将其标记为 Stopped";
+  public static final String LOG_NODE_ARG_REPORTED_SHUTDOWN_CURRENT_STATUS_IS_ARG_A375D665 =
+      "节点 {} 已报告停止；当前状态为 {}。";
   public static final String THE_CONFIG_REGION_AIR_GAP_CONNECTOR_DOES_NOT_SUPPORT_TRANSFERRING =
       "config region air gap connector 不支持传输单文件分片字节。";
   public static final String THE_CONFIG_REGION_SINK_DOES_NOT_SUPPORT_TRANSFERRING_SINGLE_FILE =
@@ -498,10 +496,6 @@ public final class ManagerMessages {
       "无法解析 config region 快照 %s。";
   public static final String THE_DATABASE_DOESN_T_EXIST_MAYBE_IT_HAS_BEEN_PRE =
       "Database: {} 不存在，可能已被预删除。";
-  public static final String LOG_THE_DATANODE_IS_REMOVING_SKIP_MARKING_IT_AS_STOPPED_90F95D71 =
-      "DataNode-{} 当前处于 Removing 状态，跳过将其标记为 Stopped";
-  public static final String LOG_THE_DATANODE_WILL_BE_SHUTDOWN_SOON_MARK_IT_AS_STOPPED_05CF8A45 =
-      "DataNode-{} 即将关闭，将其标记为 Stopped";
   public static final String THE_REMOVENODEREPLICASELECT_METHOD_OF_GREEDYREGIONGROUPALLOCATOR_IS_YET =
       "GreedyRegionGroupAllocator 的 removeNodeReplicaSelect 方法尚未实现。";
   public static final String THE_REMOVENODEREPLICASELECT_METHOD_OF_PARTITEGRAPHPLACEMENTREGIONGROUPALLOCATOR =
@@ -707,4 +701,6 @@ public final class ManagerMessages {
       MESSAGE_ARG_PLEASE_MANUALLY_CHECK_LATER_WHETHER_THE_PROCEDURE_IS_EXECUTED_SUCCESSFULLY_A82B739D =
           "%s 请稍后手动检查该 Procedure 是否执行成功。";
 
+  public static final String MESSAGE_CONFIGNODE_LEADER_IS_WAITING_FOR_NODE_STATUS_PERSISTENCE_8CA96809 =
+      "ConfigNode leader 正在等待节点状态持久化。";
 }

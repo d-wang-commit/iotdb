@@ -27,11 +27,15 @@ import org.apache.iotdb.common.rpc.thrift.TDataNodeConfiguration;
 import org.apache.iotdb.common.rpc.thrift.TDataNodeLocation;
 import org.apache.iotdb.common.rpc.thrift.TEndPoint;
 import org.apache.iotdb.common.rpc.thrift.TRegionReplicaSet;
+import org.apache.iotdb.common.rpc.thrift.TSStatus;
 import org.apache.iotdb.commons.cluster.NodeStatus;
 import org.apache.iotdb.commons.cluster.NodeType;
 import org.apache.iotdb.commons.cluster.RegionStatus;
 import org.apache.iotdb.confignode.conf.ConfigNodeConfig;
 import org.apache.iotdb.confignode.conf.ConfigNodeDescriptor;
+import org.apache.iotdb.confignode.consensus.request.write.confignode.UpdateNodeStatusPlan;
+import org.apache.iotdb.confignode.consensus.request.write.confignode.UpdateNodeStatusPlan.Operation;
+import org.apache.iotdb.confignode.i18n.ConfigNodeMessages;
 import org.apache.iotdb.confignode.i18n.ManagerMessages;
 import org.apache.iotdb.confignode.manager.IManager;
 import org.apache.iotdb.confignode.manager.ProcedureManager;
@@ -49,6 +53,8 @@ import org.apache.iotdb.confignode.manager.load.cache.region.RegionGroupStatisti
 import org.apache.iotdb.confignode.manager.load.cache.region.RegionHeartbeatSample;
 import org.apache.iotdb.confignode.manager.load.cache.region.RegionStatistics;
 import org.apache.iotdb.confignode.manager.partition.RegionGroupStatus;
+import org.apache.iotdb.consensus.exception.ConsensusException;
+import org.apache.iotdb.rpc.TSStatusCode;
 
 import org.apache.thrift.annotation.Nullable;
 import org.slf4j.Logger;
@@ -90,6 +96,7 @@ public class LoadCache {
   // False indicates there is no processing heartbeat request, true otherwise
   private final Map<Integer, AtomicBoolean> heartbeatProcessingMap;
   // Map<NodeId, BaseNodeCache>
+
   private final Map<Integer, BaseNodeCache> nodeCacheMap;
   // Map<RegionGroupId, RegionGroupCache>
   private final Map<TConsensusGroupId, RegionGroupCache> regionGroupCacheMap;
@@ -104,6 +111,8 @@ public class LoadCache {
   private Map<Integer, Set<Integer>> topologyGraph;
   private final AtomicBoolean topologyUpdated;
 
+  private IManager configManager;
+
   public LoadCache() {
     this.nodeCacheMap = new ConcurrentHashMap<>();
     this.heartbeatProcessingMap = new ConcurrentHashMap<>();
@@ -117,6 +126,7 @@ public class LoadCache {
   }
 
   public void initHeartbeatCache(final IManager configManager) {
+    this.configManager = configManager;
     initNodeHeartbeatCache(
         configManager.getNodeManager().getRegisteredConfigNodes(),
         configManager.getNodeManager().getRegisteredDataNodes(),
@@ -148,10 +158,11 @@ public class LoadCache {
           }
         });
     // Force set itself and never update
-    nodeCacheMap.put(
-        ConfigNodeHeartbeatCache.CURRENT_NODE_ID,
+    ConfigNodeHeartbeatCache currentNodeCache =
         new ConfigNodeHeartbeatCache(
-            CURRENT_NODE_ID, ConfigNodeHeartbeatCache.CURRENT_NODE_STATISTICS));
+            CURRENT_NODE_ID, ConfigNodeHeartbeatCache.CURRENT_NODE_STATISTICS);
+    currentNodeCache.initializeNodeStatus(null, this::persistNodeStatus);
+    nodeCacheMap.put(CURRENT_NODE_ID, currentNodeCache);
 
     // Init DataNodeHeartbeatCache
     registeredDataNodes.forEach(
@@ -216,24 +227,60 @@ public class LoadCache {
   }
 
   /**
-   * Create a new NodeHeartbeatCache for the specified Node.
+   * Create a NodeHeartbeatCache for the specified Node if it does not already exist.
    *
    * @param nodeType The specified NodeType
    * @param nodeId The specified NodeId
    */
   public void createNodeHeartbeatCache(NodeType nodeType, int nodeId) {
-    switch (nodeType) {
-      case ConfigNode:
-        nodeCacheMap.put(nodeId, new ConfigNodeHeartbeatCache(nodeId));
-        break;
-      case DataNode:
-        nodeCacheMap.put(nodeId, new DataNodeHeartbeatCache(nodeId));
-        break;
-      case AINode:
-        nodeCacheMap.put(nodeId, new AINodeHeartbeatCache(nodeId));
-        break;
+    // A recovered registration procedure can repeat this call while a status write is in progress.
+    // Keep the existing cache and its heartbeat processing flag so that pending updates stay
+    // visible.
+    nodeCacheMap.computeIfAbsent(
+        nodeId,
+        id -> {
+          BaseNodeCache cache =
+              switch (nodeType) {
+                case ConfigNode -> new ConfigNodeHeartbeatCache(id);
+                case DataNode -> new DataNodeHeartbeatCache(id);
+                case AINode -> new AINodeHeartbeatCache(id);
+              };
+          if (configManager != null) {
+            cache.initializeNodeStatus(
+                configManager.getNodeManager().getPersistedNodeStatus(id), this::persistNodeStatus);
+          }
+          return cache;
+        });
+    heartbeatProcessingMap.putIfAbsent(nodeId, new AtomicBoolean(false));
+  }
+
+  private TSStatus persistNodeStatus(BaseNodeCache cache, NodeStatus status) {
+    int nodeId = cache.getNodeId();
+
+    if (nodeCacheMap.get(nodeId) != cache) {
+      return new TSStatus(TSStatusCode.EXECUTE_STATEMENT_ERROR.getStatusCode());
     }
-    heartbeatProcessingMap.put(nodeId, new AtomicBoolean(false));
+    NodeStatus persistedStatus = status.isPersistentStatus() ? status : null;
+
+    if (configManager.getNodeManager().getPersistedNodeStatus(nodeId) == persistedStatus) {
+      return new TSStatus(TSStatusCode.SUCCESS_STATUS.getStatusCode());
+    }
+    Operation operation = Operation.fromNodeStatus(status);
+    try {
+      return configManager.getConsensusManager().write(new UpdateNodeStatusPlan(nodeId, operation));
+    } catch (ConsensusException e) {
+
+      LOGGER.warn(ConfigNodeMessages.FAILED_IN_THE_WRITE_API_EXECUTING_THE_CONSENSUS_LAYER_DUE, e);
+      return new TSStatus(TSStatusCode.EXECUTE_STATEMENT_ERROR.getStatusCode())
+          .setMessage(e.getMessage());
+    }
+  }
+
+  public TSStatus trySetNodeStatus(int nodeId, NodeStatus status, boolean force) {
+    BaseNodeCache cache = nodeCacheMap.get(nodeId);
+    return cache == null
+        ? new TSStatus(TSStatusCode.INTERNAL_SERVER_ERROR.getStatusCode())
+        : cache.trySetNodeStatus(status, force);
   }
 
   /**
@@ -269,9 +316,9 @@ public class LoadCache {
    * @param sample the latest heartbeat sample
    */
   public void cacheAINodeHeartbeatSample(int nodeId, NodeHeartbeatSample sample) {
-    nodeCacheMap
-        .computeIfAbsent(nodeId, empty -> new AINodeHeartbeatCache(nodeId))
-        .cacheHeartbeatSample(sample);
+    // Only cache sample when the corresponding loadCache exists
+    Optional.ofNullable(nodeCacheMap.get(nodeId))
+        .ifPresent(node -> node.cacheHeartbeatSample(sample));
     Optional.ofNullable(heartbeatProcessingMap.get(nodeId)).ifPresent(node -> node.set(false));
   }
 
@@ -365,11 +412,14 @@ public class LoadCache {
         .ifPresent(group -> group.cacheHeartbeatSample(sample));
   }
 
-  /** Update the NodeStatistics of all Nodes. */
-  public void updateNodeStatistics(boolean forceUpdate) {
-    nodeCacheMap
-        .values()
-        .forEach(baseNodeCache -> baseNodeCache.updateCurrentStatistics(forceUpdate));
+  public boolean updateNodeStatistics() {
+    boolean success = true;
+    for (BaseNodeCache cache : nodeCacheMap.values()) {
+
+      success &=
+          cache.updateNodeStatistics().getCode() == TSStatusCode.SUCCESS_STATUS.getStatusCode();
+    }
+    return success;
   }
 
   /** Update the RegionGroupStatistics of all RegionGroups. */
@@ -379,9 +429,7 @@ public class LoadCache {
 
   /** Update the ConsensusGroupStatistics of all RegionGroups. */
   public void updateConsensusGroupStatistics() {
-    consensusGroupCacheMap
-        .values()
-        .forEach(consensusGroupCache -> consensusGroupCache.updateCurrentStatistics(false));
+    consensusGroupCacheMap.values().forEach(ConsensusGroupCache::updateCurrentStatistics);
   }
 
   /**
@@ -504,9 +552,11 @@ public class LoadCache {
           if (nodeId == ConfigNodeHeartbeatCache.CURRENT_NODE_ID) {
             return;
           }
+
           if ((nodeCache instanceof ConfigNodeHeartbeatCache
                   || nodeCache instanceof DataNodeHeartbeatCache)
-              && !nodeCache.hasHeartbeatSample()) {
+              && !nodeCache.hasHeartbeatSample()
+              && !nodeCache.getNodeStatus().isPersistentStatus()) {
             unreadyNodes.add(nodeId);
           }
         });

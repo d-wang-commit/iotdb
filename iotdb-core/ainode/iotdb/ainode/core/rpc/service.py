@@ -132,5 +132,7 @@ class AINodeRPCService(threading.Thread):
         if not self._stop_event.is_set():
             logger.info("Stopping the RPC service of IoTDB-AINode...")
             self._stop_event.set()
-            self.__pool_server.stop()
-            self._handler.stop()
+            try:
+                self._handler.stop()
+            finally:
+                self.__pool_server.stop()

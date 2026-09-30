@@ -1395,6 +1395,11 @@ service IConfigNodeRPCService {
 
   common.TSStatus removeAINode(TAINodeRemoveReq req)
 
+  /**
+   * Report an AINode shutdown. The leader marks it as Stopped, retaining Removing if set.
+   */
+  common.TSStatus reportAINodeShutdown(common.TAINodeLocation aiNodeLocation)
+
   TShowAINodesResp showAINodes()
 
   TAINodeConfigurationResp getAINodeConfiguration(i32 aiNodeId)
@@ -1422,7 +1427,7 @@ service IConfigNodeRPCService {
 
   /**
    * Report that the specified DataNode will be shutdown.
-   * The ConfigNode-leader will mark it as Unknown.
+    * The ConfigNode-leader will mark it as Stopped, retaining Removing if set.
    *
    * @return SUCCESS_STATUS if reporting successfully
    */
@@ -1657,7 +1662,7 @@ service IConfigNodeRPCService {
 
   /**
    * Report that the specified ConfigNode will be shutdown.
-   * The ConfigNode-leader will mark it as Unknown.
+   * The ConfigNode-leader will mark it as Stopped, retaining Removing if set.
    *
    * @return SUCCESS_STATUS if reporting successfully
    */

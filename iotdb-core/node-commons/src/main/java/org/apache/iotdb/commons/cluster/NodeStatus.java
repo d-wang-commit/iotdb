@@ -59,9 +59,31 @@ public enum NodeStatus {
     throw new RuntimeException(String.format(CommonMessages.NODE_STATUS_NOT_EXIST, status));
   }
 
+  public static NodeStatus transition(NodeStatus previous, NodeStatus requested, boolean force) {
+    if (force) {
+      return requested;
+    }
+    if (previous == Removing) {
+      return Removing;
+    }
+
+    if (previous == Stopped && requested == Unknown) {
+      return Stopped;
+    }
+    return requested;
+  }
+
   public static boolean isNormalStatus(NodeStatus status) {
     // Currently, the only normal status is Running
     return status != null && status.equals(NodeStatus.Running);
+  }
+
+  /**
+   * Whether this status has a persistent record. Other statuses may still require clearing an
+   * existing record when the node recovers.
+   */
+  public boolean isPersistentStatus() {
+    return this == Stopped || this == Removing;
   }
 
   public static boolean isReadable(NodeStatus status) {
