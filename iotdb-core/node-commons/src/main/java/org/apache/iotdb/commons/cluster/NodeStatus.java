@@ -38,7 +38,16 @@ public enum NodeStatus {
   /** Node was stopped intentionally and reported its shutdown */
   Stopped("Stopped");
 
+  /**
+   * Reasons for entering ReadOnly. These strings cross node RPCs and are compared literally (e.g.
+   * the DiskFull auto-recovery in sampleDiskLoad), so they must stay locale-independent plain
+   * constants instead of i18n messages.
+   */
   public static final String DISK_FULL = "DiskFull";
+
+  public static final String MANUAL = "Manual";
+  public static final String STOPPING = "Stopping";
+  public static final String UNRECOVERABLE_ERROR = "UnrecoverableError";
 
   private final String status;
 
@@ -71,6 +80,35 @@ public enum NodeStatus {
       return Stopped;
     }
     return requested;
+  }
+
+  /**
+   * Selects the reason for a local ReadOnly-to-ReadOnly update: Stopping > Manual >
+   * UnrecoverableError > DiskFull > null or unclassified reasons. Equal priority keeps the previous
+   * reason, including the first unrecoverable error's details.
+   *
+   * <p>Do not apply this priority to received heartbeat reasons, which already reflect the remote
+   * node's decision.
+   */
+  public static String transitionReadOnlyReason(String previous, String requested) {
+    return getReadOnlyReasonPriority(previous) >= getReadOnlyReasonPriority(requested)
+        ? previous
+        : requested;
+  }
+
+  private static int getReadOnlyReasonPriority(String reason) {
+    if (reason == null) {
+      return 0;
+    }
+    if (reason.startsWith(UNRECOVERABLE_ERROR)) {
+      return 2;
+    }
+    return switch (reason) {
+      case STOPPING -> 4;
+      case MANUAL -> 3;
+      case DISK_FULL -> 1;
+      default -> 0;
+    };
   }
 
   public static boolean isNormalStatus(NodeStatus status) {

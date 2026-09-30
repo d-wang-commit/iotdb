@@ -27,6 +27,7 @@ import org.apache.iotdb.commons.enums.HandleSystemErrorStrategy;
 import org.apache.iotdb.commons.enums.PipeRateAverage;
 import org.apache.iotdb.commons.i18n.ConfigMessages;
 import org.apache.iotdb.commons.pipe.config.PipeConfig;
+import org.apache.iotdb.commons.queryengine.utils.DateTimeUtils;
 import org.apache.iotdb.commons.utils.FileUtils;
 import org.apache.iotdb.commons.utils.KillPoint.KillPoint;
 import org.apache.iotdb.rpc.RpcUtils;
@@ -174,12 +175,19 @@ public class CommonConfig {
   /** Status of current system. */
   private volatile NodeStatus status = NodeStatus.Running;
 
+  /** Reason for the current status, meaningful for ReadOnly and updated independently of it. */
+  private volatile String statusReason = null;
+
+  /**
+   * Maximum length of the error message embedded in the UnrecoverableError status reason, keeping
+   * the reason bounded in heartbeats and SHOW results.
+   */
+  private static final int MAX_STATUS_REASON_LENGTH = 256;
+
   private NodeStatus lastStatus = NodeStatus.Unknown;
   private String lastStatusReason = "";
 
   private volatile boolean isStopping = false;
-
-  private volatile String statusReason = null;
 
   private final int TTimePartitionSlotTransmitLimit = 1000;
 
@@ -781,8 +789,30 @@ public class CommonConfig {
     this.handleSystemErrorStrategy = handleSystemErrorStrategy;
   }
 
-  public void handleUnrecoverableError() {
-    handleSystemErrorStrategy.handle();
+  /**
+   * Handles an unrecoverable error with the given exception. The ReadOnly status reason is
+   * assembled here so that all call sites share one format: "UnrecoverableError, <timestamp>,
+   * <error message>". The error message is truncated to {@link #MAX_STATUS_REASON_LENGTH}
+   * characters so that the reason published in heartbeats and SHOW results stays bounded.
+   */
+  public void handleUnrecoverableError(Throwable e) {
+    String errorMessage =
+        e.getMessage() == null || e.getMessage().isEmpty()
+            ? e.getClass().getSimpleName()
+            : e.getMessage();
+    if (errorMessage.length() > MAX_STATUS_REASON_LENGTH) {
+      errorMessage = errorMessage.substring(0, MAX_STATUS_REASON_LENGTH) + "...";
+    }
+    handleUnrecoverableError(
+        NodeStatus.UNRECOVERABLE_ERROR
+            + ", "
+            + DateTimeUtils.convertLongToDate(System.currentTimeMillis(), "ms")
+            + ", "
+            + errorMessage);
+  }
+
+  public void handleUnrecoverableError(String errorReason) {
+    handleSystemErrorStrategy.handle(errorReason);
   }
 
   public double getDiskSpaceWarningThreshold() {
@@ -825,15 +855,50 @@ public class CommonConfig {
     return status;
   }
 
+  public String getStatusReason() {
+    return statusReason;
+  }
+
+  /**
+   * Sets the status reason independently of the status. The status and its reason are two separate
+   * values that can be updated separately, e.g. the disk-full ReadOnly and its recovery in the
+   * heartbeat sampler.
+   */
+  public synchronized void setStatusReason(String statusReason) {
+    this.statusReason = statusReason;
+  }
+
+  /**
+   * Sets the node status without a new reason. An existing ReadOnly reason is preserved when
+   * ReadOnly is requested again; requests for other statuses clear the reason.
+   */
   public synchronized void setNodeStatus(NodeStatus newStatus) {
-    if (status == newStatus) {
+    setNodeStatusWithReason(newStatus, null);
+  }
+
+  /**
+   * Sets the node status and reason together. ReadOnly-to-ReadOnly updates select the reason
+   * through {@link NodeStatus#transitionReadOnlyReason(String, String)}. The status reason is only
+   * meaningful for ReadOnly: avoid passing a non-null reason together with another status (no
+   * production code does this), although the value is still written through for generality.
+   */
+  public synchronized void setNodeStatusWithReason(NodeStatus newStatus, String newReason) {
+    if (status == NodeStatus.ReadOnly && newStatus == NodeStatus.ReadOnly) {
+      newReason = NodeStatus.transitionReadOnlyReason(statusReason, newReason);
+    }
+    if (status == newStatus && Objects.equals(statusReason, newReason)) {
       return;
     }
-
-    logger.info(ConfigMessages.SET_SYSTEM_MODE, status, newStatus);
+    logNodeStatusChange(status, newStatus);
     this.status = newStatus;
-    this.statusReason = null;
+    this.statusReason = newReason;
+  }
 
+  private void logNodeStatusChange(NodeStatus oldStatus, NodeStatus newStatus) {
+    if (oldStatus == newStatus) {
+      return;
+    }
+    logger.info(ConfigMessages.SET_SYSTEM_MODE, oldStatus, newStatus);
     switch (newStatus) {
       case ReadOnly:
         logger.warn(ConfigMessages.STATUS_CHANGE_TO_READ_ONLY);
@@ -844,14 +909,6 @@ public class CommonConfig {
       default:
         break;
     }
-  }
-
-  public String getStatusReason() {
-    return statusReason;
-  }
-
-  public void setStatusReason(String statusReason) {
-    this.statusReason = statusReason;
   }
 
   public int getTTimePartitionSlotTransmitLimit() {

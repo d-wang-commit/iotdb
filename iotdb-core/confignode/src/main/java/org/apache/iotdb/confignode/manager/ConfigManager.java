@@ -119,6 +119,7 @@ import org.apache.iotdb.confignode.manager.cq.CQManager;
 import org.apache.iotdb.confignode.manager.externalservice.ExternalServiceInfo;
 import org.apache.iotdb.confignode.manager.externalservice.ExternalServiceManager;
 import org.apache.iotdb.confignode.manager.load.LoadManager;
+import org.apache.iotdb.confignode.manager.load.cache.node.NodeStatistics;
 import org.apache.iotdb.confignode.manager.node.ClusterNodeStartUtils;
 import org.apache.iotdb.confignode.manager.node.NodeManager;
 import org.apache.iotdb.confignode.manager.node.NodeMetrics;
@@ -629,26 +630,47 @@ public class ConfigManager implements IManager {
               .sorted(Comparator.comparingInt(TDataNodeLocation::getDataNodeId))
               .collect(Collectors.toList());
       Map<Integer, TNodeVersionInfo> nodeVersionInfo = getNodeManager().getNodeVersionInfo();
-      Map<Integer, String> nodeStatus = getLoadManager().getNodeStatusWithReason();
+      Map<Integer, NodeStatistics> nodeStatisticsSnapshot =
+          getLoadManager().getNodeStatisticsSnapshot();
+      Map<Integer, String> nodeStatus = new HashMap<>();
+      Map<Integer, String> nodeStatusReason = new HashMap<>();
+      nodeStatisticsSnapshot.forEach(
+          (nodeId, statistics) -> {
+            nodeStatus.put(nodeId, statistics.getStatus().getStatus());
+            if (statistics.getStatusReason() != null) {
+              nodeStatusReason.put(nodeId, statistics.getStatusReason());
+            }
+          });
       configNodeLocations.forEach(
-          configNodeLocation ->
-              nodeStatus.putIfAbsent(
-                  configNodeLocation.getConfigNodeId(), NodeStatus.Unknown.toString()));
+          configNodeLocation -> {
+            int configNodeId = configNodeLocation.getConfigNodeId();
+            if (!nodeStatus.containsKey(configNodeId)) {
+              // No cache entry means the node has never reported a heartbeat.
+              nodeStatus.put(configNodeId, NodeStatus.Unknown.toString());
+            }
+          });
       dataNodeLocations.forEach(
-          dataNodeLocation ->
-              nodeStatus.putIfAbsent(
-                  dataNodeLocation.getDataNodeId(), NodeStatus.Unknown.toString()));
+          dataNodeLocation -> {
+            int dataNodeId = dataNodeLocation.getDataNodeId();
+            if (!nodeStatus.containsKey(dataNodeId)) {
+              // No cache entry means the node has never reported a heartbeat.
+              nodeStatus.put(dataNodeId, NodeStatus.Unknown.toString());
+            }
+          });
 
       List<TAINodeLocation> aiNodeLocations =
           getNodeManager().getRegisteredAINodes().stream()
               .map(TAINodeConfiguration::getLocation)
               .sorted(Comparator.comparingInt(TAINodeLocation::getAiNodeId))
               .collect(Collectors.toList());
-      Map<Integer, String> nodeStatusMap = getLoadManager().getNodeStatusWithReason();
       aiNodeLocations.forEach(
-          aiNodeLocation ->
-              nodeStatusMap.putIfAbsent(
-                  aiNodeLocation.getAiNodeId(), NodeStatus.Unknown.toString()));
+          aiNodeLocation -> {
+            int aiNodeId = aiNodeLocation.getAiNodeId();
+            if (!nodeStatus.containsKey(aiNodeId)) {
+              // No cache entry means the node has never reported a heartbeat.
+              nodeStatus.put(aiNodeId, NodeStatus.Unknown.toString());
+            }
+          });
 
       return new TShowClusterResp()
           .setStatus(status)
@@ -656,6 +678,7 @@ public class ConfigManager implements IManager {
           .setDataNodeList(dataNodeLocations)
           .setAiNodeList(aiNodeLocations)
           .setNodeStatus(nodeStatus)
+          .setNodeStatusReason(nodeStatusReason)
           .setNodeVersionInfo(nodeVersionInfo);
     } else {
       return new TShowClusterResp()
@@ -664,6 +687,7 @@ public class ConfigManager implements IManager {
           .setDataNodeList(Collections.emptyList())
           .setAiNodeList(Collections.emptyList())
           .setNodeStatus(Collections.emptyMap())
+          .setNodeStatusReason(Collections.emptyMap())
           .setNodeVersionInfo(Collections.emptyMap());
     }
   }
