@@ -58,13 +58,15 @@ public abstract class BaseNodeCache extends AbstractLoadCache {
   }
 
   public synchronized TSStatus updateNodeStatus(NodeStatus status, boolean force) {
-    NodeHeartbeatSample sample = new NodeHeartbeatSample(status);
+    // SET_SYSTEM_STATUS classifies an explicitly requested ReadOnly as Manual on the DataNode.
+    NodeHeartbeatSample sample =
+        new NodeHeartbeatSample(status, status == NodeStatus.ReadOnly ? NodeStatus.MANUAL : null);
     cacheHeartbeatSample(sample);
     return updateCurrentStatistics(
         new NodeStatistics(
             sample.getSampleLogicalTimestamp(),
             status,
-            null,
+            sample.getStatusReason(),
             NodeStatus.isNormalStatus(status) ? 0 : Long.MAX_VALUE),
         force);
   }
@@ -95,10 +97,10 @@ public abstract class BaseNodeCache extends AbstractLoadCache {
     return ((NodeStatistics) currentStatistics.get()).getStatus();
   }
 
-  public String getNodeStatusWithReason() {
-    NodeStatistics statistics = (NodeStatistics) currentStatistics.get();
-    return statistics.getStatusReason() == null
-        ? statistics.getStatus().getStatus()
-        : statistics.getStatus().getStatus() + "(" + statistics.getStatusReason() + ")";
+  /**
+   * @return The reason why lead to current NodeStatus, null if there is none.
+   */
+  public String getNodeStatusReason() {
+    return ((NodeStatistics) currentStatistics.get()).getStatusReason();
   }
 }
