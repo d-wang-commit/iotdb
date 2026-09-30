@@ -151,6 +151,11 @@ public class NodeManager {
     this.removeConfigNodeLock = new ReentrantLock();
   }
 
+  public NodeStatus getPersistedNodeStatus(int nodeId) {
+
+    return nodeInfo.getNodeStatus(nodeId);
+  }
+
   /**
    * Get system configurations.
    *

@@ -37,39 +37,27 @@ public class AINodeHeartbeatCache extends BaseNodeCache {
   }
 
   @Override
-  public void updateCurrentStatistics(boolean forceUpdate) {
-    NodeHeartbeatSample lastSample;
-    final List<AbstractHeartbeatSample> heartbeatHistory;
-    /* Update Node status */
-    NodeStatus status = null;
+  protected NodeStatistics calculateCurrentStatistics() {
+    NodeStatus status;
     String statusReason = null;
     long currentNanoTime = System.nanoTime();
     synchronized (slidingWindow) {
-      lastSample = (NodeHeartbeatSample) getLastSample();
-      heartbeatHistory = Collections.unmodifiableList(slidingWindow);
-      /* Update load sample */
+      NodeHeartbeatSample lastSample = (NodeHeartbeatSample) getLastSample();
+      List<AbstractHeartbeatSample> heartbeatHistory = Collections.unmodifiableList(slidingWindow);
       if (lastSample != null && lastSample.isSetLoadSample()) {
-        latestLoadSample.set((lastSample.getLoadSample()));
+        latestLoadSample.set(lastSample.getLoadSample());
       }
-
-      if (lastSample != null && NodeStatus.Removing.equals(lastSample.getStatus())) {
-        status = NodeStatus.Removing;
-      } else if (!failureDetector.isAvailable(nodeId, heartbeatHistory)) {
-        /* Failure detector decides that this AINode is UNKNOWN */
+      if (lastSample == null || !failureDetector.isAvailable(nodeId, heartbeatHistory)) {
         status = NodeStatus.Unknown;
-      } else if (lastSample != null) {
+      } else {
         status = lastSample.getStatus();
         statusReason = lastSample.getStatusReason();
       }
     }
-
-    long loadScore = NodeStatus.isNormalStatus(status) ? 0 : Long.MAX_VALUE;
-
-    NodeStatistics newStatistics =
-        new NodeStatistics(currentNanoTime, status, statusReason, loadScore);
-    if (!currentStatistics.get().equals(newStatistics)) {
-      // Update the current NodeStatistics if necessary
-      currentStatistics.set(newStatistics);
-    }
+    return new NodeStatistics(
+        currentNanoTime,
+        status,
+        statusReason,
+        NodeStatus.isNormalStatus(status) ? 0 : Long.MAX_VALUE);
   }
 }

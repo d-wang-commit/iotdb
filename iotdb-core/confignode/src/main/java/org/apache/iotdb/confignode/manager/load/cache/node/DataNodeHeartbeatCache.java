@@ -21,11 +21,7 @@ package org.apache.iotdb.confignode.manager.load.cache.node;
 
 import org.apache.iotdb.common.rpc.thrift.TLoadSample;
 import org.apache.iotdb.commons.cluster.NodeStatus;
-import org.apache.iotdb.confignode.i18n.ManagerMessages;
 import org.apache.iotdb.confignode.manager.load.cache.AbstractHeartbeatSample;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import java.util.Collections;
 import java.util.List;
@@ -34,9 +30,8 @@ import java.util.concurrent.atomic.AtomicReference;
 /** Heartbeat cache for cluster DataNodes. */
 public class DataNodeHeartbeatCache extends BaseNodeCache {
 
-  private static final Logger LOGGER = LoggerFactory.getLogger(DataNodeHeartbeatCache.class);
-
   // TODO: The load sample may be moved into NodeStatistics in the future
+
   private final AtomicReference<TLoadSample> latestLoadSample;
 
   /** Constructor for create DataNodeHeartbeatCache with default NodeStatistics. */
@@ -46,65 +41,29 @@ public class DataNodeHeartbeatCache extends BaseNodeCache {
   }
 
   @Override
-  public synchronized void updateCurrentStatistics(boolean forceUpdate) {
-    // The Removing status can not be updated
-    if (!forceUpdate && NodeStatus.Removing.equals(getNodeStatus())) {
-      return;
-    }
-
-    NodeHeartbeatSample lastSample;
-    final List<AbstractHeartbeatSample> heartbeatHistory;
-    /* Update Node status */
+  protected NodeStatistics calculateCurrentStatistics() {
     NodeStatus status;
     String statusReason = null;
     long currentNanoTime = System.nanoTime();
     synchronized (slidingWindow) {
-      lastSample = (NodeHeartbeatSample) getLastSample();
-      heartbeatHistory = Collections.unmodifiableList(slidingWindow);
-      /* Update load sample */
+      NodeHeartbeatSample lastSample = (NodeHeartbeatSample) getLastSample();
+      List<AbstractHeartbeatSample> heartbeatHistory = Collections.unmodifiableList(slidingWindow);
+
       if (lastSample != null && lastSample.isSetLoadSample()) {
         latestLoadSample.set(lastSample.getLoadSample());
       }
-
-      if (lastSample == null) {
-        /* First heartbeat not received from this DataNode, status is UNKNOWN */
-        status = NodeStatus.Unknown;
-      } else if (!failureDetector.isAvailable(nodeId, heartbeatHistory)) {
-        /* Failure detector decides that this DataNode is UNKNOWN */
+      if (lastSample == null || !failureDetector.isAvailable(nodeId, heartbeatHistory)) {
         status = NodeStatus.Unknown;
       } else {
         status = lastSample.getStatus();
         statusReason = lastSample.getStatusReason();
       }
     }
-
-    if (NodeStatus.Removing.equals(getNodeStatus())) {
-      // Removing is the highest-priority sticky status: neither a heartbeat-driven Unknown (e.g.
-      // the onError path of a broken connection) nor the Stopped report may refresh it. Explicit
-      // management status changes (e.g. Running on rollback) still apply.
-      if (NodeStatus.Unknown.equals(status) || NodeStatus.Stopped.equals(status)) {
-        status = NodeStatus.Removing;
-        statusReason = null;
-      }
-    } else if (NodeStatus.Stopped.equals(getNodeStatus()) && NodeStatus.Unknown.equals(status)) {
-      // The Stopped status is sticky: heartbeat-driven updates (heartbeat failure, failure
-      // detection) must not refresh a gracefully stopped node back to Unknown. A live status
-      // reported by a heartbeat (e.g. Running after the node restarts) still revives it.
-      status = NodeStatus.Stopped;
-      statusReason = null;
-    }
-
-    /* Update loadScore */
-    // Only consider Running DataNode as available currently
-    // TODO: Construct load score module
-    long loadScore = NodeStatus.isNormalStatus(status) ? 0 : Long.MAX_VALUE;
-
-    currentStatistics.set(new NodeStatistics(currentNanoTime, status, statusReason, loadScore));
-
-    if (forceUpdate) {
-      LOGGER.debug(
-          ManagerMessages.FORCE_UPDATE_NODECACHE_STATUS_CURRENTNANOTIME, status, currentNanoTime);
-    }
+    return new NodeStatistics(
+        currentNanoTime,
+        status,
+        statusReason,
+        NodeStatus.isNormalStatus(status) ? 0 : Long.MAX_VALUE);
   }
 
   public double getFreeDiskSpace() {
