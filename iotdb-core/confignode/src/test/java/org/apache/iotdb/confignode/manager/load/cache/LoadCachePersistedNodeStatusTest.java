@@ -25,6 +25,7 @@ import org.apache.iotdb.common.rpc.thrift.TConfigNodeLocation;
 import org.apache.iotdb.common.rpc.thrift.TDataNodeConfiguration;
 import org.apache.iotdb.common.rpc.thrift.TDataNodeLocation;
 import org.apache.iotdb.common.rpc.thrift.TEndPoint;
+import org.apache.iotdb.common.rpc.thrift.TLoadSample;
 import org.apache.iotdb.common.rpc.thrift.TSStatus;
 import org.apache.iotdb.commons.cluster.NodeStatus;
 import org.apache.iotdb.confignode.consensus.request.write.confignode.ApplyConfigNodePlan;
@@ -40,6 +41,7 @@ import org.apache.iotdb.confignode.manager.load.cache.node.NodeHeartbeatSample;
 import org.apache.iotdb.confignode.manager.node.NodeManager;
 import org.apache.iotdb.confignode.manager.schema.ClusterSchemaManager;
 import org.apache.iotdb.confignode.persistence.node.NodeInfo;
+import org.apache.iotdb.mpp.rpc.thrift.TDataNodeHeartbeatResp;
 import org.apache.iotdb.rpc.TSStatusCode;
 
 import org.junit.Assert;
@@ -231,6 +233,100 @@ public class LoadCachePersistedNodeStatusTest {
   }
 
   @Test
+  public void testReadOnlyRevivalPublishesReasonOnlyAfterStoppedMarkerIsCleared() throws Exception {
+    nodeInfo.updateNodeStatus(new UpdateNodeStatusPlan(DATA_NODE_ID, Operation.SET_STOPPED));
+    loadCache.initHeartbeatCache(configManager);
+    doReturn(failure())
+        .doAnswer(invocation -> nodeInfo.updateNodeStatus(invocation.getArgument(0)))
+        .when(consensusManager)
+        .write(new UpdateNodeStatusPlan(DATA_NODE_ID, Operation.CLEAR));
+    loadCache.cacheDataNodeHeartbeatSample(
+        DATA_NODE_ID, readOnlySample(System.nanoTime(), NodeStatus.MANUAL));
+
+    Assert.assertFalse(loadCache.updateNodeStatistics());
+    Assert.assertEquals(NodeStatus.Stopped, loadCache.getNodeStatus(DATA_NODE_ID));
+    Assert.assertNull(loadCache.getNodeStatusReason(DATA_NODE_ID));
+    Assert.assertEquals(NodeStatus.Stopped, nodeInfo.getNodeStatus(DATA_NODE_ID));
+
+    Assert.assertTrue(loadCache.updateNodeStatistics());
+    Assert.assertEquals(NodeStatus.ReadOnly, loadCache.getNodeStatus(DATA_NODE_ID));
+    Assert.assertEquals(NodeStatus.MANUAL, loadCache.getNodeStatusReason(DATA_NODE_ID));
+    Assert.assertFalse(nodeInfo.getPersistedNodeStatuses().containsKey(DATA_NODE_ID));
+
+    // The next leader must learn ReadOnly from its own heartbeats, not from durable node state.
+    loadCache.initHeartbeatCache(configManager);
+    Assert.assertEquals(NodeStatus.Unknown, loadCache.getNodeStatus(DATA_NODE_ID));
+    Assert.assertNull(loadCache.getNodeStatusReason(DATA_NODE_ID));
+    loadCache.cacheDataNodeHeartbeatSample(
+        DATA_NODE_ID, readOnlySample(System.nanoTime(), NodeStatus.MANUAL));
+    Assert.assertTrue(loadCache.updateNodeStatistics());
+    Assert.assertEquals(NodeStatus.ReadOnly, loadCache.getNodeStatus(DATA_NODE_ID));
+    Assert.assertEquals(NodeStatus.MANUAL, loadCache.getNodeStatusReason(DATA_NODE_ID));
+  }
+
+  @Test
+  public void testReadOnlyHeartbeatIsNotFilteredByCacheInitializationTime() throws Exception {
+    long previousLeaderTimestamp = System.nanoTime();
+    nodeInfo.updateNodeStatus(new UpdateNodeStatusPlan(DATA_NODE_ID, Operation.SET_STOPPED));
+    loadCache.initHeartbeatCache(configManager);
+    loadCache.cacheDataNodeHeartbeatSample(
+        DATA_NODE_ID, readOnlySample(previousLeaderTimestamp, NodeStatus.MANUAL));
+
+    Assert.assertTrue(loadCache.updateNodeStatistics());
+    Assert.assertEquals(NodeStatus.ReadOnly, loadCache.getNodeStatus(DATA_NODE_ID));
+    Assert.assertEquals(NodeStatus.MANUAL, loadCache.getNodeStatusReason(DATA_NODE_ID));
+    Assert.assertNull(nodeInfo.getNodeStatus(DATA_NODE_ID));
+    verify(consensusManager).write(new UpdateNodeStatusPlan(DATA_NODE_ID, Operation.CLEAR));
+  }
+
+  @Test
+  public void testRestampedSamplePreservesReadOnlyReasonAndLoad() {
+    loadCache.initHeartbeatCache(configManager);
+    loadCache.cacheDataNodeHeartbeatSample(
+        DATA_NODE_ID, new NodeHeartbeatSample(NodeStatus.Running));
+    NodeHeartbeatSample sample =
+        new NodeHeartbeatSample(
+            new TDataNodeHeartbeatResp()
+                .setHeartbeatTimestamp(0)
+                .setStatus(NodeStatus.ReadOnly.getStatus())
+                .setStatusReason(NodeStatus.DISK_FULL)
+                .setLoadSample(new TLoadSample().setFreeDiskSpace(123.0)));
+
+    loadCache.cacheDataNodeHeartbeatSample(
+        DATA_NODE_ID, new NodeHeartbeatSample(System.nanoTime(), sample));
+    Assert.assertTrue(loadCache.updateNodeStatistics());
+    Assert.assertEquals(NodeStatus.ReadOnly, loadCache.getNodeStatus(DATA_NODE_ID));
+    Assert.assertEquals(NodeStatus.DISK_FULL, loadCache.getNodeStatusReason(DATA_NODE_ID));
+    Assert.assertEquals(123.0, loadCache.getFreeDiskSpace(DATA_NODE_ID), 0.0);
+    Assert.assertFalse(nodeInfo.getPersistedNodeStatuses().containsKey(DATA_NODE_ID));
+  }
+
+  @Test
+  public void testStoppingReasonIsClearedByShutdownAndCannotOverrideRemoving() throws Exception {
+    nodeInfo.updateNodeStatus(
+        new UpdateNodeStatusPlan(REMOVING_DATA_NODE_ID, Operation.SET_REMOVING));
+    loadCache.initHeartbeatCache(configManager);
+    for (int nodeId : Arrays.asList(DATA_NODE_ID, REMOVING_DATA_NODE_ID)) {
+      loadCache.cacheDataNodeHeartbeatSample(
+          nodeId, readOnlySample(System.nanoTime(), NodeStatus.STOPPING));
+    }
+    Assert.assertTrue(loadCache.updateNodeStatistics());
+    Assert.assertEquals(NodeStatus.ReadOnly, loadCache.getNodeStatus(DATA_NODE_ID));
+    Assert.assertEquals(NodeStatus.STOPPING, loadCache.getNodeStatusReason(DATA_NODE_ID));
+    Assert.assertEquals(NodeStatus.Removing, loadCache.getNodeStatus(REMOVING_DATA_NODE_ID));
+    Assert.assertNull(loadCache.getNodeStatusReason(REMOVING_DATA_NODE_ID));
+
+    for (int nodeId : Arrays.asList(DATA_NODE_ID, REMOVING_DATA_NODE_ID)) {
+      Assert.assertEquals(
+          success().getCode(),
+          loadCache.updateNodeStatus(nodeId, NodeStatus.Stopped, false).getCode());
+      Assert.assertNull(loadCache.getNodeStatusReason(nodeId));
+    }
+    Assert.assertEquals(NodeStatus.Stopped, nodeInfo.getNodeStatus(DATA_NODE_ID));
+    Assert.assertEquals(NodeStatus.Removing, nodeInfo.getNodeStatus(REMOVING_DATA_NODE_ID));
+  }
+
+  @Test
   public void testStoppedIsNotPublishedBeforePersistenceCompletes() throws Exception {
     loadCache.initHeartbeatCache(configManager);
     loadCache.updateNodeStatus(DATA_NODE_ID, NodeStatus.Running, false);
@@ -312,7 +408,8 @@ public class LoadCachePersistedNodeStatusTest {
   @Test
   public void testExplicitRollbackRestoresOfflineAndRunningStatuses() throws Exception {
     for (NodeStatus rollbackStatus :
-        Arrays.asList(NodeStatus.Unknown, NodeStatus.Stopped, NodeStatus.Running)) {
+        Arrays.asList(
+            NodeStatus.Unknown, NodeStatus.Stopped, NodeStatus.Running, NodeStatus.ReadOnly)) {
       nodeInfo.updateNodeStatus(
           new UpdateNodeStatusPlan(REMOVING_DATA_NODE_ID, Operation.SET_REMOVING));
       loadCache.initHeartbeatCache(configManager);
@@ -322,12 +419,18 @@ public class LoadCachePersistedNodeStatusTest {
           loadCache.updateNodeStatus(REMOVING_DATA_NODE_ID, rollbackStatus, true).getCode());
       Assert.assertEquals(rollbackStatus, loadCache.getNodeStatus(REMOVING_DATA_NODE_ID));
       Assert.assertEquals(
+          rollbackStatus == NodeStatus.ReadOnly ? NodeStatus.MANUAL : null,
+          loadCache.getNodeStatusReason(REMOVING_DATA_NODE_ID));
+      Assert.assertEquals(
           rollbackStatus == NodeStatus.Stopped ? NodeStatus.Stopped : null,
           nodeInfo.getNodeStatus(REMOVING_DATA_NODE_ID));
 
       // Ordinary statistics updates must preserve the successfully committed rollback.
       Assert.assertTrue(loadCache.updateNodeStatistics());
       Assert.assertEquals(rollbackStatus, loadCache.getNodeStatus(REMOVING_DATA_NODE_ID));
+      Assert.assertEquals(
+          rollbackStatus == NodeStatus.ReadOnly ? NodeStatus.MANUAL : null,
+          loadCache.getNodeStatusReason(REMOVING_DATA_NODE_ID));
     }
   }
 
@@ -504,6 +607,14 @@ public class LoadCachePersistedNodeStatusTest {
       release.countDown();
       executor.shutdownNow();
     }
+  }
+
+  private static NodeHeartbeatSample readOnlySample(long timestamp, String reason) {
+    return new NodeHeartbeatSample(
+        new TDataNodeHeartbeatResp()
+            .setHeartbeatTimestamp(timestamp)
+            .setStatus(NodeStatus.ReadOnly.getStatus())
+            .setStatusReason(reason));
   }
 
   private static TSStatus success() {
