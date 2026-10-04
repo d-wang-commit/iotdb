@@ -238,7 +238,8 @@ public class LoadCachePersistedNodeStatusTest {
   }
 
   @Test
-  public void testReadOnlyRevivalPublishesReasonOnlyAfterStoppedMarkerIsCleared() throws Exception {
+  public void testReadOnlyRevivalPublishesReasonWhileStoppedMarkerClearIsRetried()
+      throws Exception {
     nodeInfo.applyNodeStatusPlan(new UpdateNodeStatusPlan(DATA_NODE_ID, Operation.SET_STOPPED));
     loadCache.initHeartbeatCache(configManager);
     doReturn(failure())
@@ -249,8 +250,8 @@ public class LoadCachePersistedNodeStatusTest {
         DATA_NODE_ID, readOnlySample(System.nanoTime(), NodeStatus.MANUAL));
 
     Assert.assertFalse(loadCache.updateNodeStatistics());
-    Assert.assertEquals(NodeStatus.Stopped, loadCache.getNodeStatus(DATA_NODE_ID));
-    Assert.assertNull(loadCache.getNodeStatusReason(DATA_NODE_ID));
+    Assert.assertEquals(NodeStatus.ReadOnly, loadCache.getNodeStatus(DATA_NODE_ID));
+    Assert.assertEquals(NodeStatus.MANUAL, loadCache.getNodeStatusReason(DATA_NODE_ID));
     Assert.assertEquals(NodeStatus.Stopped, nodeInfo.getNodeStatus(DATA_NODE_ID));
 
     Assert.assertTrue(loadCache.updateNodeStatistics());
