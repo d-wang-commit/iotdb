@@ -138,6 +138,7 @@ public abstract class BaseNodeCache extends AbstractLoadCache {
    * @return The reason why lead to current NodeStatus, null if there is none.
    */
   public String getNodeStatusReason() {
-    return ((NodeStatistics) currentStatistics.get()).getStatusReason();
+    NodeStatistics statistics = (NodeStatistics) this.currentStatistics.get();
+    return statistics.getStatusReason();
   }
 }
