@@ -153,7 +153,6 @@ public class NodeManager {
   }
 
   public NodeStatus getPersistedNodeStatus(int nodeId) {
-
     return nodeInfo.getNodeStatus(nodeId);
   }
 

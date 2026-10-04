@@ -96,7 +96,6 @@ public class LoadCache {
   // False indicates there is no processing heartbeat request, true otherwise
   private final Map<Integer, AtomicBoolean> heartbeatProcessingMap;
   // Map<NodeId, BaseNodeCache>
-
   private final Map<Integer, BaseNodeCache> nodeCacheMap;
   // Map<RegionGroupId, RegionGroupCache>
   private final Map<TConsensusGroupId, RegionGroupCache> regionGroupCacheMap;
@@ -256,20 +255,17 @@ public class LoadCache {
 
   private TSStatus persistNodeStatus(BaseNodeCache cache, NodeStatus status) {
     int nodeId = cache.getNodeId();
-
     if (nodeCacheMap.get(nodeId) != cache) {
       return new TSStatus(TSStatusCode.EXECUTE_STATEMENT_ERROR.getStatusCode());
     }
-    NodeStatus persistedStatus = status.isPersistentStatus() ? status : null;
-
+    Operation operation = Operation.fromNodeStatus(status);
+    NodeStatus persistedStatus = operation == Operation.CLEAR ? null : status;
     if (configManager.getNodeManager().getPersistedNodeStatus(nodeId) == persistedStatus) {
       return new TSStatus(TSStatusCode.SUCCESS_STATUS.getStatusCode());
     }
-    Operation operation = Operation.fromNodeStatus(status);
     try {
       return configManager.getConsensusManager().write(new UpdateNodeStatusPlan(nodeId, operation));
     } catch (ConsensusException e) {
-
       LOGGER.warn(ConfigNodeMessages.FAILED_IN_THE_WRITE_API_EXECUTING_THE_CONSENSUS_LAYER_DUE, e);
       return new TSStatus(TSStatusCode.EXECUTE_STATEMENT_ERROR.getStatusCode())
           .setMessage(e.getMessage());
@@ -412,10 +408,10 @@ public class LoadCache {
         .ifPresent(group -> group.cacheHeartbeatSample(sample));
   }
 
+  /** Update the NodeStatistics of all Nodes. */
   public boolean updateNodeStatistics() {
     boolean success = true;
     for (BaseNodeCache cache : nodeCacheMap.values()) {
-
       success &=
           cache.updateNodeStatistics().getCode() == TSStatusCode.SUCCESS_STATUS.getStatusCode();
     }
@@ -552,10 +548,10 @@ public class LoadCache {
           if (nodeId == ConfigNodeHeartbeatCache.CURRENT_NODE_ID) {
             return;
           }
-
           if ((nodeCache instanceof ConfigNodeHeartbeatCache
                   || nodeCache instanceof DataNodeHeartbeatCache)
               && !nodeCache.hasHeartbeatSample()
+              // Stopped/Removing 可从持久化记录恢复，即使没有 sample，也不必再等待首个心跳。
               && !nodeCache.getNodeStatus().isPersistentStatus()) {
             unreadyNodes.add(nodeId);
           }

@@ -52,7 +52,6 @@ public class UpdateNodeStatusPlan extends ConfigPhysicalPlan {
   private Operation operation;
 
   public UpdateNodeStatusPlan() {
-
     super(ConfigPhysicalPlanType.UpdateNodeStatus);
   }
 
@@ -72,10 +71,8 @@ public class UpdateNodeStatusPlan extends ConfigPhysicalPlan {
 
   @Override
   protected void serializeImpl(DataOutputStream stream) throws IOException {
-
     ReadWriteIOUtils.write(getType().getPlanType(), stream);
     ReadWriteIOUtils.write(nodeId, stream);
-
     ReadWriteIOUtils.write(operation.name(), stream);
   }
 

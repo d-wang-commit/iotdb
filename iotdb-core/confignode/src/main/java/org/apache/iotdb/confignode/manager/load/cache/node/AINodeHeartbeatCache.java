@@ -19,35 +19,9 @@
 
 package org.apache.iotdb.confignode.manager.load.cache.node;
 
-import org.apache.iotdb.commons.cluster.NodeStatus;
-import org.apache.iotdb.confignode.manager.load.cache.AbstractHeartbeatSample;
-
-import java.util.Collections;
-import java.util.List;
-
 public class AINodeHeartbeatCache extends BaseNodeCache {
 
   public AINodeHeartbeatCache(int aiNodeId) {
     super(aiNodeId);
-  }
-
-  @Override
-  protected NodeStatistics calculateCurrentStatistics() {
-    NodeStatus status;
-    String statusReason = null;
-    long currentNanoTime = System.nanoTime();
-    NodeHeartbeatSample lastSample = (NodeHeartbeatSample) getLastSample();
-    List<AbstractHeartbeatSample> heartbeatHistory = Collections.unmodifiableList(slidingWindow);
-    if (lastSample == null || !failureDetector.isAvailable(nodeId, heartbeatHistory)) {
-      status = NodeStatus.Unknown;
-    } else {
-      status = lastSample.getStatus();
-      statusReason = lastSample.getStatusReason();
-    }
-    return new NodeStatistics(
-        currentNanoTime,
-        status,
-        statusReason,
-        NodeStatus.isNormalStatus(status) ? 0 : Long.MAX_VALUE);
   }
 }

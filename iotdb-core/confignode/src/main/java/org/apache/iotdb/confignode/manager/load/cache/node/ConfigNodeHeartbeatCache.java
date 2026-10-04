@@ -21,10 +21,6 @@ package org.apache.iotdb.confignode.manager.load.cache.node;
 
 import org.apache.iotdb.commons.cluster.NodeStatus;
 import org.apache.iotdb.confignode.conf.ConfigNodeDescriptor;
-import org.apache.iotdb.confignode.manager.load.cache.AbstractHeartbeatSample;
-
-import java.util.Collections;
-import java.util.List;
 
 /** Heartbeat cache for cluster ConfigNodes. */
 public class ConfigNodeHeartbeatCache extends BaseNodeCache {
@@ -40,14 +36,12 @@ public class ConfigNodeHeartbeatCache extends BaseNodeCache {
 
   /** Constructor for create ConfigNodeHeartbeatCache with default NodeStatistics. */
   public ConfigNodeHeartbeatCache(int configNodeId) {
-
     super(configNodeId);
     this.isCurrentNode = configNodeId == CURRENT_NODE_ID;
   }
 
   /** Constructor only for ConfigNode-leader. */
   public ConfigNodeHeartbeatCache(int configNodeId, NodeStatistics statistics) {
-
     this(configNodeId);
     this.currentStatistics.set(statistics);
   }
@@ -57,14 +51,6 @@ public class ConfigNodeHeartbeatCache extends BaseNodeCache {
     if (isCurrentNode) {
       return (NodeStatistics) currentStatistics.get();
     }
-    long currentNanoTime = System.nanoTime();
-    NodeHeartbeatSample lastSample = (NodeHeartbeatSample) getLastSample();
-    List<AbstractHeartbeatSample> heartbeatHistory = Collections.unmodifiableList(slidingWindow);
-    NodeStatus status =
-        lastSample == null || !failureDetector.isAvailable(nodeId, heartbeatHistory)
-            ? NodeStatus.Unknown
-            : lastSample.getStatus();
-    return new NodeStatistics(
-        currentNanoTime, status, null, NodeStatus.isNormalStatus(status) ? 0 : Long.MAX_VALUE);
+    return super.calculateCurrentStatistics();
   }
 }

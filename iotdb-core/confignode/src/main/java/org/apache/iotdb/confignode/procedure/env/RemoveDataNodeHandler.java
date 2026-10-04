@@ -162,43 +162,35 @@ public class RemoveDataNodeHandler {
     for (Map.Entry<Integer, TSStatus> entry :
         changeDataNodeStatusContext.getResponseMap().entrySet()) {
       int dataNodeId = entry.getKey();
-
       NodeStatus nodeStatus = nodeStatusMap.get(dataNodeId);
 
       if (!isSucceed(entry.getValue())) {
-
         NodeStatus currentStatus = configManager.getLoadManager().getNodeStatus(dataNodeId);
         // Offline removal/rollback does not require an unreachable DataNode to acknowledge.
-        // A previously committed Removing transition is also safe to retry.
-
-        boolean offlineOrAlreadyRemoving =
-            nodeStatus == NodeStatus.Unknown
-                || nodeStatus == NodeStatus.Stopped
+        // A node already in Removing can also retry; persistence is checked below.
+        boolean requireSuccess =
+            nodeStatus == NodeStatus.Running
+                || nodeStatus == NodeStatus.ReadOnly
                 || (nodeStatus == NodeStatus.Removing
-                    && (currentStatus == NodeStatus.Unknown
-                        || currentStatus == NodeStatus.Stopped
-                        || currentStatus == NodeStatus.Removing));
-        if (!offlineOrAlreadyRemoving) {
+                    && (currentStatus == NodeStatus.Running
+                        || currentStatus == NodeStatus.ReadOnly));
+        if (requireSuccess) {
           LOGGER.error(
               ProcedureMessages.FAILED_TO_CHANGE_DATANODE_STATUS_DATANODEID_NODESTATUS,
               REMOVE_DATANODE_PROCESS,
               dataNodeId,
               nodeStatus);
-
           failure = new IOException(entry.getValue().toString());
           continue;
         }
       }
 
       // Force updating NodeStatus
-
       long currentTime = System.nanoTime();
-
       TSStatus status =
           configManager.getLoadManager().trySetNodeStatus(dataNodeId, nodeStatus, true);
       if (!isSucceed(status)) {
         // Do not advance the persisted procedure state before its node status is durable.
-
         failure = new IOException(status.toString());
         continue;
       }
@@ -211,13 +203,11 @@ public class RemoveDataNodeHandler {
           currentTime);
 
       // Force update RegionStatus
-
       RegionStatus regionStatus =
           nodeStatus == NodeStatus.Stopped
               ? RegionStatus.Unknown
               : RegionStatus.valueOf(nodeStatus.getStatus());
       if (regionStatus != RegionStatus.Removing) {
-
         Map<TConsensusGroupId, Map<Integer, RegionHeartbeatSample>> heartbeatSampleMap =
             new TreeMap<>();
         configManager
@@ -233,7 +223,6 @@ public class RemoveDataNodeHandler {
       }
     }
     if (failure != null) {
-
       throw failure;
     }
   }
@@ -487,21 +476,17 @@ public class RemoveDataNodeHandler {
       throws IOException {
     // Remove consensus record
     try {
-
       TSStatus status =
           configManager.getConsensusManager().write(new RemoveDataNodePlan(removedDataNodes));
       if (!isSucceed(status)) {
-
         throw new IOException(status.toString());
       }
     } catch (ConsensusException e) {
       LOGGER.warn(ConfigNodeMessages.FAILED_IN_THE_WRITE_API_EXECUTING_THE_CONSENSUS_LAYER_DUE, e);
-
       throw new IOException(e);
     }
 
     // Adjust maxRegionGroupNum
-
     configManager.getClusterSchemaManager().adjustMaxRegionGroupNum();
 
     // Remove metrics

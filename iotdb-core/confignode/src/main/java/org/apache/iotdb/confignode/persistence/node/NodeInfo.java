@@ -111,7 +111,6 @@ public class NodeInfo implements SnapshotProcessor {
   private final ReentrantReadWriteLock versionInfoReadWriteLock;
 
   private final Map<Integer, NodeStatus> persistedNodeStatuses;
-
   private final ReentrantReadWriteLock persistedNodeStatusReadWriteLock;
 
   private static final String SNAPSHOT_FILENAME = "node_info.bin";
@@ -185,7 +184,6 @@ public class NodeInfo implements SnapshotProcessor {
 
     dataNodeInfoReadWriteLock.writeLock().lock();
     versionInfoReadWriteLock.writeLock().lock();
-
     persistedNodeStatusReadWriteLock.writeLock().lock();
     try {
       req.getDataNodeLocations()
@@ -193,12 +191,10 @@ public class NodeInfo implements SnapshotProcessor {
               removeDataNodes -> {
                 registeredDataNodes.remove(removeDataNodes.getDataNodeId());
                 nodeVersionInfo.remove(removeDataNodes.getDataNodeId());
-
                 persistedNodeStatuses.remove(removeDataNodes.getDataNodeId());
                 LOGGER.info(ConfigNodeMessages.REMOVED_THE_DATANODE_FROM_CLUSTER, removeDataNodes);
               });
     } finally {
-
       persistedNodeStatusReadWriteLock.writeLock().unlock();
       versionInfoReadWriteLock.writeLock().unlock();
       dataNodeInfoReadWriteLock.writeLock().unlock();
@@ -475,12 +471,10 @@ public class NodeInfo implements SnapshotProcessor {
     TSStatus status = new TSStatus();
     configNodeInfoReadWriteLock.writeLock().lock();
     versionInfoReadWriteLock.writeLock().lock();
-
     persistedNodeStatusReadWriteLock.writeLock().lock();
     try {
       registeredConfigNodes.remove(removeConfigNodePlan.getConfigNodeLocation().getConfigNodeId());
       nodeVersionInfo.remove(removeConfigNodePlan.getConfigNodeLocation().getConfigNodeId());
-
       persistedNodeStatuses.remove(removeConfigNodePlan.getConfigNodeLocation().getConfigNodeId());
       SystemPropertiesUtils.storeConfigNodeList(new ArrayList<>(registeredConfigNodes.values()));
       LOGGER.info(
@@ -543,6 +537,12 @@ public class NodeInfo implements SnapshotProcessor {
     return new TSStatus(TSStatusCode.SUCCESS_STATUS.getStatusCode());
   }
 
+  /**
+   * Persist information about removing an AINode.
+   *
+   * @param req RemoveAINodePlan
+   * @return {@link TSStatus}
+   */
   public TSStatus removeAINode(RemoveAINodePlan req) {
     LOGGER.info(
         ConfigNodeMessages.THERE_ARE_AI_NODES_IN_CLUSTER_BEFORE_EXECUTED_REMOVEAINODEPLAN,
@@ -650,7 +650,6 @@ public class NodeInfo implements SnapshotProcessor {
   }
 
   public TSStatus applyNodeStatusPlan(UpdateNodeStatusPlan plan) {
-
     configNodeInfoReadWriteLock.readLock().lock();
     dataNodeInfoReadWriteLock.readLock().lock();
     aiNodeInfoReadWriteLock.readLock().lock();
@@ -676,7 +675,6 @@ public class NodeInfo implements SnapshotProcessor {
 
       return new TSStatus(TSStatusCode.SUCCESS_STATUS.getStatusCode());
     } finally {
-
       persistedNodeStatusReadWriteLock.writeLock().unlock();
       aiNodeInfoReadWriteLock.readLock().unlock();
       dataNodeInfoReadWriteLock.readLock().unlock();
@@ -685,7 +683,6 @@ public class NodeInfo implements SnapshotProcessor {
   }
 
   public NodeStatus getNodeStatus(int nodeId) {
-
     persistedNodeStatusReadWriteLock.readLock().lock();
     try {
       return persistedNodeStatuses.get(nodeId);
@@ -718,7 +715,6 @@ public class NodeInfo implements SnapshotProcessor {
     dataNodeInfoReadWriteLock.readLock().lock();
     aiNodeInfoReadWriteLock.readLock().lock();
     versionInfoReadWriteLock.readLock().lock();
-
     persistedNodeStatusReadWriteLock.readLock().lock();
     try (FileOutputStream fileOutputStream = new FileOutputStream(tmpFile);
         TIOStreamTransport tioStreamTransport = new TIOStreamTransport(fileOutputStream)) {
@@ -800,10 +796,8 @@ public class NodeInfo implements SnapshotProcessor {
   }
 
   private void serializePersistedNodeStatuses(OutputStream outputStream) throws IOException {
-
     ReadWriteIOUtils.write(persistedNodeStatuses.size(), outputStream);
     for (Entry<Integer, NodeStatus> entry : persistedNodeStatuses.entrySet()) {
-
       ReadWriteIOUtils.write(entry.getKey(), outputStream);
       ReadWriteIOUtils.write(entry.getValue().getStatus(), outputStream);
     }
@@ -824,7 +818,6 @@ public class NodeInfo implements SnapshotProcessor {
     dataNodeInfoReadWriteLock.writeLock().lock();
     aiNodeInfoReadWriteLock.writeLock().lock();
     versionInfoReadWriteLock.writeLock().lock();
-
     persistedNodeStatusReadWriteLock.writeLock().lock();
 
     try (ByteArrayInputStream inputStream =
@@ -847,7 +840,6 @@ public class NodeInfo implements SnapshotProcessor {
       deserializeBuildInfo(inputStream);
 
       deserializePersistedNodeStatuses(inputStream);
-
     } finally {
       persistedNodeStatusReadWriteLock.writeLock().unlock();
       versionInfoReadWriteLock.writeLock().unlock();
@@ -921,7 +913,6 @@ public class NodeInfo implements SnapshotProcessor {
   }
 
   private void deserializePersistedNodeStatuses(InputStream inputStream) throws IOException {
-
     if (inputStream.available() == 0) {
       return;
     }
@@ -929,7 +920,6 @@ public class NodeInfo implements SnapshotProcessor {
     int size = ReadWriteIOUtils.readInt(inputStream);
     for (int i = 0; i < size; i++) {
       int nodeId = ReadWriteIOUtils.readInt(inputStream);
-
       persistedNodeStatuses.put(nodeId, NodeStatus.parse(ReadWriteIOUtils.readString(inputStream)));
     }
   }

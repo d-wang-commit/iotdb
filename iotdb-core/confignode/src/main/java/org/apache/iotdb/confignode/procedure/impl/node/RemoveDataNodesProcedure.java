@@ -53,7 +53,6 @@ import static org.apache.iotdb.confignode.conf.ConfigNodeConstant.REMOVE_DATANOD
 /** remove data node procedure */
 public class RemoveDataNodesProcedure extends AbstractNodeProcedure<RemoveDataNodeState> {
   private static final Logger LOG = LoggerFactory.getLogger(RemoveDataNodesProcedure.class);
-
   private static final int RETRY_THRESHOLD = 5;
 
   private List<TDataNodeLocation> removedDataNodes;
@@ -125,7 +124,6 @@ public class RemoveDataNodesProcedure extends AbstractNodeProcedure<RemoveDataNo
           Map<Integer, NodeStatus> removedNodeStatusMap = new HashMap<>();
           removedDataNodes.forEach(
               dataNode -> removedNodeStatusMap.put(dataNode.getDataNodeId(), NodeStatus.Removing));
-
           removeDataNodeHandler.changeDataNodeStatus(removedDataNodes, removedNodeStatusMap);
           regionMigrationPlans =
               removeDataNodeHandler.selectedRegionMigrationPlans(removedDataNodes);
@@ -217,7 +215,6 @@ public class RemoveDataNodesProcedure extends AbstractNodeProcedure<RemoveDataNo
     List<TDataNodeLocation> rollBackDataNodes = new ArrayList<>();
     List<TDataNodeLocation> successDataNodes = new ArrayList<>();
     for (TDataNodeLocation dataNode : removedDataNodes) {
-
       List<TConsensusGroupId> migratedFailedRegions =
           replicaSets.stream()
               .filter(
@@ -246,7 +243,6 @@ public class RemoveDataNodesProcedure extends AbstractNodeProcedure<RemoveDataNo
               .LOG_ARG_DATANODES_ARG_ALL_REGIONS_MIGRATED_SUCCESSFULLY_START_STOP_THEM_32D56F28,
           REMOVE_DATANODE_PROCESS,
           successDataNodes);
-
       env.getRemoveDataNodeHandler().removeDataNodePersistence(successDataNodes);
       env.getRemoveDataNodeHandler().stopDataNodes(successDataNodes);
     }
@@ -255,9 +251,7 @@ public class RemoveDataNodesProcedure extends AbstractNodeProcedure<RemoveDataNo
           ProcedureMessages.LOG_ARG_START_ROLL_BACK_DATANODES_STATUS_ARG_05C67270,
           REMOVE_DATANODE_PROCESS,
           rollBackDataNodes);
-
       env.getRemoveDataNodeHandler().changeDataNodeStatus(rollBackDataNodes, nodeStatusMap);
-
       env.getRemoveDataNodeHandler().broadcastDataNodeStatusChange(rollBackDataNodes);
       LOG.info(
           ProcedureMessages.LOG_ARG_ROLL_BACK_DATANODES_STATUS_SUCCESSFULLY_ARG_6773A2DF,

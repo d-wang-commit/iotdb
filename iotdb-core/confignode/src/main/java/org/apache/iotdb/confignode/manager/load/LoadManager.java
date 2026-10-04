@@ -48,7 +48,6 @@ import org.apache.iotdb.confignode.manager.load.service.StatisticsService;
 import org.apache.iotdb.confignode.manager.load.service.TopologyService;
 import org.apache.iotdb.confignode.manager.partition.RegionGroupStatus;
 import org.apache.iotdb.confignode.rpc.thrift.TTimeSlotList;
-import org.apache.iotdb.rpc.TSStatusCode;
 
 import java.util.List;
 import java.util.Map;
@@ -213,7 +212,6 @@ public class LoadManager {
 
     if (!loadCache.updateNodeStatistics()) {
       // In particular, do not serve as leader until its own old Stopped marker is cleared.
-
       loadReadyReason =
           ManagerMessages.MESSAGE_CONFIGNODE_LEADER_IS_WAITING_FOR_NODE_STATUS_PERSISTENCE_8CA96809;
       return false;
@@ -349,7 +347,7 @@ public class LoadManager {
 
   /**
    * Try to set the specified Node's status according to transition rules and broadcast statistics
-   * changes after persistence succeeds. Does not send a status-change RPC to the node.
+   * changes, including when persistence fails. Does not send a status-change RPC to the node.
    *
    * @param nodeId Specified NodeId
    * @param nodeStatus requested status
@@ -359,9 +357,7 @@ public class LoadManager {
    */
   public TSStatus trySetNodeStatus(int nodeId, NodeStatus nodeStatus, boolean force) {
     TSStatus status = loadCache.trySetNodeStatus(nodeId, nodeStatus, force);
-    if (status.getCode() == TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
-      eventService.checkAndBroadcastNodeStatisticsChangeEventIfNecessary();
-    }
+    eventService.checkAndBroadcastNodeStatisticsChangeEventIfNecessary();
     return status;
   }
 
