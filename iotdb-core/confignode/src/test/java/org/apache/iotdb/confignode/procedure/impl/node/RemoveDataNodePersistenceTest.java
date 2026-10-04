@@ -206,7 +206,7 @@ public class RemoveDataNodePersistenceTest {
   }
 
   @Test
-  public void testPreparePublishesRemovingOnlyAfterPersistence() throws Exception {
+  public void testPreparePersistsRemoving() throws Exception {
     change(FIRST, NodeStatus.Removing);
     assertStates(FIRST, NodeStatus.Removing, NodeStatus.Removing, NodeStatus.Removing);
   }
@@ -243,7 +243,7 @@ public class RemoveDataNodePersistenceTest {
     failRpc.put(FIRST, true);
     failStatusWrite = true;
     expectChangeFailure(NodeStatus.Removing);
-    assertEquals(NodeStatus.Stopped, cache.getNodeStatus(FIRST));
+    assertEquals(NodeStatus.Removing, cache.getNodeStatus(FIRST));
     assertEquals(NodeStatus.Stopped, nodeInfo.getNodeStatus(FIRST));
     failStatusWrite = false;
     change(FIRST, NodeStatus.Removing);
@@ -264,10 +264,10 @@ public class RemoveDataNodePersistenceTest {
   }
 
   @Test
-  public void testPrepareCommitFailureRetainsCacheAndRetries() throws Exception {
+  public void testPrepareCommitFailureUpdatesCacheAndRetries() throws Exception {
     failStatusWrite = true;
     expectChangeFailure(NodeStatus.Removing);
-    assertStates(FIRST, NodeStatus.Removing, NodeStatus.Running, null);
+    assertStates(FIRST, NodeStatus.Removing, NodeStatus.Removing, null);
     failStatusWrite = false;
     change(FIRST, NodeStatus.Removing);
     assertStates(FIRST, NodeStatus.Removing, NodeStatus.Removing, NodeStatus.Removing);
@@ -305,13 +305,15 @@ public class RemoveDataNodePersistenceTest {
   }
 
   @Test
-  public void testRpcFailureOnRetryDoesNotHidePreviousCommitFailure() throws Exception {
+  public void testRpcFailureOnRetryStillRequiresPersistence() throws Exception {
     failStatusWrite = true;
     expectChangeFailure(NodeStatus.Removing);
-    failStatusWrite = false;
     failRpc.put(FIRST, true);
     expectChangeFailure(NodeStatus.Removing);
-    assertNull(nodeInfo.getNodeStatus(FIRST));
+    assertStates(FIRST, NodeStatus.Removing, NodeStatus.Removing, null);
+    failStatusWrite = false;
+    change(FIRST, NodeStatus.Removing);
+    assertStates(FIRST, NodeStatus.Removing, NodeStatus.Removing, NodeStatus.Removing);
   }
 
   @Test
@@ -352,7 +354,7 @@ public class RemoveDataNodePersistenceTest {
     failStatusWrite = true;
     TestProcedure procedure = procedure(NodeStatus.Running, RemoveDataNodeState.STOP_DATA_NODE);
     assertFalse(procedure.finish(env));
-    assertStates(FIRST, NodeStatus.Running, NodeStatus.Removing, NodeStatus.Removing);
+    assertStates(FIRST, NodeStatus.Running, NodeStatus.Running, NodeStatus.Removing);
     failStatusWrite = false;
     assertTrue(procedure.finish(env));
     assertStates(FIRST, NodeStatus.Running, NodeStatus.Running, null);

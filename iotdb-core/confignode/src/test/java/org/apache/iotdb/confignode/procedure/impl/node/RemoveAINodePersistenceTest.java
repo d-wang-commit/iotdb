@@ -154,7 +154,7 @@ public class RemoveAINodePersistenceTest {
       assertFalse(procedure.isFailed());
       assertEquals(RemoveAINodeState.NODE_STOP, procedure.state());
       assertEquals(0, stopRequests);
-      assertEquals(NodeStatus.Running, cache.getNodeStatus(AI_NODE_ID));
+      assertEquals(NodeStatus.Removing, cache.getNodeStatus(AI_NODE_ID));
       assertNull(nodeInfo.getNodeStatus(AI_NODE_ID));
     }
 
@@ -175,7 +175,7 @@ public class RemoveAINodePersistenceTest {
     }
     assertTrue(procedure.isFailed());
     assertEquals(0, stopRequests);
-    assertEquals(NodeStatus.Running, cache.getNodeStatus(AI_NODE_ID));
+    assertEquals(NodeStatus.Removing, cache.getNodeStatus(AI_NODE_ID));
     assertNull(nodeInfo.getNodeStatus(AI_NODE_ID));
     assertEquals(1, nodeInfo.getRegisteredAINodes().size());
   }

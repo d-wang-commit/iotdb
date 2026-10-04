@@ -195,7 +195,7 @@ public class LoadCachePersistedNodeStatusTest {
   }
 
   @Test
-  public void testFailedRevivalRetainsStoppedUntilPersistenceRetrySucceeds() throws Exception {
+  public void testRevivalUpdatesStatisticsWhileClearIsRetried() throws Exception {
     nodeInfo.applyNodeStatusPlan(new UpdateNodeStatusPlan(DATA_NODE_ID, Operation.SET_STOPPED));
     loadCache.initHeartbeatCache(configManager);
     doReturn(failure())
@@ -206,7 +206,7 @@ public class LoadCachePersistedNodeStatusTest {
         DATA_NODE_ID, new NodeHeartbeatSample(NodeStatus.Running));
 
     Assert.assertFalse(loadCache.updateNodeStatistics());
-    Assert.assertEquals(NodeStatus.Stopped, loadCache.getNodeStatus(DATA_NODE_ID));
+    Assert.assertEquals(NodeStatus.Running, loadCache.getNodeStatus(DATA_NODE_ID));
     Assert.assertEquals(NodeStatus.Stopped, nodeInfo.getNodeStatus(DATA_NODE_ID));
 
     Assert.assertTrue(loadCache.updateNodeStatistics());
@@ -332,7 +332,7 @@ public class LoadCachePersistedNodeStatusTest {
   }
 
   @Test
-  public void testStoppedIsNotPublishedBeforePersistenceCompletes() throws Exception {
+  public void testStoppedStatisticsUpdateAfterFailedPersistenceReturns() throws Exception {
     loadCache.initHeartbeatCache(configManager);
     loadCache.trySetNodeStatus(DATA_NODE_ID, NodeStatus.Running, false);
     CountDownLatch persistenceStarted = new CountDownLatch(1);
@@ -356,11 +356,17 @@ public class LoadCachePersistedNodeStatusTest {
       Assert.assertFalse(nodeInfo.getPersistedNodeStatuses().containsKey(DATA_NODE_ID));
       finishPersistence.countDown();
       Assert.assertEquals(failure().getCode(), update.get(5, TimeUnit.SECONDS).getCode());
-      Assert.assertEquals(NodeStatus.Running, loadCache.getNodeStatus(DATA_NODE_ID));
+      Assert.assertEquals(NodeStatus.Stopped, loadCache.getNodeStatus(DATA_NODE_ID));
+      Assert.assertNull(nodeInfo.getNodeStatus(DATA_NODE_ID));
 
-      loadCache.updateNodeStatistics();
+      // Even when the latest sample becomes Unknown, statistics retain the stop for retry.
+      loadCache.cacheDataNodeHeartbeatSample(
+          DATA_NODE_ID, new NodeHeartbeatSample(NodeStatus.Unknown));
+      Assert.assertTrue(loadCache.updateNodeStatistics());
       Assert.assertEquals(NodeStatus.Stopped, loadCache.getNodeStatus(DATA_NODE_ID));
       Assert.assertEquals(NodeStatus.Stopped, nodeInfo.getNodeStatus(DATA_NODE_ID));
+      verify(consensusManager, times(2))
+          .write(new UpdateNodeStatusPlan(DATA_NODE_ID, Operation.SET_STOPPED));
     } finally {
       finishPersistence.countDown();
       executor.shutdownNow();
@@ -507,7 +513,7 @@ public class LoadCachePersistedNodeStatusTest {
   }
 
   @Test
-  public void testFailedExplicitRollbackRetainsRemovingUntilRetried() throws Exception {
+  public void testFailedExplicitRollbackUpdatesStatisticsAndRetriesPeriodically() throws Exception {
     nodeInfo.applyNodeStatusPlan(
         new UpdateNodeStatusPlan(REMOVING_DATA_NODE_ID, Operation.SET_REMOVING));
     loadCache.initHeartbeatCache(configManager);
@@ -518,15 +524,17 @@ public class LoadCachePersistedNodeStatusTest {
 
     Assert.assertEquals(
         failure().getCode(),
-        loadCache.trySetNodeStatus(REMOVING_DATA_NODE_ID, NodeStatus.Unknown, true).getCode());
-    Assert.assertEquals(NodeStatus.Removing, loadCache.getNodeStatus(REMOVING_DATA_NODE_ID));
+        loadCache.trySetNodeStatus(REMOVING_DATA_NODE_ID, NodeStatus.Running, true).getCode());
+    Assert.assertEquals(NodeStatus.Running, loadCache.getNodeStatus(REMOVING_DATA_NODE_ID));
     Assert.assertEquals(NodeStatus.Removing, nodeInfo.getNodeStatus(REMOVING_DATA_NODE_ID));
 
-    Assert.assertEquals(
-        success().getCode(),
-        loadCache.trySetNodeStatus(REMOVING_DATA_NODE_ID, NodeStatus.Unknown, true).getCode());
-    Assert.assertEquals(NodeStatus.Unknown, loadCache.getNodeStatus(REMOVING_DATA_NODE_ID));
+    Assert.assertTrue(loadCache.updateNodeStatistics());
+    Assert.assertEquals(NodeStatus.Running, loadCache.getNodeStatus(REMOVING_DATA_NODE_ID));
     Assert.assertFalse(nodeInfo.getPersistedNodeStatuses().containsKey(REMOVING_DATA_NODE_ID));
+    verify(consensusManager, times(2))
+        .write(new UpdateNodeStatusPlan(REMOVING_DATA_NODE_ID, Operation.CLEAR));
+    verify(consensusManager, never())
+        .write(new UpdateNodeStatusPlan(REMOVING_DATA_NODE_ID, Operation.SET_REMOVING));
   }
 
   @Test
@@ -562,7 +570,7 @@ public class LoadCachePersistedNodeStatusTest {
 
     Assert.assertFalse(loadCache.updateNodeStatistics());
 
-    Assert.assertEquals(NodeStatus.Stopped, loadCache.getNodeStatus(DATA_NODE_ID));
+    Assert.assertEquals(NodeStatus.Running, loadCache.getNodeStatus(DATA_NODE_ID));
     Assert.assertEquals(NodeStatus.Stopped, nodeInfo.getNodeStatus(DATA_NODE_ID));
     Assert.assertEquals(NodeStatus.Running, loadCache.getNodeStatus(CONFIG_NODE_ID));
     Assert.assertFalse(nodeInfo.getPersistedNodeStatuses().containsKey(CONFIG_NODE_ID));
@@ -668,8 +676,7 @@ public class LoadCachePersistedNodeStatusTest {
   }
 
   @Test
-  public void testAINodePublishesStatusOnlyAfterPersistenceAndClearsStoppedOnRestart()
-      throws Exception {
+  public void testAINodeUpdatesStatisticsOnPersistenceFailureAndRetries() throws Exception {
     registerAINode();
     loadCache.initHeartbeatCache(configManager);
     doReturn(failure())
@@ -679,11 +686,11 @@ public class LoadCachePersistedNodeStatusTest {
     Assert.assertEquals(
         failure().getCode(),
         loadCache.trySetNodeStatus(AI_NODE_ID, NodeStatus.Stopped, false).getCode());
-    Assert.assertEquals(NodeStatus.Unknown, loadCache.getNodeStatus(AI_NODE_ID));
+    Assert.assertEquals(NodeStatus.Stopped, loadCache.getNodeStatus(AI_NODE_ID));
     Assert.assertNull(nodeInfo.getNodeStatus(AI_NODE_ID));
-    Assert.assertEquals(
-        success().getCode(),
-        loadCache.trySetNodeStatus(AI_NODE_ID, NodeStatus.Stopped, false).getCode());
+    loadCache.cacheAINodeHeartbeatSample(AI_NODE_ID, new NodeHeartbeatSample(NodeStatus.Unknown));
+    Assert.assertTrue(loadCache.updateNodeStatistics());
+    Assert.assertEquals(NodeStatus.Stopped, loadCache.getNodeStatus(AI_NODE_ID));
     Assert.assertEquals(NodeStatus.Stopped, nodeInfo.getNodeStatus(AI_NODE_ID));
 
     doReturn(failure())
@@ -692,7 +699,7 @@ public class LoadCachePersistedNodeStatusTest {
         .write(new UpdateNodeStatusPlan(AI_NODE_ID, Operation.CLEAR));
     loadCache.cacheAINodeHeartbeatSample(AI_NODE_ID, new NodeHeartbeatSample(NodeStatus.Running));
     Assert.assertFalse(loadCache.updateNodeStatistics());
-    Assert.assertEquals(NodeStatus.Stopped, loadCache.getNodeStatus(AI_NODE_ID));
+    Assert.assertEquals(NodeStatus.Running, loadCache.getNodeStatus(AI_NODE_ID));
     Assert.assertEquals(NodeStatus.Stopped, nodeInfo.getNodeStatus(AI_NODE_ID));
     Assert.assertTrue(loadCache.updateNodeStatistics());
     Assert.assertEquals(NodeStatus.Running, loadCache.getNodeStatus(AI_NODE_ID));
