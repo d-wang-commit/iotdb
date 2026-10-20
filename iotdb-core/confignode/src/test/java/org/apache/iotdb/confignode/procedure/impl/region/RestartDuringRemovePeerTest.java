@@ -118,8 +118,10 @@ public class RestartDuringRemovePeerTest {
     loadManager = Mockito.mock(LoadManager.class, Mockito.RETURNS_DEEP_STUBS);
     when(configManager.getPartitionManager()).thenReturn(partitionManager);
     when(configManager.getLoadManager()).thenReturn(loadManager);
-    when(partitionManager.getAllReplicaSets())
-        .thenAnswer(ignored -> partitionInfo.getAllReplicaSets());
+    when(partitionManager.getRegionDatabase(regionId))
+        .thenAnswer(call -> partitionInfo.getRegionDatabase(call.getArgument(0)));
+    when(partitionManager.getReplicaSets("root.restart", Collections.singletonList(regionId)))
+        .thenAnswer(call -> partitionInfo.getReplicaSets(call.getArgument(0), call.getArgument(1)));
     when(partitionManager.removeRegionLocation(any()))
         .thenAnswer(call -> partitionInfo.removeRegionLocation(call.getArgument(0)));
     handler = Mockito.spy(new RegionMaintainHandler(configManager));
@@ -380,7 +382,7 @@ public class RestartDuringRemovePeerTest {
     partitionInfo.removeRegionLocation(new RemoveRegionLocationPlan(regionId, removedNode));
     doReturn(null).when(handler).resetPeerList(any(), anyList(), anyMap());
     assertFalse(handler.resetPeerListAfterRemoveForIoTConsensusV1(regionId, removedNode));
-    when(partitionManager.getAllReplicaSets()).thenReturn(Collections.emptyList());
+    when(partitionManager.getRegionDatabase(regionId)).thenReturn(null);
     assertTrue(handler.resetPeerListAfterRemoveForIoTConsensusV1(regionId, removedNode));
   }
 
