@@ -100,7 +100,7 @@ public final class ReplicationBacklogCache {
             if (group != null) {
               clearDecision(group);
             }
-            group = new Group(sorted, now);
+            group = new Group(sorted, now, group);
             groups.put(id.getId(), group);
             topologyRevision++;
           }
@@ -114,7 +114,10 @@ public final class ReplicationBacklogCache {
                     && node.getStatus() == NodeStatus.Running
                     && replica != null
                     && replica.getRegionStatus() == RegionStatus.Running;
-            changed |= group.available[i] != available;
+            if (group.available[i] != available) {
+              changed = true;
+              resetAdmission(group, i, now);
+            }
             group.available[i] = available;
           }
           if (changed) {
@@ -172,6 +175,12 @@ public final class ReplicationBacklogCache {
     }
     if (reporter.initialized && !reporter.instance.equals(report.getSourceInstanceId())) {
       invalidateSource(sourceNodeId);
+      for (Group group : groups.values()) {
+        int index = Arrays.binarySearch(group.members, sourceNodeId);
+        if (index >= 0) {
+          resetAdmission(group, index, now);
+        }
+      }
     }
     reporter.instance = report.getSourceInstanceId();
     reporter.sequence = report.getSampleSequence();
@@ -283,6 +292,12 @@ public final class ReplicationBacklogCache {
         || old.generation != sample.getGeneration()
         || old.protocol != sample.getProtocol()
         || !Arrays.equals(old.edgeGenerations, generations)) {
+      // A new local Region incarnation needs admission again. Recreating only an outgoing Pipe
+      // resets load evidence, but does not mean the healthy source replica has restarted.
+      if (old != null
+          && (old.generation != sample.getGeneration() || old.protocol != sample.getProtocol())) {
+        resetAdmission(group, sourceIndex, now);
+      }
       clearDecision(group);
       old = new Source(sample.getProtocol(), sample.getGeneration(), generations, raw.length);
       for (int i = 0; i < raw.length; i++) {
@@ -340,6 +355,17 @@ public final class ReplicationBacklogCache {
           group.streak[i] = 0;
           continue;
         }
+        if (!group.confirmed[i]) {
+          boolean afterRecovery = true;
+          for (Source source : group.sources) {
+            afterRecovery &= source.sampledAt >= group.admissionSince[i];
+          }
+          if (!afterRecovery) {
+            group.streak[i] = 0;
+            group.admissionStreak[i] = 0;
+            continue;
+          }
+        }
         boolean enter = false;
         boolean retain = false;
         for (int j = 0; j < group.members.length; j++) {
@@ -356,6 +382,17 @@ public final class ReplicationBacklogCache {
           group.streak[i] = 0;
           dirty = true;
           candidateRevision++;
+        }
+        // A recovered replica is neither light nor heavy until fresh post-recovery observations
+        // confirm its classification. Missing/duplicate samples cannot open this admission gate.
+        if (!group.confirmed[i]) {
+          group.admissionStreak[i] = !enter ? group.admissionStreak[i] + 1 : 0;
+          if (group.heavy[i] || group.admissionStreak[i] >= config.getConfirmationRounds()) {
+            group.confirmed[i] = true;
+            group.admissionStreak[i] = 0;
+            dirty = true;
+            candidateRevision++;
+          }
         }
       }
       boolean anyEligible = false;
@@ -392,12 +429,13 @@ public final class ReplicationBacklogCache {
   }
 
   private void clearDecision(Group group) {
-    if (hasExclusion(group)) {
+    if (hasHeavyReplica(group)) {
       dirty = true;
       candidateRevision++;
     }
     Arrays.fill(group.heavy, false);
     Arrays.fill(group.streak, 0);
+    Arrays.fill(group.admissionStreak, 0);
     group.valid = false;
     for (Source source : group.sources) {
       if (source != null) {
@@ -407,12 +445,36 @@ public final class ReplicationBacklogCache {
   }
 
   private static boolean hasExclusion(Group group) {
+    boolean confirmed = false;
+    boolean pending = false;
+    for (int i = 0; i < group.members.length; i++) {
+      confirmed |= group.available[i] && group.confirmed[i];
+      pending |= group.available[i] && !group.confirmed[i];
+    }
+    return hasHeavyReplica(group) || (confirmed && pending);
+  }
+
+  private static boolean hasHeavyReplica(Group group) {
     for (boolean heavy : group.heavy) {
       if (heavy) {
         return true;
       }
     }
     return false;
+  }
+
+  private void resetAdmission(Group group, int index, long now) {
+    if (group.confirmed[index]) {
+      dirty = true;
+      candidateRevision++;
+    }
+    group.confirmed[index] = false;
+    group.admissionStreak[index] = 0;
+    group.admissionSince[index] = now;
+  }
+
+  private boolean hasFreshDecision(Group group, long now) {
+    return group.valid && Arrays.stream(group.sources).allMatch(s -> s != null && fresh(s, now));
   }
 
   /** Only constrained groups are returned. Absence means use the original availability checks. */
@@ -423,22 +485,28 @@ public final class ReplicationBacklogCache {
     Map<TConsensusGroupId, Set<Integer>> result = new HashMap<>();
     for (Map.Entry<Integer, Group> entry : groups.entrySet()) {
       Group group = entry.getValue();
-      if (!group.valid || Arrays.stream(group.sources).anyMatch(s -> s == null || !fresh(s, now))) {
-        continue;
-      }
+      boolean freshDecision = hasFreshDecision(group, now);
       Set<Integer> retained = new HashSet<>();
-      boolean excluded = false;
+      Set<Integer> confirmed = new HashSet<>();
+      int available = 0;
       for (int i = 0; i < group.members.length; i++) {
         if (!group.available[i]) {
           continue;
         }
-        if (group.heavy[i]) {
-          excluded = true;
-        } else {
-          retained.add(group.members[i]);
+        available++;
+        if (group.confirmed[i]) {
+          confirmed.add(group.members[i]);
+          if (!freshDecision || !group.heavy[i]) {
+            retained.add(group.members[i]);
+          }
         }
       }
-      if (excluded && !retained.isEmpty()) {
+      // Prefer even a heavy confirmed replica over an unconfirmed recovery. Only when none is
+      // available (including cluster bootstrap) may availability override the admission gate.
+      if (retained.isEmpty()) {
+        retained = confirmed;
+      }
+      if (!retained.isEmpty() && retained.size() < available) {
         result.put(new TConsensusGroupId(TConsensusGroupType.DataRegion, entry.getKey()), retained);
       }
     }
@@ -448,7 +516,23 @@ public final class ReplicationBacklogCache {
   /** One solver input; its map is reused during final validation, never rebuilt. */
   public synchronized SelectionSnapshot captureSelection(long now) {
     Map<TConsensusGroupId, Set<Integer>> candidates = eligibleCandidates(now);
-    return new SelectionSnapshot(epoch, topologyRevision, candidateRevision, config, candidates);
+    Set<Integer> loadConstrainedGroups = new HashSet<>();
+    candidates.forEach(
+        (id, retained) -> {
+          Group group = groups.get(id.getId());
+          if (hasFreshDecision(group, now)) {
+            for (int i = 0; i < group.members.length; i++) {
+              if (group.available[i]
+                  && group.confirmed[i]
+                  && group.heavy[i]
+                  && !retained.contains(group.members[i])) {
+                loadConstrainedGroups.add(id.getId());
+              }
+            }
+          }
+        });
+    return new SelectionSnapshot(
+        epoch, topologyRevision, candidateRevision, config, candidates, loadConstrainedGroups);
   }
 
   /**
@@ -461,15 +545,12 @@ public final class ReplicationBacklogCache {
         || (config.getMode() == Mode.ENFORCE && snapshot.candidateRevision != candidateRevision)) {
       return false;
     }
-    for (TConsensusGroupId region : snapshot.candidates.keySet()) {
-      Group group = groups.get(region.getId());
-      if (group == null || !group.valid) {
+    // Admission-only constraints remain valid while recovery samples are missing. Only exclusions
+    // based on measured load require fresh telemetry at the end of a potentially long solve.
+    for (int region : snapshot.loadConstrainedGroups) {
+      Group group = groups.get(region);
+      if (group == null || !hasFreshDecision(group, now)) {
         return false;
-      }
-      for (Source source : group.sources) {
-        if (source == null || !fresh(source, now)) {
-          return false;
-        }
       }
     }
     return true;
@@ -481,18 +562,21 @@ public final class ReplicationBacklogCache {
     private final long candidateRevision;
     private final ReplicationBacklogConfig config;
     private final Map<TConsensusGroupId, Set<Integer>> candidates;
+    private final Set<Integer> loadConstrainedGroups;
 
     private SelectionSnapshot(
         long epoch,
         long topologyRevision,
         long candidateRevision,
         ReplicationBacklogConfig config,
-        Map<TConsensusGroupId, Set<Integer>> candidates) {
+        Map<TConsensusGroupId, Set<Integer>> candidates,
+        Set<Integer> loadConstrainedGroups) {
       this.epoch = epoch;
       this.topologyRevision = topologyRevision;
       this.candidateRevision = candidateRevision;
       this.config = config;
       this.candidates = candidates;
+      this.loadConstrainedGroups = loadConstrainedGroups;
     }
 
     public Map<TConsensusGroupId, Set<Integer>> getCandidates() {
@@ -549,7 +633,12 @@ public final class ReplicationBacklogCache {
       result.put(
           group.members[i],
           new ReplicaDiagnostic(
-              known, group.available[i], complete && group.heavy[i], raw[i], smooth[i]));
+              known,
+              group.available[i],
+              !group.confirmed[i],
+              complete && group.heavy[i],
+              raw[i],
+              smooth[i]));
     }
     return result;
   }
@@ -577,14 +666,21 @@ public final class ReplicationBacklogCache {
   public static final class ReplicaDiagnostic {
     private final boolean known;
     private final boolean available;
+    private final boolean admissionPending;
     private final boolean heavy;
     private final double[] counts;
     private final double[] smoothedCounts;
 
     private ReplicaDiagnostic(
-        boolean known, boolean available, boolean heavy, double[] counts, double[] smoothedCounts) {
+        boolean known,
+        boolean available,
+        boolean admissionPending,
+        boolean heavy,
+        double[] counts,
+        double[] smoothedCounts) {
       this.known = known;
       this.available = available;
+      this.admissionPending = admissionPending;
       this.heavy = heavy;
       this.counts = counts;
       this.smoothedCounts = smoothedCounts;
@@ -600,6 +696,10 @@ public final class ReplicationBacklogCache {
 
     public boolean isHeavy() {
       return heavy;
+    }
+
+    public boolean isAdmissionPending() {
+      return admissionPending;
     }
 
     public double[] getCounts() {
@@ -622,15 +722,33 @@ public final class ReplicationBacklogCache {
     private final int[] members;
     private final Source[] sources;
     private final boolean[] available;
+    private final boolean[] confirmed;
+    private final int[] admissionStreak;
+    private final long[] admissionSince;
     private final boolean[] heavy;
     private final int[] streak;
     private final long createdAt;
     private boolean valid;
 
-    private Group(int[] members, long now) {
+    private Group(int[] members, long now, Group previous) {
       this.members = members;
       sources = new Source[members.length];
       available = new boolean[members.length];
+      confirmed = new boolean[members.length];
+      admissionStreak = new int[members.length];
+      admissionSince = new long[members.length];
+      Arrays.fill(admissionSince, now);
+      // A membership change must not turn every healthy replica into an unconfirmed candidate,
+      // otherwise the all-pending availability fallback would also admit the newly added replica.
+      if (previous != null) {
+        for (int i = 0; i < members.length; i++) {
+          int oldIndex = Arrays.binarySearch(previous.members, members[i]);
+          if (oldIndex >= 0) {
+            available[i] = previous.available[oldIndex];
+            confirmed[i] = previous.confirmed[oldIndex];
+          }
+        }
+      }
       heavy = new boolean[members.length];
       streak = new int[members.length];
       createdAt = now;

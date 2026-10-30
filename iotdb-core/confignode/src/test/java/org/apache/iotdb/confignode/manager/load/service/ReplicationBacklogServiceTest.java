@@ -296,13 +296,45 @@ public class ReplicationBacklogServiceTest {
     assertEquals(Set.of(2), service.getEligibleCandidates().get(GROUP));
   }
 
+  @Test
+  public void recoveryGateReachesRealSolverBeforeFreshBacklogArrives() throws Exception {
+    prepareFilteredSelection();
+    loadCache.getCurrentDataNodeStatisticsMap().put(2, new NodeStatistics(NodeStatus.Unknown));
+    service.getEligibleCandidates();
+    loadCache.getCurrentDataNodeStatisticsMap().put(2, new NodeStatistics(NodeStatus.Running));
+    // The immediate health-triggered solve must already exclude replica 2, before a sampling tick.
+    assertEquals(Set.of(1, 3), service.getEligibleCandidates().get(GROUP));
+    runSelection(Set.of(1, 3), 2, () -> {});
+    verify(loadManager)
+        .forceUpdateConsensusGroupCache(
+            argThat(
+                updates ->
+                    updates.size() == 1
+                        && Set.of(1, 3).contains(updates.get(GROUP).getLeaderId())));
+    for (int seq = 5; seq <= 6; seq++) {
+      round(seq);
+      assertEquals(Set.of(1, 3), service.getEligibleCandidates().get(GROUP));
+    }
+    round(7);
+    assertEquals(Set.of(2), service.getEligibleCandidates().get(GROUP));
+    runSelection(() -> {});
+    verify(loadManager)
+        .forceUpdateConsensusGroupCache(
+            argThat(updates -> updates.size() == 1 && updates.get(GROUP).getLeaderId() == 2));
+  }
+
   private void runSelection(CheckedAction duringSolve) throws Exception {
+    runSelection(Set.of(2), 1, duringSolve);
+  }
+
+  private void runSelection(Set<Integer> expectedCandidates, int leader, CheckedAction duringSolve)
+      throws Exception {
     IManager manager = mock(IManager.class);
     when(manager.getLoadManager()).thenReturn(loadManager);
     when(loadCache.getCurrentDatabaseRegionGroupMap(TConsensusGroupType.DataRegion))
         .thenReturn(Collections.singletonMap("root.test", Collections.singletonList(GROUP)));
     when(loadCache.getRegionLeaderMap(TConsensusGroupType.DataRegion))
-        .thenReturn(Collections.singletonMap(GROUP, 1));
+        .thenReturn(Collections.singletonMap(GROUP, leader));
     RouteBalancer actualRouteBalancer = new RouteBalancer(manager);
     Object context = getField(actualRouteBalancer, "dataRegionLeaderBalanceContext");
     setField(context, "consensusProtocolClass", ConsensusFactory.IOT_CONSENSUS);
@@ -319,11 +351,11 @@ public class ReplicationBacklogServiceTest {
               Map<Integer, NodeStatistics> nodes,
               Map<TConsensusGroupId, Map<Integer, RegionStatistics>> regions,
               Map<TConsensusGroupId, Set<Integer>> candidates) {
-            assertEquals(Set.of(2), candidates.get(GROUP));
+            assertEquals(expectedCandidates, candidates.get(GROUP));
             Map<TConsensusGroupId, Integer> result =
                 super.generateOptimalLeaderDistribution(
                     databases, locations, leaders, nodes, regions, candidates);
-            assertEquals(Integer.valueOf(2), result.get(GROUP));
+            assertTrue(expectedCandidates.contains(result.get(GROUP)));
             solved.set(true);
             try {
               duringSolve.run();

@@ -20,8 +20,8 @@
 package org.apache.iotdb.confignode.i18n;
 
 public final class ConfigNodeMessages {
-  public static final String LOG_REPLICATIONBACKLOG_REGION_ARG_REPLICA_ARG_KNOWN_ARG_AVAILABLE_ARG_PROPOSEDEXCLUDED_ARG_RAW_REQUEST_TABLET_FILE_DELETION_ARG_EWMA_ARG_MODE_ARG_819B0890 =
-      "[ReplicationBacklog] Region {}，副本 {}，已知={}，可用={}，拟排除={}，原始 [request,tablet,file,deletion]={}，EWMA={}，模式={}。";
+  public static final String LOG_REPLICATIONBACKLOG_REGION_ARG_REPLICA_ARG_KNOWN_ARG_AVAILABLE_ARG_ADMISSIONPENDING_ARG_PROPOSEDEXCLUDED_ARG_RAW_REQUEST_TABLET_FILE_DELETION_ARG_EWMA_ARG_MODE_ARG_BADEAF0E =
+      "[ReplicationBacklog] Region {}，副本 {}，已知={}，可用={}，准入待确认={}，拟排除={}，原始 [request,tablet,file,deletion]={}，EWMA={}，模式={}。";
   public static final String EXCEPTION_CONFIGNODE_SIMPLECONSENSUS_WRITES_ARE_DISABLED_AFTER_A_WAL_CLEANUP_FAILURE_RESTART_IS_REQUIRED_D52F0107 =
       "ConfigNode SimpleConsensus 因 WAL 清理失败已禁用写入，需要重启。";
   public static final String EXCEPTION_FAILED_TO_CLOSE_THE_CONFIGNODE_SIMPLECONSENSUS_LOG_WRITER_BC0F417C =

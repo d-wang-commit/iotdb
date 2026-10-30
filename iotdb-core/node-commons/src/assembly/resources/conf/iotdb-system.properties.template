@@ -786,7 +786,10 @@ enable_auto_leader_balance_for_ratis_consensus=true
 # OFF stops ConfigNode sampling and filtering; DataNode lifecycle counters remain active.
 # OBSERVE samples without changing leaders. ENFORCE also filters persistently heavier
 # available candidates for CFS; original per-database/global costs remain unchanged.
-# Missing, recovering or expired reports never mean zero and fall back to normal candidates.
+# Missing, recovering or expired reports never mean zero and withdraw load-based exclusions.
+# ENFORCE also keeps newly started/recovered replicas out until their backlog classification
+# is confirmed. Missing or expired reports do not release this admission gate. Only when no
+# confirmed replica is available (including cluster bootstrap) do normal candidates apply.
 # Modes change only by administrator configuration, never automatically.
 # effectiveMode: hot_reload
 # Datatype: String (OFF, OBSERVE, ENFORCE)
@@ -806,6 +809,7 @@ iot_consensus_replication_backlog_balance_interval_ms=10000
 # A heavier replica must be no lighter in every dimension and exceed both the absolute
 # gap and relative_gap * max(lighter_count, 1) in at least one dimension.
 # Exit thresholds are half the entry thresholds, with the same confirmation count.
+# Recovery admission uses the same count, with fresh observations collected after recovery.
 # effectiveMode: hot_reload
 # Datatype: double (alpha in (0, 1], relative gap > 0), int (rounds > 0)
 iot_consensus_replication_backlog_ewma_alpha=0.5

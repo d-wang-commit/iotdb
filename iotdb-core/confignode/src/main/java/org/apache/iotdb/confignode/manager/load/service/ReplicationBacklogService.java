@@ -181,11 +181,12 @@ public final class ReplicationBacklogService {
                     (node, diagnostic) ->
                         LOGGER.info(
                             ConfigNodeMessages
-                                .LOG_REPLICATIONBACKLOG_REGION_ARG_REPLICA_ARG_KNOWN_ARG_AVAILABLE_ARG_PROPOSEDEXCLUDED_ARG_RAW_REQUEST_TABLET_FILE_DELETION_ARG_EWMA_ARG_MODE_ARG_819B0890,
+                                .LOG_REPLICATIONBACKLOG_REGION_ARG_REPLICA_ARG_KNOWN_ARG_AVAILABLE_ARG_ADMISSIONPENDING_ARG_PROPOSEDEXCLUDED_ARG_RAW_REQUEST_TABLET_FILE_DELETION_ARG_EWMA_ARG_MODE_ARG_BADEAF0E,
                             region,
                             node,
                             diagnostic.isKnown(),
                             diagnostic.isAvailable(),
+                            diagnostic.isAdmissionPending(),
                             diagnostic.isHeavy(),
                             Arrays.toString(diagnostic.getCounts()),
                             Arrays.toString(diagnostic.getSmoothedCounts()),

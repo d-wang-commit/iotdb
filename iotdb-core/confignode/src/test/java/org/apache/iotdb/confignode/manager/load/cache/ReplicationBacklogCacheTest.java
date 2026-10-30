@@ -128,6 +128,230 @@ public class ReplicationBacklogCacheTest {
   }
 
   @Test
+  public void recoveredLightReplicaWaitsForThreeNewCompleteRounds() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    recover(cache, 2);
+    assertEquals(Set.of(1, 3), cache.eligibleCandidates(22 * SECOND).get(GROUP));
+    assertTrue(cache.getDiagnostics(7, 22 * SECOND).get(2).isAdmissionPending());
+    assertFalse(cache.getDiagnostics(7, 22 * SECOND).get(1).isAdmissionPending());
+    ReplicationBacklogCache.SelectionSnapshot pending = cache.captureSelection(22 * SECOND);
+    assertTrue(cache.isSelectionValid(pending, 22 * SECOND));
+    for (int seq = 5; seq <= 6; seq++) {
+      round(cache, seq);
+      // Neither repeated evaluations nor duplicate reports provide another confirmation.
+      for (int i = 0; i < 10; i++) {
+        round(cache, seq);
+      }
+      assertEquals(Set.of(1, 3), cache.eligibleCandidates(seq * 5 * SECOND).get(GROUP));
+    }
+    round(cache, 7);
+    assertFalse(cache.getDiagnostics(7, 35 * SECOND).get(2).isAdmissionPending());
+    assertEquals(Set.of(2), cache.eligibleCandidates(35 * SECOND).get(GROUP));
+    assertFalse(cache.isSelectionValid(pending, 35 * SECOND));
+  }
+
+  @Test
+  public void confirmingHeavyRecoveryDoesNotAdmitIt() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    recover(cache, 1);
+    assertEquals(Set.of(2, 3), cache.eligibleCandidates(22 * SECOND).get(GROUP));
+    for (int seq = 5; seq <= 7; seq++) {
+      round(cache, seq);
+    }
+    assertFalse(cache.getDiagnostics(7, 35 * SECOND).get(1).isAdmissionPending());
+    assertTrue(cache.getDiagnostics(7, 35 * SECOND).get(1).isHeavy());
+    assertEquals(Set.of(2), cache.eligibleCandidates(35 * SECOND).get(GROUP));
+  }
+
+  @Test
+  public void missingOrExpiredTelemetryDoesNotOpenRecoveryGate() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    recover(cache, 2);
+    round(cache, 5);
+    // One invalid source breaks confirmation; it must not readmit the recovering replica.
+    cache.cacheReport(3, null, 26 * SECOND, cache.getEpoch(), 26 * SECOND);
+    cache.evaluate(26 * SECOND);
+    assertEquals(Set.of(1, 3), cache.eligibleCandidates(26 * SECOND).get(GROUP));
+    ReplicationBacklogCache.SelectionSnapshot pending = cache.captureSelection(26 * SECOND);
+    assertTrue(cache.isSelectionValid(pending, 26 * SECOND));
+    cache.evaluate(60 * SECOND);
+    assertEquals(Set.of(1, 3), cache.eligibleCandidates(60 * SECOND).get(GROUP));
+    assertTrue(cache.isSelectionValid(pending, 60 * SECOND));
+    // Source reinitialization establishes a baseline, then three new rounds are required.
+    for (int seq = 13; seq <= 15; seq++) {
+      round(cache, seq);
+      assertTrue(cache.getDiagnostics(7, seq * 5 * SECOND).get(2).isAdmissionPending());
+    }
+    round(cache, 16);
+    assertFalse(cache.getDiagnostics(7, 80 * SECOND).get(2).isAdmissionPending());
+  }
+
+  @Test
+  public void delayedPreRecoverySamplesCannotConfirmAdmission() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    recover(cache, 2);
+    for (int seq = 5; seq <= 7; seq++) {
+      long now = seq * 5 * SECOND;
+      for (int source : MEMBERS) {
+        cache.cacheReport(
+            source,
+            v1(source, seq).setSampleAgeNanos(now - 20 * SECOND),
+            now,
+            cache.getEpoch(),
+            now);
+      }
+      cache.evaluate(now);
+      assertTrue(cache.getDiagnostics(7, now).get(2).isAdmissionPending());
+      assertEquals(Set.of(1, 3), cache.eligibleCandidates(now).get(GROUP));
+    }
+    for (int seq = 8; seq <= 10; seq++) {
+      round(cache, seq);
+      assertEquals(seq < 10, cache.getDiagnostics(7, seq * 5 * SECOND).get(2).isAdmissionPending());
+    }
+  }
+
+  @Test
+  public void restartIdentityClosesAdmissionWithoutAnOfflineHeartbeat() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    TReplicationBacklogReport restarted = v1(2, 1).setSourceInstanceId("restarted");
+    cache.cacheReport(2, restarted, 25 * SECOND, cache.getEpoch(), 25 * SECOND);
+    assertTrue(cache.getDiagnostics(7, 25 * SECOND).get(2).isAdmissionPending());
+    assertEquals(Set.of(1, 3), cache.eligibleCandidates(25 * SECOND).get(GROUP));
+    // A delayed response from the previous process must not reopen or replace the new instance.
+    cache.cacheReport(2, v1(2, 100), 24 * SECOND, cache.getEpoch(), 26 * SECOND);
+    assertEquals(Set.of(1, 3), cache.eligibleCandidates(26 * SECOND).get(GROUP));
+    for (int seq = 6; seq <= 8; seq++) {
+      long now = seq * 5 * SECOND;
+      for (int source : MEMBERS) {
+        TReplicationBacklogReport sample = v1(source, seq);
+        if (source == 2) {
+          sample.setSourceInstanceId("restarted");
+        }
+        cache.cacheReport(source, sample, now, cache.getEpoch(), now);
+      }
+      cache.evaluate(now);
+      assertEquals(seq < 8, cache.getDiagnostics(7, now).get(2).isAdmissionPending());
+    }
+  }
+
+  @Test
+  public void v2PipeRecreationPreservesHealthyAdmissionDuringPeerRecovery() throws Exception {
+    ReplicationBacklogCache cache = cache("ENFORCE");
+    for (int seq = 1; seq <= 7; seq++) {
+      if (seq == 5) {
+        recover(cache, 2);
+      }
+      long now = seq * 5 * SECOND;
+      for (int source : MEMBERS) {
+        ArrayList<TReplicationBacklogEdge> edges = new ArrayList<>();
+        for (int target : MEMBERS) {
+          if (source != target) {
+            edges.add(
+                edge(target, 0, 0, 0, 0)
+                    .setGeneration(source == 1 && target == 2 && seq >= 5 ? 2 : 1));
+          }
+        }
+        cache.cacheReport(
+            source,
+            report(source, seq, (byte) 2, edges.toArray(new TReplicationBacklogEdge[0])),
+            now,
+            cache.getEpoch(),
+            now);
+      }
+      cache.evaluate(now);
+      if (seq == 5 || seq == 6) {
+        assertFalse(cache.getDiagnostics(7, now).get(1).isAdmissionPending());
+        assertTrue(cache.getDiagnostics(7, now).get(2).isAdmissionPending());
+        assertEquals(Set.of(1, 3), cache.eligibleCandidates(now).get(GROUP));
+      }
+    }
+    assertFalse(cache.getDiagnostics(7, 35 * SECOND).get(2).isAdmissionPending());
+    assertTrue(cache.eligibleCandidates(35 * SECOND).isEmpty());
+  }
+
+  @Test
+  public void regionRecoveryOnRunningNodeClosesAdmission() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    Map<TConsensusGroupId, Map<Integer, RegionStatistics>> health = regions(MEMBERS);
+    health.get(GROUP).put(2, new RegionStatistics(RegionStatus.Unknown));
+    cache.updateTopology(
+        Collections.singletonMap(GROUP, MEMBERS), nodes(MEMBERS), health, 21 * SECOND);
+    cache.updateTopology(
+        Collections.singletonMap(GROUP, MEMBERS), nodes(MEMBERS), regions(MEMBERS), 22 * SECOND);
+    assertEquals(Set.of(1, 3), cache.eligibleCandidates(22 * SECOND).get(GROUP));
+    assertTrue(cache.getDiagnostics(7, 22 * SECOND).get(2).isAdmissionPending());
+  }
+
+  @Test
+  public void newLocalRegionGenerationClosesAdmissionWithoutHealthChange() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    TReplicationBacklogReport sample = v1(2, 5);
+    sample.getGroups().get(0).setGeneration(2);
+    cache.cacheReport(2, sample, 25 * SECOND, cache.getEpoch(), 25 * SECOND);
+    assertEquals(Set.of(1, 3), cache.eligibleCandidates(25 * SECOND).get(GROUP));
+    assertTrue(cache.getDiagnostics(7, 25 * SECOND).get(2).isAdmissionPending());
+  }
+
+  @Test
+  public void membershipChangeKeepsExistingAdmissionButGatesNewReplica() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    Set<Integer> members = Set.of(1, 2, 4);
+    cache.updateTopology(
+        Collections.singletonMap(GROUP, members), nodes(members), regions(members), 21 * SECOND);
+    assertEquals(Set.of(1, 2), cache.eligibleCandidates(21 * SECOND).get(GROUP));
+    assertTrue(cache.getDiagnostics(7, 21 * SECOND).get(4).isAdmissionPending());
+    assertFalse(cache.getDiagnostics(7, 21 * SECOND).get(1).isAdmissionPending());
+  }
+
+  @Test
+  public void availabilityFallbackRequiresNoConfirmedAvailableReplica() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    recover(cache, 2);
+    Map<Integer, NodeStatistics> health = nodes(MEMBERS);
+    health.put(1, new NodeStatistics(NodeStatus.Unknown));
+    cache.updateTopology(
+        Collections.singletonMap(GROUP, MEMBERS), health, regions(MEMBERS), 23 * SECOND);
+    assertEquals(Set.of(3), cache.eligibleCandidates(23 * SECOND).get(GROUP));
+    health.put(3, new NodeStatistics(NodeStatus.Unknown));
+    cache.updateTopology(
+        Collections.singletonMap(GROUP, MEMBERS), health, regions(MEMBERS), 24 * SECOND);
+    assertTrue(cache.eligibleCandidates(24 * SECOND).isEmpty());
+    assertTrue(cache.getDiagnostics(7, 24 * SECOND).get(2).isAdmissionPending());
+    // Bootstrap likewise cannot wait for an already confirmed replica that does not exist yet.
+    assertTrue(cache("ENFORCE").eligibleCandidates(0).isEmpty());
+  }
+
+  @Test
+  public void observeAndOffDoNotEnforceRecoveryGate() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    recover(cache, 2);
+    cache.configure(config("OBSERVE"));
+    assertTrue(cache.getDiagnostics(7, 22 * SECOND).get(2).isAdmissionPending());
+    assertTrue(cache.eligibleCandidates(22 * SECOND).isEmpty());
+    cache.configure(config("ENFORCE"));
+    assertEquals(Set.of(1, 3), cache.eligibleCandidates(22 * SECOND).get(GROUP));
+    cache.configure(config("OFF"));
+    assertTrue(cache.eligibleCandidates(22 * SECOND).isEmpty());
+  }
+
+  private static ReplicationBacklogCache warmedCache() throws Exception {
+    ReplicationBacklogCache cache = cache("ENFORCE");
+    for (int seq = 1; seq <= 4; seq++) {
+      round(cache, seq);
+    }
+    return cache;
+  }
+
+  private static void recover(ReplicationBacklogCache cache, int node) {
+    Map<Integer, NodeStatistics> health = nodes(MEMBERS);
+    health.put(node, new NodeStatistics(NodeStatus.Unknown));
+    cache.updateTopology(
+        Collections.singletonMap(GROUP, MEMBERS), health, regions(MEMBERS), 21 * SECOND);
+    cache.updateTopology(
+        Collections.singletonMap(GROUP, MEMBERS), nodes(MEMBERS), regions(MEMBERS), 22 * SECOND);
+  }
+
+  @Test
   public void multiSourceIncomingAggregationAndObserveMode() throws Exception {
     ReplicationBacklogCache cache = cache("OBSERVE");
     for (int i = 1; i <= 4; i++) {
