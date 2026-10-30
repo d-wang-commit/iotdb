@@ -296,6 +296,8 @@ struct TDataNodeHeartbeatReq {
   // lowest bit: enable separation of admin powers
   16: optional byte booleanVariables1
   17: optional i64 fenceThresholdMs
+  // 18 and 19 are used by downstream heartbeat extensions.
+  20: optional bool needReplicationBacklog
 }
 
 struct TDataNodeActivation {
@@ -326,6 +328,38 @@ struct TDataNodeHeartbeatResp {
   18: optional list<i32> pipeDegradedStatusList
   19: optional list<map<string, i64>> pipeRecentFailureList
   20: optional list<common.TPipeCompletedDataRegion> pipeCompletedDataRegionList
+  // 21 is used by a downstream heartbeat extension.
+  22: optional TReplicationBacklogReport replicationBacklogReport
+}
+
+// Telemetry only: these fields are not replication checkpoints or durability guarantees.
+// State: 0=valid, 1=recovering, 2=unsupported, 3=error. Missing reports are never zero.
+struct TReplicationBacklogEdge {
+  1: required i32 targetNodeId
+  2: required i64 generation
+  3: required i64 requestCount
+  4: required i64 tabletCount
+  5: required i64 fileCount
+  6: required i64 deletionCount
+  7: required byte state
+}
+
+struct TRegionReplicationBacklog {
+  1: required i32 regionId
+  // 1=IoTConsensus v1, 2=IoTConsensus v2. Counts from different protocols are incomparable.
+  2: required byte protocol
+  3: required i64 generation
+  4: required list<TReplicationBacklogEdge> targets
+  5: required byte state
+}
+
+struct TReplicationBacklogReport {
+  // Changes on source process restart; sequences are monotonic only within this instance.
+  1: required string sourceInstanceId
+  2: required i64 sampleSequence
+  // Duration measured on the source, not an absolute timestamp from its clock.
+  3: required i64 sampleAgeNanos
+  4: required list<TRegionReplicationBacklog> groups
 }
 
 struct TPipeHeartbeatReq {

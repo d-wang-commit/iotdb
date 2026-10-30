@@ -24,6 +24,7 @@ import org.apache.iotdb.db.pipe.event.common.deletion.PipeDeleteDataNodeEvent;
 import org.apache.iotdb.db.pipe.event.common.heartbeat.PipeHeartbeatEvent;
 import org.apache.iotdb.db.pipe.event.common.tablet.PipeInsertNodeTabletInsertionEvent;
 import org.apache.iotdb.db.pipe.event.common.tsfile.PipeTsFileInsertionEvent;
+import org.apache.iotdb.db.pipe.source.dataregion.realtime.epoch.TsFileEpoch;
 import org.apache.iotdb.db.pipe.source.dataregion.realtime.epoch.TsFileEpochManager;
 import org.apache.iotdb.db.queryengine.plan.planner.plan.node.write.AbstractDeleteDataNode;
 import org.apache.iotdb.db.queryengine.plan.planner.plan.node.write.InsertNode;
@@ -31,6 +32,14 @@ import org.apache.iotdb.db.storageengine.dataregion.tsfile.TsFileResource;
 
 public class PipeRealtimeEventFactory {
   private static final TsFileEpochManager TS_FILE_EPOCH_MANAGER = new TsFileEpochManager();
+
+  public static TsFileEpoch getOrCreateTsFileEpoch(final TsFileResource resource) {
+    return TS_FILE_EPOCH_MANAGER.getOrCreateEpoch(resource);
+  }
+
+  public static void retireTsFileEpoch(final TsFileResource resource) {
+    TS_FILE_EPOCH_MANAGER.retireEpoch(resource);
+  }
 
   public static PipeRealtimeEvent createRealtimeEvent(
       final Boolean isTableModel,

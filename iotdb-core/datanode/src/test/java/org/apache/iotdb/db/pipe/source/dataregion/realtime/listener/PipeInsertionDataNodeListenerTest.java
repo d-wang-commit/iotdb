@@ -19,13 +19,17 @@
 
 package org.apache.iotdb.db.pipe.source.dataregion.realtime.listener;
 
+import org.apache.iotdb.db.pipe.event.realtime.PipeRealtimeEventFactory;
 import org.apache.iotdb.db.pipe.source.dataregion.realtime.assigner.PipeDataRegionAssigner;
+import org.apache.iotdb.db.pipe.source.dataregion.realtime.epoch.TsFileEpoch;
+import org.apache.iotdb.db.storageengine.dataregion.tsfile.TsFileResource;
 
 import org.junit.Test;
 
 import java.lang.reflect.Field;
 import java.util.concurrent.ConcurrentMap;
 
+import static org.junit.Assert.assertNotSame;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -34,6 +38,38 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 public class PipeInsertionDataNodeListenerTest {
+
+  @Test
+  @SuppressWarnings("unchecked")
+  public void testFileCloseRetiresEpochWhenNoTsFileSourceRemains() throws Exception {
+    final PipeInsertionDataNodeListener listener = PipeInsertionDataNodeListener.getInstance();
+    final Field assignerMapField =
+        PipeInsertionDataNodeListener.class.getDeclaredField("dataRegionId2Assigner");
+    assignerMapField.setAccessible(true);
+    final ConcurrentMap<Integer, PipeDataRegionAssigner> assignerMap =
+        (ConcurrentMap<Integer, PipeDataRegionAssigner>) assignerMapField.get(listener);
+    final int regionId = Integer.MIN_VALUE + 2;
+    final TsFileResource resource = mock(TsFileResource.class);
+    when(resource.getTsFilePath()).thenReturn("closed-without-consensus-source.tsfile");
+    final PipeDataRegionAssigner assigner = mock(PipeDataRegionAssigner.class);
+    try {
+      final TsFileEpoch stoppedSourceEpoch =
+          PipeRealtimeEventFactory.getOrCreateTsFileEpoch(resource);
+      listener.listenToTsFile(regionId, null, resource, false);
+      final TsFileEpoch newEpoch = PipeRealtimeEventFactory.getOrCreateTsFileEpoch(resource);
+      assertNotSame(stoppedSourceEpoch, newEpoch);
+
+      assignerMap.put(regionId, assigner);
+      when(assigner.shouldListenToTsFile()).thenReturn(false);
+      listener.listenToTsFile(regionId, null, resource, false);
+      assertNotSame(newEpoch, PipeRealtimeEventFactory.getOrCreateTsFileEpoch(resource));
+      verify(assigner).invalidateCompletion();
+      verify(assigner, never()).publishDataEventToAssign(any());
+    } finally {
+      assignerMap.remove(regionId, assigner);
+      PipeRealtimeEventFactory.retireTsFileEpoch(resource);
+    }
+  }
 
   @Test
   @SuppressWarnings("unchecked")

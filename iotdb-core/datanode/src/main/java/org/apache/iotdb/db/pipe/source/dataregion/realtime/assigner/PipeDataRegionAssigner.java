@@ -20,13 +20,16 @@
 package org.apache.iotdb.db.pipe.source.dataregion.realtime.assigner;
 
 import org.apache.iotdb.commons.consensus.DataRegionId;
+import org.apache.iotdb.commons.consensus.index.impl.MinimumProgressIndex;
 import org.apache.iotdb.commons.pipe.event.EnrichedEvent;
 import org.apache.iotdb.commons.pipe.event.ProgressReportEvent;
 import org.apache.iotdb.commons.pipe.metric.PipeEventCounter;
 import org.apache.iotdb.commons.utils.PathUtils;
 import org.apache.iotdb.db.i18n.DataNodePipeMessages;
+import org.apache.iotdb.db.pipe.consensus.ReplicateProgressDataNodeManager;
 import org.apache.iotdb.db.pipe.consensus.deletion.DeletionResource;
 import org.apache.iotdb.db.pipe.consensus.deletion.DeletionResourceManager;
+import org.apache.iotdb.db.pipe.consensus.metric.ConsensusPipeBacklog;
 import org.apache.iotdb.db.pipe.event.common.deletion.PipeDeleteDataNodeEvent;
 import org.apache.iotdb.db.pipe.event.common.heartbeat.PipeHeartbeatEvent;
 import org.apache.iotdb.db.pipe.event.common.tsfile.PipeTsFileInsertionEvent;
@@ -35,11 +38,15 @@ import org.apache.iotdb.db.pipe.event.realtime.PipeRealtimeEventFactory;
 import org.apache.iotdb.db.pipe.metric.overview.PipeDataNodeSinglePipeMetrics;
 import org.apache.iotdb.db.pipe.metric.source.PipeAssignerMetrics;
 import org.apache.iotdb.db.pipe.metric.source.PipeDataRegionEventCounter;
+import org.apache.iotdb.db.pipe.processor.iotconsensusv2.IoTConsensusV2Processor;
 import org.apache.iotdb.db.pipe.source.dataregion.realtime.PipeRealtimeDataRegionSource;
+import org.apache.iotdb.db.pipe.source.dataregion.realtime.epoch.TsFileEpoch;
 import org.apache.iotdb.db.pipe.source.dataregion.realtime.matcher.CachedSchemaPatternMatcher;
 import org.apache.iotdb.db.pipe.source.dataregion.realtime.matcher.PipeDataRegionMatcher;
+import org.apache.iotdb.db.queryengine.plan.planner.plan.node.write.InsertNode;
 import org.apache.iotdb.db.storageengine.StorageEngine;
 import org.apache.iotdb.db.storageengine.dataregion.DataRegion;
+import org.apache.iotdb.db.storageengine.dataregion.tsfile.TsFileResource;
 import org.apache.iotdb.pipe.api.event.dml.insertion.TabletInsertionEvent;
 import org.apache.iotdb.pipe.api.event.dml.insertion.TsFileInsertionEvent;
 
@@ -48,8 +55,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
@@ -79,6 +88,7 @@ public class PipeDataRegionAssigner implements Closeable {
   private final AtomicLong completionInvalidationEpoch = new AtomicLong(0);
   // Serializes generation/token changes with publication, so a barrier cannot overtake data.
   private final ReentrantLock publicationLock = new ReentrantLock();
+  private final List<PipeRealtimeDataRegionSource> consensusSources = new CopyOnWriteArrayList<>();
 
   private Boolean isTableModel;
 
@@ -167,10 +177,17 @@ public class PipeDataRegionAssigner implements Closeable {
 
   private void publishToAssignInternal(final PipeRealtimeEvent event, final boolean isDataEvent) {
     final EnrichedEvent innerEvent = event.getEvent();
+    if (isDataEvent) {
+      for (final PipeRealtimeDataRegionSource source : consensusSources) {
+        event.addReplicationEventToken(source.getSourceId(), createReplicationToken(event, source));
+      }
+    }
     if (!event.increaseReferenceCount(PipeDataRegionAssigner.class.getName())) {
       if (isDataEvent) {
         markPublicationFailed();
       }
+      event.invalidateUnassignedReplicationEventTokens();
+      event.releaseUnassignedReplicationEventTokens();
       LOGGER.warn(DataNodePipeMessages.THE_REFERENCE_COUNT_OF_THE_REALTIME_EVENT, event);
       return;
     }
@@ -214,6 +231,8 @@ public class PipeDataRegionAssigner implements Closeable {
       if (isDataEvent) {
         markPublicationFailed();
       }
+      event.invalidateUnassignedReplicationEventTokens();
+      event.releaseUnassignedReplicationEventTokens();
       throw e;
     }
 
@@ -227,6 +246,63 @@ public class PipeDataRegionAssigner implements Closeable {
 
   private void markPublicationFailed() {
     publicationFailureEpoch.incrementAndGet();
+    consensusSources.forEach(source -> source.getConsensusPipeBacklog().invalidate());
+  }
+
+  /** Records batch work without constructing a tablet event or pinning its WAL entry. */
+  public void recordUnsealedReplicationFile(
+      final InsertNode insertNode, final TsFileResource resource) {
+    if (consensusSources.isEmpty()
+        || ReplicateProgressDataNodeManager.extractLocalSimpleProgressIndex(
+                insertNode.getProgressIndex())
+            instanceof MinimumProgressIndex) {
+      return;
+    }
+    for (final PipeRealtimeDataRegionSource source : consensusSources) {
+      if (!source.isNeedListenToInsertNode() && source.isNeedListenToTsFile()) {
+        final TsFileEpoch epoch = PipeRealtimeEventFactory.getOrCreateTsFileEpoch(resource);
+        epoch.markLocalReplicationData();
+        epoch.reserveReplicationFile(source);
+      }
+    }
+  }
+
+  private ConsensusPipeBacklog.Token createReplicationToken(
+      final PipeRealtimeEvent event, final PipeRealtimeDataRegionSource source) {
+    final ConsensusPipeBacklog backlog = source.getConsensusPipeBacklog();
+    final EnrichedEvent innerEvent = event.getEvent();
+    if (backlog == null
+        || innerEvent.isControlEvent()
+        || !IoTConsensusV2Processor.isShouldReplicate(innerEvent)) {
+      return null;
+    }
+    if (innerEvent instanceof TabletInsertionEvent) {
+      if (!source.isNeedListenToInsertNode() && !source.isNeedListenToTsFile()) {
+        return null;
+      }
+      event.getTsFileEpoch().markLocalReplicationData();
+      if (!source.isNeedListenToInsertNode()) {
+        event.getTsFileEpoch().reserveReplicationFile(source);
+        return null;
+      }
+      return backlog.newToken(ConsensusPipeBacklog.Kind.TABLET);
+    }
+    if (innerEvent instanceof TsFileInsertionEvent) {
+      if (!source.isNeedListenToTsFile()) {
+        return null;
+      }
+      event.getTsFileEpoch().markLocalReplicationData();
+      // A regular file in stream mode can be only a progress marker. Reserve it only when
+      // file transfer is already known to be needed; Hybrid may decide to reserve it later.
+      if (!source.isNeedListenToInsertNode()
+          || ((PipeTsFileInsertionEvent) innerEvent).isLoaded()) {
+        event.getTsFileEpoch().reserveReplicationFile(source);
+      }
+      return event.getTsFileEpoch().takeReplicationFile(source);
+    }
+    return innerEvent instanceof PipeDeleteDataNodeEvent && source.shouldExtractDeletion()
+        ? backlog.newToken(ConsensusPipeBacklog.Kind.DELETION)
+        : null;
   }
 
   /**
@@ -303,6 +379,7 @@ public class PipeDataRegionAssigner implements Closeable {
   }
 
   private void onAssignedHook(final PipeRealtimeEvent realtimeEvent) {
+    realtimeEvent.releaseUnassignedReplicationEventTokens();
     realtimeEvent.gcSchemaInfo();
     realtimeEvent.decreaseReferenceCount(PipeDataRegionAssigner.class.getName(), false);
 
@@ -326,6 +403,8 @@ public class PipeDataRegionAssigner implements Closeable {
       if (!event.getEvent().isControlEvent()) {
         markPublicationFailed();
       }
+      event.invalidateUnassignedReplicationEventTokens();
+      event.releaseUnassignedReplicationEventTokens();
       throw e;
     }
   }
@@ -374,6 +453,14 @@ public class PipeDataRegionAssigner implements Closeable {
               final EnrichedEvent innerEvent = copiedEvent.getEvent();
 
               innerEvent.bindSource(source.getSourceId());
+              ConsensusPipeBacklog.Token replicationToken =
+                  event.takeReplicationEventToken(source.getSourceId());
+              if (replicationToken == null && source.getConsensusPipeBacklog() != null) {
+                // The source can register after publication but before assignment. Its historical
+                // snapshot covers earlier data; this additional realtime delivery is real work too.
+                replicationToken = createReplicationToken(event, source);
+              }
+              innerEvent.bindReplicationEventToken(replicationToken);
 
               if (innerEvent instanceof PipeTsFileInsertionEvent) {
                 final PipeTsFileInsertionEvent tsFileInsertionEvent =
@@ -450,10 +537,14 @@ public class PipeDataRegionAssigner implements Closeable {
     if (source.isNeedListenToInsertNode()) {
       listenToInsertNodeSourceCount++;
     }
+    if (source.getConsensusPipeBacklog() != null) {
+      consensusSources.add(source);
+    }
     logSourceAssignmentChange("registered", source);
   }
 
   public synchronized void stopAssignTo(final PipeRealtimeDataRegionSource source) {
+    consensusSources.remove(source);
     matcher.deregister(source);
     PipeDataNodeSinglePipeMetrics.getInstance().deregister(source, this);
     if (source.isNeedListenToTsFile()) {
@@ -508,6 +599,8 @@ public class PipeDataRegionAssigner implements Closeable {
     final long startTime = System.currentTimeMillis();
     disruptor.shutdown();
     matcher.clear();
+    consensusSources.forEach(source -> source.getConsensusPipeBacklog().invalidate());
+    consensusSources.clear();
     if (interrupted) {
       Thread.currentThread().interrupt();
     }

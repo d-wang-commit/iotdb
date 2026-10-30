@@ -28,6 +28,7 @@ import org.apache.iotdb.commons.pipe.datastructure.pattern.TreePattern;
 import org.apache.iotdb.commons.pipe.source.IoTDBSource;
 import org.apache.iotdb.commons.queryengine.common.SqlDialect;
 import org.apache.iotdb.db.i18n.DataNodePipeMessages;
+import org.apache.iotdb.db.pipe.consensus.metric.ConsensusPipeBacklog;
 import org.apache.iotdb.db.pipe.event.common.heartbeat.PipeHeartbeatEvent;
 import org.apache.iotdb.db.pipe.metric.overview.PipeDataNodeSinglePipeMetrics;
 import org.apache.iotdb.db.pipe.metric.overview.PipeTsFileToTabletsMetrics;
@@ -143,6 +144,7 @@ public class IoTDBDataRegionSource extends IoTDBSource {
   private boolean hasNoExtractionNeed = true;
   private boolean shouldExtractDeletion = false;
   private final AtomicBoolean completionSourceStarted = new AtomicBoolean(false);
+  private ConsensusPipeBacklog consensusPipeBacklog;
 
   @Override
   public void validate(final PipeParameterValidator validator) throws Exception {
@@ -469,6 +471,14 @@ public class IoTDBDataRegionSource extends IoTDBSource {
     historicalSource.customize(parameters, configuration);
     realtimeSource.customize(parameters, configuration);
 
+    if (pipeName.startsWith(PipeStaticMeta.CONSENSUS_PIPE_PREFIX)) {
+      consensusPipeBacklog =
+          ConsensusPipeBacklog.create(pipeName, creationTime, realtimeSource.getSourceId());
+      realtimeSource.setConsensusPipeBacklog(consensusPipeBacklog);
+      ((PipeHistoricalDataRegionTsFileAndDeletionSource) historicalSource)
+          .setConsensusPipeBacklog(consensusPipeBacklog);
+    }
+
     // Set watermark injector
     long watermarkIntervalInMs = EXTRACTOR_WATERMARK_INTERVAL_DEFAULT_VALUE;
     if (parameters.hasAnyAttributes(
@@ -590,6 +600,9 @@ public class IoTDBDataRegionSource extends IoTDBSource {
       realtimeSource.start();
       historicalSource.start();
     } catch (final Exception e) {
+      if (consensusPipeBacklog != null) {
+        consensusPipeBacklog.invalidate();
+      }
       exceptionHolder.set(e);
       LOGGER.warn(
           DataNodePipeMessages.PIPE_START_HISTORICAL_SOURCE_AND_REALTIME_SOURCE,
@@ -641,6 +654,9 @@ public class IoTDBDataRegionSource extends IoTDBSource {
   @Override
   public void close() throws Exception {
     completionSourceStarted.set(false);
+    if (consensusPipeBacklog != null) {
+      consensusPipeBacklog.close();
+    }
     PipeDataNodeSinglePipeMetrics.getInstance().deregister(this);
     if (hasNoExtractionNeed || !hasBeenStarted.get()) {
       return;

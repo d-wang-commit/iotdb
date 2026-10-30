@@ -1486,4 +1486,15 @@ public class ConfigNodeConfig {
   public void setTopologyProbingTimeoutRatio(double topologyProbingTimeoutRatio) {
     this.topologyProbingTimeoutRatio = topologyProbingTimeoutRatio;
   }
+
+  private volatile ReplicationBacklogConfig replicationBacklogConfig =
+      ReplicationBacklogConfig.defaults();
+
+  public ReplicationBacklogConfig getReplicationBacklogConfig() {
+    return replicationBacklogConfig;
+  }
+
+  public void setReplicationBacklogConfig(ReplicationBacklogConfig config) {
+    replicationBacklogConfig = config;
+  }
 }

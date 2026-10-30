@@ -79,6 +79,7 @@ public class PipeRealtimeDataRegionLogSource extends PipeRealtimeDataRegionSourc
     }
 
     event.getTsFileEpoch().migrateState(this, state -> TsFileEpoch.State.USING_TSFILE);
+    bindReplicationFileIfNeeded(event);
     pendingQueue.offer(event);
   }
 

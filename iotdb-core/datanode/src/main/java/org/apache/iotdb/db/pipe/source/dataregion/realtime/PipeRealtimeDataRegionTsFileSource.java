@@ -125,6 +125,7 @@ public class PipeRealtimeDataRegionTsFileSource extends PipeRealtimeDataRegionSo
       return;
     }
 
+    bindReplicationFileIfNeeded(event);
     pendingQueue.offer(event);
 
     event.getTsFileEpoch().clearState(this);

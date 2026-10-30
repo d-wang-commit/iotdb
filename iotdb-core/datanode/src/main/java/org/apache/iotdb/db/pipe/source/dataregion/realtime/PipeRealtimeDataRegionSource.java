@@ -38,6 +38,7 @@ import org.apache.iotdb.db.consensus.DataRegionConsensusImpl;
 import org.apache.iotdb.db.i18n.DataNodePipeMessages;
 import org.apache.iotdb.db.pipe.agent.PipeDataNodeAgent;
 import org.apache.iotdb.db.pipe.consensus.ReplicateProgressDataNodeManager;
+import org.apache.iotdb.db.pipe.consensus.metric.ConsensusPipeBacklog;
 import org.apache.iotdb.db.pipe.event.common.heartbeat.PipeHeartbeatEvent;
 import org.apache.iotdb.db.pipe.event.common.tablet.PipeInsertNodeTabletInsertionEvent;
 import org.apache.iotdb.db.pipe.event.common.tsfile.PipeTsFileInsertionEvent;
@@ -109,6 +110,7 @@ public abstract class PipeRealtimeDataRegionSource implements PipeExtractor {
   // A lifecycle identity for this source instance, also attached to its events for attribution.
   private final long sourceId = SOURCE_ID_GENERATOR.incrementAndGet();
   private final AtomicLong completionStateVersion = new AtomicLong(0);
+  private ConsensusPipeBacklog consensusPipeBacklog;
 
   protected boolean shouldExtractInsertion;
   protected boolean shouldExtractDeletion;
@@ -331,10 +333,16 @@ public abstract class PipeRealtimeDataRegionSource implements PipeExtractor {
   public void start() throws Exception {
     PipeTimePartitionListener.getInstance().startListen(dataRegionId, this);
     PipeInsertionDataNodeListener.getInstance().startListenAndAssign(dataRegionId, this);
+    if (consensusPipeBacklog != null) {
+      consensusPipeBacklog.markRealtimeReady();
+    }
   }
 
   @Override
   public void close() throws Exception {
+    if (consensusPipeBacklog != null) {
+      consensusPipeBacklog.close();
+    }
     if (dataRegionId >= 0) {
       PipeInsertionDataNodeListener.getInstance().stopListenAndAssign(dataRegionId, this);
       PipeTimePartitionListener.getInstance().stopListen(dataRegionId, this);
@@ -633,6 +641,21 @@ public abstract class PipeRealtimeDataRegionSource implements PipeExtractor {
     return sourceId;
   }
 
+  public final ConsensusPipeBacklog getConsensusPipeBacklog() {
+    return consensusPipeBacklog;
+  }
+
+  public final void setConsensusPipeBacklog(final ConsensusPipeBacklog consensusPipeBacklog) {
+    this.consensusPipeBacklog = consensusPipeBacklog;
+  }
+
+  protected final void bindReplicationFileIfNeeded(final PipeRealtimeEvent event) {
+    if (consensusPipeBacklog != null) {
+      event.getTsFileEpoch().reserveReplicationFile(this);
+      event.bindReplicationEventToken(event.getTsFileEpoch().takeReplicationFile(this));
+    }
+  }
+
   public final long getCompletionStateVersion() {
     return completionStateVersion.get();
   }
@@ -642,6 +665,9 @@ public abstract class PipeRealtimeDataRegionSource implements PipeExtractor {
   }
 
   protected final void markDataRegionCompletionInvalid() {
+    if (consensusPipeBacklog != null) {
+      consensusPipeBacklog.invalidate();
+    }
     PipeDataNodeSinglePipeMetrics.getInstance()
         .markDataRegionCompletionInvalid(
             pipeName, creationTime, dataRegionId, pipeTaskMeta, sourceId);

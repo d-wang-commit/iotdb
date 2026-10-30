@@ -104,10 +104,14 @@ public class PipeInsertionDataNodeListener {
     final PipeDataRegionAssigner assigner = dataRegionId2Assigner.get(dataRegionId);
 
     if (assigner == null) {
+      // The last source may have stopped while this file was still open. A batch backlog
+      // placeholder must not retain its epoch after the file closes without any listener.
+      PipeRealtimeEventFactory.retireTsFileEpoch(tsFileResource);
       return;
     }
     // only events from registered data region with tsfile listeners will be extracted
     if (!assigner.shouldListenToTsFile()) {
+      PipeRealtimeEventFactory.retireTsFileEpoch(tsFileResource);
       assigner.invalidateCompletion();
       return;
     }
@@ -128,6 +132,7 @@ public class PipeInsertionDataNodeListener {
     if (assigner == null) {
       return;
     }
+    assigner.recordUnsealedReplicationFile(insertNode, tsFileResource);
     // only events from registered data region with insert listeners will be extracted
     if (!assigner.shouldListenToInsertNode()) {
       assigner.invalidateCompletionBarrier();

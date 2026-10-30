@@ -26,6 +26,7 @@ import org.apache.iotdb.confignode.manager.load.cache.region.RegionStatistics;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -71,6 +72,9 @@ public class CostFlowSelectionLeaderBalancer extends AbstractLeaderBalancer {
   private int maximumFlow = 0;
   private int minimumCost = 0;
 
+  // Optional candidate restrictions; the actual topology and all costs remain unchanged.
+  private Map<TConsensusGroupId, Set<Integer>> eligibleCandidates = Collections.emptyMap();
+
   public CostFlowSelectionLeaderBalancer() {
     super();
     this.rVertexMap = new TreeMap<>();
@@ -87,12 +91,29 @@ public class CostFlowSelectionLeaderBalancer extends AbstractLeaderBalancer {
       Map<TConsensusGroupId, Integer> regionLeaderMap,
       Map<Integer, NodeStatistics> dataNodeStatisticsMap,
       Map<TConsensusGroupId, Map<Integer, RegionStatistics>> regionStatisticsMap) {
+    return generateOptimalLeaderDistribution(
+        databaseRegionGroupMap,
+        regionLocationMap,
+        regionLeaderMap,
+        dataNodeStatisticsMap,
+        regionStatisticsMap,
+        Collections.emptyMap());
+  }
+
+  public Map<TConsensusGroupId, Integer> generateOptimalLeaderDistribution(
+      Map<String, List<TConsensusGroupId>> databaseRegionGroupMap,
+      Map<TConsensusGroupId, Set<Integer>> regionLocationMap,
+      Map<TConsensusGroupId, Integer> regionLeaderMap,
+      Map<Integer, NodeStatistics> dataNodeStatisticsMap,
+      Map<TConsensusGroupId, Map<Integer, RegionStatistics>> regionStatisticsMap,
+      Map<TConsensusGroupId, Set<Integer>> eligibleCandidates) {
     initialize(
         databaseRegionGroupMap,
         regionLocationMap,
         regionLeaderMap,
         dataNodeStatisticsMap,
         regionStatisticsMap);
+    this.eligibleCandidates = eligibleCandidates;
     Map<TConsensusGroupId, Integer> result;
     constructFlowNetwork();
     dinicAlgorithm();
@@ -115,6 +136,7 @@ public class CostFlowSelectionLeaderBalancer extends AbstractLeaderBalancer {
     this.vertexMinimumCost = null;
     this.maxVertex = T_VERTEX + 1;
     this.maxEdge = 0;
+    this.eligibleCandidates = Collections.emptyMap();
   }
 
   private void constructFlowNetwork() {
@@ -177,11 +199,12 @@ public class CostFlowSelectionLeaderBalancer extends AbstractLeaderBalancer {
               .forEach(
                   dataNodeId -> {
                     if (isDataNodeAvailable(dataNodeId)
-                        && isRegionAvailable(regionGroupId, dataNodeId)) {
+                        && isRegionAvailable(regionGroupId, dataNodeId)
+                        && isBacklogEligible(regionGroupId, dataNodeId)) {
                       int sDVertex = sDVertexMap.get(database).get(dataNodeId);
-                      // Capacity: 1, Cost: 1 if the DataNode is the current leader of the
+                      // Capacity: 1, Cost: 0 if the DataNode is the current leader of the
                       // RegionGroup;
-                      // 0 otherwise. Thus, the RegionGroup will keep the leader as constant as
+                      // 1 otherwise. Thus, the RegionGroup will keep the leader as constant as
                       // possible.
                       int cost =
                           Objects.equals(
@@ -243,6 +266,22 @@ public class CostFlowSelectionLeaderBalancer extends AbstractLeaderBalancer {
   private void addAdjacentEdges(int fromVertex, int destVertex, int capacity, int cost) {
     addEdge(fromVertex, destVertex, capacity, cost);
     addEdge(destVertex, fromVertex, 0, -cost);
+  }
+
+  private boolean isBacklogEligible(TConsensusGroupId groupId, int nodeId) {
+    Set<Integer> candidates = eligibleCandidates.get(groupId);
+    if (candidates == null || candidates.isEmpty()) {
+      return true;
+    }
+    // Availability may change after a telemetry snapshot. Never exclude the last usable replica.
+    boolean anyAvailable =
+        candidates.stream()
+            .anyMatch(
+                id ->
+                    regionLocationMap.get(groupId).contains(id)
+                        && isDataNodeAvailable(id)
+                        && isRegionAvailable(groupId, id));
+    return !anyAvailable || candidates.contains(nodeId);
   }
 
   private void addEdge(int fromVertex, int destVertex, int capacity, int cost) {

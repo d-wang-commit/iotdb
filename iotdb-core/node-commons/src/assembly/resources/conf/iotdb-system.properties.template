@@ -782,6 +782,49 @@ region_group_allocate_policy=GCR
 # Datatype: Boolean
 enable_auto_leader_balance_for_ratis_consensus=true
 
+# Incoming replication backlog observation for IoTConsensus v1/v2 DataRegions.
+# OFF stops ConfigNode sampling and filtering; DataNode lifecycle counters remain active.
+# OBSERVE samples without changing leaders. ENFORCE also filters persistently heavier
+# available candidates for CFS; original per-database/global costs remain unchanged.
+# Missing, recovering or expired reports never mean zero and fall back to normal candidates.
+# Modes change only by administrator configuration, never automatically.
+# effectiveMode: hot_reload
+# Datatype: String (OFF, OBSERVE, ENFORCE)
+iot_consensus_replication_backlog_mode=OBSERVE
+
+# Sampling is piggybacked on heartbeats, so it cannot run faster than heartbeats.
+# Sample validity must be at least the sample interval. Balancing coalesces candidate changes;
+# ordinary health-triggered failover does not wait for this interval.
+# effectiveMode: hot_reload
+# Datatype: long, in milliseconds
+iot_consensus_replication_backlog_sample_interval_ms=5000
+iot_consensus_replication_backlog_ttl_ms=30000
+iot_consensus_replication_backlog_balance_interval_ms=10000
+
+# EWMA = alpha * new sample + (1 - alpha) * previous EWMA. Missing/duplicate reports
+# do not update EWMA or confirmation. A round requires new reports from every member.
+# A heavier replica must be no lighter in every dimension and exceed both the absolute
+# gap and relative_gap * max(lighter_count, 1) in at least one dimension.
+# Exit thresholds are half the entry thresholds, with the same confirmation count.
+# effectiveMode: hot_reload
+# Datatype: double (alpha in (0, 1], relative gap > 0), int (rounds > 0)
+iot_consensus_replication_backlog_ewma_alpha=0.5
+iot_consensus_replication_backlog_relative_gap=1.0
+iot_consensus_replication_backlog_confirmation_rounds=3
+
+# Absolute gaps are counts, not rows, bytes or time. v1 uses the request sequence span;
+# v2 separately compares Tablet/InsertNode events, TsFiles (including unsealed placeholders)
+# and deletion events. Different kinds are never added into one workload score.
+# -1 leaves a threshold unconfigured. OBSERVE can display counts without thresholds;
+# ENFORCE requires all four gaps to be positive. Choose gaps from observed workloads.
+# Changing thresholds resets confirmation; invalid configuration keeps the old settings.
+# effectiveMode: hot_reload
+# Datatype: long (-1 or positive)
+iot_consensus_replication_backlog_request_gap=-1
+iot_consensus_replication_backlog_tablet_gap=-1
+iot_consensus_replication_backlog_file_gap=-1
+iot_consensus_replication_backlog_deletion_gap=-1
+
 ####################
 ### Cluster management
 ####################

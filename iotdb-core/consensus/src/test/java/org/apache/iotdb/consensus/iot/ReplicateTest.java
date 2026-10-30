@@ -280,6 +280,17 @@ public class ReplicateTest {
     Assert.assertEquals(0, servers.get(0).getImpl(gid).getMinSyncIndex());
     Assert.assertEquals(0, servers.get(1).getImpl(gid).getMinSyncIndex());
 
+    // Each source independently owes the absent third replica all of its own requests.
+    for (int i = 0; i < 2; i++) {
+      IoTConsensusReplicationSnapshot snapshot =
+          servers.get(i).getImpl(gid).getReplicationBacklogSnapshot();
+      Assert.assertTrue(snapshot.isValid());
+      Assert.assertEquals(2, snapshot.getPendingRequests().size());
+      Assert.assertEquals(
+          Long.valueOf(CHECK_POINT_GAP),
+          snapshot.getPendingRequests().get(peers.get(2).getNodeId()));
+    }
+
     try {
       stopServer();
       initServer();
@@ -313,6 +324,18 @@ public class ReplicateTest {
 
       Assert.assertEquals(stateMachines.get(0).getData(), stateMachines.get(1).getData());
       Assert.assertEquals(stateMachines.get(2).getData(), stateMachines.get(1).getData());
+      for (IoTConsensus server : servers) {
+        IoTConsensusReplicationSnapshot snapshot =
+            server.getImpl(gid).getReplicationBacklogSnapshot();
+        Assert.assertTrue(snapshot.isValid());
+        Assert.assertEquals(2, snapshot.getPendingRequests().size());
+        snapshot
+            .getPendingRequests()
+            .values()
+            .forEach(value -> Assert.assertEquals(0L, value.longValue()));
+      }
+      // Receiving both other sources' data did not create a third local source stream.
+      Assert.assertEquals(0, servers.get(2).getImpl(gid).getSearchIndex());
     } catch (IOException e) {
       if (e.getCause() instanceof StartupException) {
         // just succeed when can not bind socket

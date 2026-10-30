@@ -49,6 +49,7 @@ import org.apache.iotdb.db.i18n.DataNodePipeMessages;
 import org.apache.iotdb.db.pipe.consensus.ReplicateProgressDataNodeManager;
 import org.apache.iotdb.db.pipe.consensus.deletion.DeletionResource;
 import org.apache.iotdb.db.pipe.consensus.deletion.DeletionResourceManager;
+import org.apache.iotdb.db.pipe.consensus.metric.ConsensusPipeBacklog;
 import org.apache.iotdb.db.pipe.event.common.deletion.PipeDeleteDataNodeEvent;
 import org.apache.iotdb.db.pipe.event.common.terminate.PipeTerminateEvent;
 import org.apache.iotdb.db.pipe.event.common.tsfile.PipeTsFileInsertionEvent;
@@ -171,6 +172,7 @@ public class PipeHistoricalDataRegionTsFileAndDeletionSource
   private boolean isForwardingPipeRequests;
 
   private volatile boolean hasBeenStarted = false;
+  private ConsensusPipeBacklog consensusPipeBacklog;
 
   private Queue<PersistentResource> pendingQueue;
   private final Map<TsFileResource, Set<String>> filteredTsFileResources2TableNames =
@@ -538,6 +540,7 @@ public class PipeHistoricalDataRegionTsFileAndDeletionSource
   public synchronized void start() {
     if (!shouldExtractInsertion && !shouldExtractDeletion) {
       hasBeenStarted = true;
+      markHistoricalBacklogReady();
       return;
     }
     if (!StorageEngine.getInstance().isReadyForNonReadWriteFunctions()) {
@@ -558,6 +561,7 @@ public class PipeHistoricalDataRegionTsFileAndDeletionSource
         StorageEngine.getInstance().getDataRegion(new DataRegionId(dataRegionId));
     if (Objects.isNull(dataRegion)) {
       pendingQueue = new ArrayDeque<>();
+      markHistoricalBacklogReady();
       return;
     }
 
@@ -588,6 +592,7 @@ public class PipeHistoricalDataRegionTsFileAndDeletionSource
         prepareProgressReportResourcesForHistoricalTsFileQueryPriorityOrder(originalResourceList);
       }
       pendingQueue = new ArrayDeque<>(originalResourceList);
+      initializeHistoricalBacklog();
       PipeTerminateEvent.initializeHistoricalTransferSummary(
           pipeName,
           creationTime,
@@ -600,9 +605,63 @@ public class PipeHistoricalDataRegionTsFileAndDeletionSource
           pipeName,
           dataRegionId,
           System.currentTimeMillis() - startTime);
+    } catch (final RuntimeException | Error e) {
+      if (consensusPipeBacklog != null) {
+        consensusPipeBacklog.invalidate();
+      }
+      throw e;
     } finally {
       dataRegion.writeUnlock();
     }
+  }
+
+  public void setConsensusPipeBacklog(final ConsensusPipeBacklog consensusPipeBacklog) {
+    this.consensusPipeBacklog = consensusPipeBacklog;
+  }
+
+  void initializeHistoricalBacklog() {
+    if (consensusPipeBacklog == null) {
+      return;
+    }
+    long files = 0;
+    long deletions = 0;
+    for (final PersistentResource resource : pendingQueue) {
+      if (isPendingReplicationResource(resource)) {
+        if (resource instanceof TsFileResource) {
+          files++;
+        } else {
+          deletions++;
+        }
+      }
+    }
+    consensusPipeBacklog.addPending(ConsensusPipeBacklog.Kind.FILE, files);
+    consensusPipeBacklog.addPending(ConsensusPipeBacklog.Kind.DELETION, deletions);
+    markHistoricalBacklogReady();
+  }
+
+  private void markHistoricalBacklogReady() {
+    if (consensusPipeBacklog != null) {
+      consensusPipeBacklog.markHistoricalReady();
+    }
+  }
+
+  private boolean isPendingReplicationResource(final PersistentResource resource) {
+    if (consensusPipeBacklog == null) {
+      return false;
+    }
+    if (resource instanceof TsFileResource) {
+      final TsFileResource tsFile = (TsFileResource) resource;
+      return filteredTsFileResources2TableNames.containsKey(tsFile)
+          && !tsFile.isGeneratedByIoTConsensusV2()
+          && !tsFile.isEmpty()
+          && !(ReplicateProgressDataNodeManager.extractLocalSimpleProgressIndex(
+                  tsFile.getMaxProgressIndex())
+              instanceof MinimumProgressIndex);
+    }
+    return resource instanceof DeletionResource
+        && !(ReplicateProgressDataNodeManager.extractLocalSimpleProgressIndex(
+                resource.getProgressIndex())
+            instanceof MinimumProgressIndex);
   }
 
   private boolean shouldUseHistoricalTsFileQueryPriorityOrder() {
@@ -809,6 +868,9 @@ public class PipeHistoricalDataRegionTsFileAndDeletionSource
                   return false;
                 } catch (final IOException e) {
                   ++statistics.pinFailedCount;
+                  if (consensusPipeBacklog != null) {
+                    consensusPipeBacklog.invalidate();
+                  }
                   LOGGER.warn(
                       DataNodePipeMessages.PIPE_FAILED_TO_PIN_TSFILERESOURCE,
                       resource.getTsFilePath(),
@@ -1104,6 +1166,17 @@ public class PipeHistoricalDataRegionTsFileAndDeletionSource
 
   @Override
   public synchronized Event supply() {
+    try {
+      return supplyInternal();
+    } catch (final RuntimeException | Error e) {
+      if (consensusPipeBacklog != null) {
+        consensusPipeBacklog.invalidate();
+      }
+      throw e;
+    }
+  }
+
+  private Event supplyInternal() {
     if (!hasBeenStarted && StorageEngine.getInstance().isReadyForNonReadWriteFunctions()) {
       start();
     }
@@ -1208,6 +1281,9 @@ public class PipeHistoricalDataRegionTsFileAndDeletionSource
       return false;
     }
 
+    if (isPendingReplicationResource(resource)) {
+      consensusPipeBacklog.discardPending(ConsensusPipeBacklog.Kind.FILE, 1);
+    }
     filteredTsFileResources2TableNames.remove(resource);
     PipeTerminateEvent.markHistoricalTsFileSkipped(pipeName, creationTime, dataRegionId);
     LOGGER.info(
@@ -1313,6 +1389,10 @@ public class PipeHistoricalDataRegionTsFileAndDeletionSource
         event.skipParsingTime();
       }
 
+      if (isPendingReplicationResource(resource)) {
+        event.bindReplicationEventToken(
+            consensusPipeBacklog.takePendingToken(ConsensusPipeBacklog.Kind.FILE));
+      }
       final boolean isReferenceCountIncreased =
           event.increaseReferenceCount(
               PipeHistoricalDataRegionTsFileAndDeletionSource.class.getName());
@@ -1400,6 +1480,10 @@ public class PipeHistoricalDataRegionTsFileAndDeletionSource
       event.skipParsingTime();
     }
 
+    if (isPendingReplicationResource(deletionResource)) {
+      event.bindReplicationEventToken(
+          consensusPipeBacklog.takePendingToken(ConsensusPipeBacklog.Kind.DELETION));
+    }
     final boolean isReferenceCountIncreased =
         event.increaseReferenceCount(
             PipeHistoricalDataRegionTsFileAndDeletionSource.class.getName());
@@ -1450,6 +1534,9 @@ public class PipeHistoricalDataRegionTsFileAndDeletionSource
 
   @Override
   public synchronized void close() {
+    if (consensusPipeBacklog != null) {
+      consensusPipeBacklog.close();
+    }
     if (!isTerminateSignalSent) {
       PipeTerminateEvent.clearHistoricalTransferSummary(pipeName, creationTime, dataRegionId);
     }

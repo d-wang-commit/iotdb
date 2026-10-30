@@ -284,6 +284,17 @@ public class HeartbeatService {
               configManager.getClusterSchemaManager()::updateTimeSeriesUsage,
               configManager.getClusterSchemaManager()::updateDeviceUsage,
               configManager.getPipeManager().getPipeRuntimeCoordinator());
+      boolean needBacklog =
+          configManager
+              .getLoadManager()
+              .getReplicationBacklogService()
+              .shouldSample(dataNodeId, heartbeatReq.getHeartbeatTimestamp());
+      heartbeatReq.setNeedReplicationBacklog(needBacklog);
+      if (needBacklog) {
+        handler.setReplicationBacklogRequest(
+            heartbeatReq.getHeartbeatTimestamp(),
+            configManager.getLoadManager().getReplicationBacklogService().getEpoch());
+      }
       configManager.getClusterQuotaManager().updateSpaceQuotaUsage();
       addConfigNodeLocationsToReq(dataNodeId, heartbeatReq);
       if (contactTracker.hasDeliveredCurrentFenceThreshold(dataNodeId)) {
@@ -293,7 +304,7 @@ public class HeartbeatService {
       }
       AsyncDataNodeHeartbeatClientPool.getInstance()
           .getDataNodeHeartBeat(
-              dataNodeInfo.getLocation().getInternalEndPoint(), heartbeatReq, handler);
+              dataNodeInfo.getLocation().getInternalEndPoint(), heartbeatReq.deepCopy(), handler);
     }
   }
 

@@ -30,6 +30,7 @@ import org.apache.iotdb.consensus.common.Peer;
 import org.apache.iotdb.consensus.common.request.IndexedConsensusRequest;
 import org.apache.iotdb.consensus.config.IoTConsensusConfig;
 import org.apache.iotdb.consensus.i18n.IoTConsensusMessages;
+import org.apache.iotdb.consensus.iot.IoTConsensusReplicationSnapshot;
 import org.apache.iotdb.consensus.iot.IoTConsensusServerImpl;
 import org.apache.iotdb.consensus.iot.client.AsyncIoTConsensusServiceClient;
 import org.apache.iotdb.consensus.iot.client.DispatchLogHandler;
@@ -42,9 +43,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.OptionalLong;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -68,6 +72,10 @@ public class LogDispatcher {
 
   private final ConsensusReqReader reader;
   private boolean stopped = false;
+  private static final AtomicLong BACKLOG_GENERATIONS = new AtomicLong();
+  // Published only when membership/lifecycle changes. Reading telemetry must not wait for stop().
+  private volatile BacklogView backlogView;
+  private boolean started;
 
   private final AtomicLong logEntriesFromWAL = new AtomicLong(0);
   private final AtomicLong logEntriesFromQueue = new AtomicLong(0);
@@ -90,6 +98,7 @@ public class LogDispatcher {
     if (!threads.isEmpty()) {
       initLogSyncThreadPool();
     }
+    publishBacklogView();
   }
 
   private void initLogSyncThreadPool() {
@@ -106,9 +115,13 @@ public class LogDispatcher {
     if (!threads.isEmpty()) {
       threads.forEach(logDispatcherThread -> executorService.submit(logDispatcherThread));
     }
+    started = true;
+    publishBacklogView();
   }
 
   public synchronized void stop() {
+    started = false;
+    publishBacklogView();
     if (!threads.isEmpty()) {
       threads.forEach(LogDispatcherThread::setStopped);
       executorService.shutdownNow();
@@ -133,6 +146,7 @@ public class LogDispatcher {
     }
     LogDispatcherThread thread = new LogDispatcherThread(peer, impl.getConfig(), initialSyncIndex);
     threads.add(thread);
+    publishBacklogView();
     // If the initial replica is 1, the executorService won't be initialized. And when adding
     // dispatcher thread, the executorService should be initialized manually
     if (this.executorService == null) {
@@ -160,6 +174,38 @@ public class LogDispatcher {
     threads.get(threadIndex).stop();
     threads.get(threadIndex).cleanup();
     threads.remove(threadIndex);
+    publishBacklogView();
+  }
+
+  private void publishBacklogView() {
+    backlogView =
+        new BacklogView(BACKLOG_GENERATIONS.incrementAndGet(), started, new ArrayList<>(threads));
+  }
+
+  /** Caller holds the source index monitor, so an ACK cannot exceed the sampled source head. */
+  public IoTConsensusReplicationSnapshot getReplicationBacklogSnapshot(long head, boolean active) {
+    final BacklogView view = backlogView;
+    final Map<Integer, Long> pending = new HashMap<>();
+    boolean valid = view.started && active && head >= 0;
+    for (LogDispatcherThread thread : view.threads) {
+      final long acknowledged = thread.getCurrentSyncIndex();
+      valid &= acknowledged >= 0 && acknowledged <= head;
+      pending.put(thread.getPeer().getNodeId(), Math.max(0, head - acknowledged));
+    }
+    return new IoTConsensusReplicationSnapshot(
+        view.generation, valid && view == backlogView, pending);
+  }
+
+  private static final class BacklogView {
+    private final long generation;
+    private final boolean started;
+    private final List<LogDispatcherThread> threads;
+
+    private BacklogView(long generation, boolean started, List<LogDispatcherThread> threads) {
+      this.generation = generation;
+      this.started = started;
+      this.threads = threads;
+    }
   }
 
   public synchronized OptionalLong getMinSyncIndex() {

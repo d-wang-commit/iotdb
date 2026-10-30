@@ -66,6 +66,7 @@ import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
@@ -82,6 +83,8 @@ public class IoTConsensusV2ServerImpl {
   private final IoTConsensusV2PeerManager peerManager;
   private final AtomicBoolean active;
   private final AtomicBoolean isStarted;
+  private static final AtomicLong BACKLOG_GENERATIONS = new AtomicLong();
+  private final long backlogGeneration = BACKLOG_GENERATIONS.incrementAndGet();
   private final String consensusGroupId;
   private final ReplicateProgressManager replicateProgressManager;
   private final IClientManager<TEndPoint, SyncIoTConsensusV2ServiceClient> syncClientManager;
@@ -466,6 +469,14 @@ public class IoTConsensusV2ServerImpl {
 
   public boolean isActive() {
     return active.get();
+  }
+
+  public boolean isReplicationBacklogReady() {
+    return active.get() && isStarted.get();
+  }
+
+  public long getReplicationBacklogGeneration() {
+    return backlogGeneration;
   }
 
   public void setActive(boolean active) {

@@ -51,6 +51,15 @@ public class TsFileEpochManager {
 
   private final ConcurrentMap<String, TsFileEpoch> filePath2Epoch = new ConcurrentHashMap<>();
 
+  public TsFileEpoch getOrCreateEpoch(final TsFileResource resource) {
+    return filePath2Epoch.computeIfAbsent(
+        resource.getTsFilePath(), key -> new TsFileEpoch(resource));
+  }
+
+  public void retireEpoch(final TsFileResource resource) {
+    filePath2Epoch.remove(resource.getTsFilePath());
+  }
+
   public PipeRealtimeEvent bindPipeTsFileInsertionEvent(
       PipeTsFileInsertionEvent event, TsFileResource resource) {
     final String filePath = resource.getTsFilePath();
@@ -75,8 +84,7 @@ public class TsFileEpochManager {
 
   public PipeRealtimeEvent bindPipeInsertNodeTabletInsertionEvent(
       PipeInsertNodeTabletInsertionEvent event, InsertNode node, TsFileResource resource) {
-    final TsFileEpoch epoch =
-        filePath2Epoch.computeIfAbsent(resource.getTsFilePath(), k -> new TsFileEpoch(resource));
+    final TsFileEpoch epoch = getOrCreateEpoch(resource);
     epoch.updateInsertNodeMinTime(node.getMinTime());
     return new PipeRealtimeEvent(
         event,

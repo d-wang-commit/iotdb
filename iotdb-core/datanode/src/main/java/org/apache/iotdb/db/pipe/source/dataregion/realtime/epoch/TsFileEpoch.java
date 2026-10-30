@@ -19,10 +19,13 @@
 
 package org.apache.iotdb.db.pipe.source.dataregion.realtime.epoch;
 
+import org.apache.iotdb.db.pipe.consensus.metric.ConsensusPipeBacklog;
 import org.apache.iotdb.db.pipe.metric.source.PipeDataRegionSourceMetrics;
 import org.apache.iotdb.db.pipe.source.dataregion.realtime.PipeRealtimeDataRegionSource;
 import org.apache.iotdb.db.storageengine.dataregion.tsfile.TsFileResource;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -35,6 +38,11 @@ public class TsFileEpoch {
   private final ConcurrentMap<PipeRealtimeDataRegionSource, AtomicReference<State>>
       dataRegionExtractor2State;
   private final AtomicLong insertNodeMinTime;
+  // The slots have the same lifetime and fan-out as the existing per-source epoch state.
+  // A transferred slot remains here until this epoch is reclaimed: a later state transition
+  // must not count the sealed file a second time.
+  private Map<Long, ReplicationFileSlot> replicationFiles;
+  private boolean containsLocalReplicationData;
 
   public TsFileEpoch(final TsFileResource resource) {
     this.resource = resource;
@@ -70,6 +78,47 @@ public class TsFileEpoch {
     if (!Objects.equals(stateRef.get(), migratedState)) {
       stateRef.set(migratedState);
       setExtractorsRecentProcessedTsFileEpochState();
+    }
+    if (migratedState == State.USING_TSFILE || migratedState == State.USING_BOTH) {
+      reserveReplicationFile(extractor);
+    }
+  }
+
+  public synchronized void markLocalReplicationData() {
+    containsLocalReplicationData = true;
+  }
+
+  public synchronized void reserveReplicationFile(final PipeRealtimeDataRegionSource source) {
+    if (containsLocalReplicationData && source.getConsensusPipeBacklog() != null) {
+      if (replicationFiles == null) {
+        replicationFiles = new HashMap<>();
+      }
+      replicationFiles.values().removeIf(slot -> slot.token.isOwnerClosed());
+      replicationFiles.computeIfAbsent(
+          source.getSourceId(),
+          ignored ->
+              new ReplicationFileSlot(
+                  source.getConsensusPipeBacklog().newToken(ConsensusPipeBacklog.Kind.FILE)));
+    }
+  }
+
+  public synchronized ConsensusPipeBacklog.Token takeReplicationFile(
+      final PipeRealtimeDataRegionSource source) {
+    final ReplicationFileSlot slot =
+        replicationFiles == null ? null : replicationFiles.get(source.getSourceId());
+    if (slot == null || slot.transferred) {
+      return null;
+    }
+    slot.transferred = true;
+    return slot.token;
+  }
+
+  private static final class ReplicationFileSlot {
+    private final ConsensusPipeBacklog.Token token;
+    private boolean transferred;
+
+    private ReplicationFileSlot(final ConsensusPipeBacklog.Token token) {
+      this.token = token;
     }
   }
 

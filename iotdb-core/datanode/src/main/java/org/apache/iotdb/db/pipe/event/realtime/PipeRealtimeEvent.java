@@ -24,11 +24,15 @@ import org.apache.iotdb.commons.pipe.agent.task.meta.PipeTaskMeta;
 import org.apache.iotdb.commons.pipe.datastructure.pattern.TablePattern;
 import org.apache.iotdb.commons.pipe.datastructure.pattern.TreePattern;
 import org.apache.iotdb.commons.pipe.event.EnrichedEvent;
+import org.apache.iotdb.commons.pipe.event.PipeReplicationEventToken;
+import org.apache.iotdb.db.pipe.consensus.metric.ConsensusPipeBacklog.Token;
 import org.apache.iotdb.db.pipe.source.dataregion.realtime.PipeRealtimeDataRegionSource;
 import org.apache.iotdb.db.pipe.source.dataregion.realtime.epoch.TsFileEpoch;
 
 import org.apache.tsfile.file.metadata.IDeviceID;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -42,6 +46,9 @@ public class PipeRealtimeEvent extends EnrichedEvent {
   private final TsFileEpoch tsFileEpoch;
 
   private Map<IDeviceID, String[]> device2Measurements;
+
+  // Only the raw assigner event owns these slots; each bound copy receives one token.
+  private List<ReplicationTokenSlot> replicationTokenSlots;
 
   public PipeRealtimeEvent(
       final EnrichedEvent event,
@@ -110,6 +117,67 @@ public class PipeRealtimeEvent extends EnrichedEvent {
 
   public void gcSchemaInfo() {
     device2Measurements = null;
+  }
+
+  public synchronized void addReplicationEventToken(final long sourceId, final Token token) {
+    if (token == null) {
+      return;
+    }
+    if (replicationTokenSlots == null) {
+      replicationTokenSlots = new ArrayList<>(2);
+    }
+    replicationTokenSlots.add(new ReplicationTokenSlot(sourceId, token));
+  }
+
+  public synchronized Token takeReplicationEventToken(final long sourceId) {
+    if (replicationTokenSlots != null) {
+      for (final ReplicationTokenSlot slot : replicationTokenSlots) {
+        if (slot.sourceId == sourceId && slot.token != null) {
+          final Token token = slot.token;
+          slot.token = null;
+          return token;
+        }
+      }
+    }
+    return null;
+  }
+
+  /** Finishes unmatched directions after assignment without retaining the raw event. */
+  public synchronized void releaseUnassignedReplicationEventTokens() {
+    if (replicationTokenSlots != null) {
+      for (final ReplicationTokenSlot slot : replicationTokenSlots) {
+        if (slot.token != null) {
+          slot.token.finish();
+        }
+      }
+      replicationTokenSlots = null;
+    }
+  }
+
+  public synchronized void invalidateUnassignedReplicationEventTokens() {
+    if (replicationTokenSlots != null) {
+      for (final ReplicationTokenSlot slot : replicationTokenSlots) {
+        if (slot.token != null) {
+          slot.token.invalidate();
+        }
+      }
+    }
+  }
+
+  @Override
+  public void bindReplicationEventToken(final PipeReplicationEventToken token) {
+    event.bindReplicationEventToken(token);
+  }
+
+  private static class ReplicationTokenSlot {
+
+    private final long sourceId;
+    private Token token;
+
+    private ReplicationTokenSlot(final long sourceId, final Token token) {
+      this.sourceId = sourceId;
+      this.token = token;
+    }
   }
 
   public boolean maySourceOnlyUseTablets(final PipeRealtimeDataRegionSource extractor) {

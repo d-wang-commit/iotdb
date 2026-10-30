@@ -87,6 +87,9 @@ public abstract class EnrichedEvent implements Event {
   protected String cliHostname;
   protected boolean skipIfNoPrivileges;
 
+  // Not copied by shallow-copy operations: the caller must explicitly transfer ownership.
+  private PipeReplicationEventToken replicationEventToken;
+
   protected EnrichedEvent(
       final String pipeName,
       final long creationTime,
@@ -157,6 +160,7 @@ public abstract class EnrichedEvent implements Event {
         trackResource();
       }
     } else {
+      finishReplicationEventToken(true);
       LOGGER.warn(
           PipeMessages
               .LOG_INCREASE_REFERENCE_COUNT_FAILED_ENRICHEDEVENT_ARG_STACK_TRACE_ARG_94C472FC,
@@ -209,13 +213,15 @@ public abstract class EnrichedEvent implements Event {
         shouldReportOnCommit = false;
       }
       // We assume that this function will not throw any exceptions.
-      if (!internallyDecreaseResourceReferenceCount(holderMessage)) {
+      final boolean resourceReleased = internallyDecreaseResourceReferenceCount(holderMessage);
+      if (!resourceReleased) {
         LOGGER.warn(
             PipeMessages
                 .LOG_RESOURCE_REFERENCE_COUNT_DECREASED_0_BUT_FAILED_RELEASE_RESOURCE_ENRICHEDEVENT_A02A86AF,
             coreReportMessage(),
             Thread.currentThread().getStackTrace());
       }
+      finishReplicationEventToken(!resourceReleased);
       PipeEventCommitManager.getInstance().commit(this, committerKey);
     }
 
@@ -225,6 +231,7 @@ public abstract class EnrichedEvent implements Event {
       isReleased.set(true);
       isSuccessful = newReferenceCount == 0;
       if (newReferenceCount < 0) {
+        finishReplicationEventToken(true);
         LOGGER.warn(
             PipeMessages.LOG_REFERENCE_COUNT_DECREASED_ARG_EVENT_ARG_STACK_TRACE_ARG_A4BF56FC,
             newReferenceCount,
@@ -273,7 +280,41 @@ public abstract class EnrichedEvent implements Event {
 
     referenceCount.set(0);
     isReleased.set(true);
+    finishReplicationEventToken(true);
     return true;
+  }
+
+  /** Binds already-counted work without changing the event's resource reference count. */
+  public synchronized void bindReplicationEventToken(final PipeReplicationEventToken token) {
+    if (token == null || token == replicationEventToken) {
+      return;
+    }
+    if (isReleased.get() || replicationEventToken != null) {
+      token.invalidate();
+      token.finish();
+      if (replicationEventToken != null) {
+        replicationEventToken.invalidate();
+      }
+      return;
+    }
+    replicationEventToken = token;
+  }
+
+  private void finishReplicationEventToken(final boolean invalid) {
+    if (replicationEventToken != null) {
+      if (invalid) {
+        replicationEventToken.invalidate();
+      }
+      replicationEventToken.finish();
+      replicationEventToken = null;
+    }
+  }
+
+  /** Marks accounting uncertain without changing replication or resource ownership. */
+  public synchronized void invalidateReplicationEventToken() {
+    if (replicationEventToken != null) {
+      replicationEventToken.invalidate();
+    }
   }
 
   /**

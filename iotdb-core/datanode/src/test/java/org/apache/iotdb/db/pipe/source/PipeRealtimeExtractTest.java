@@ -40,6 +40,7 @@ import org.apache.iotdb.commons.queryengine.plan.planner.plan.node.PlanNodeId;
 import org.apache.iotdb.commons.utils.FileUtils;
 import org.apache.iotdb.db.conf.IoTDBDescriptor;
 import org.apache.iotdb.db.pipe.agent.PipeDataNodeAgent;
+import org.apache.iotdb.db.pipe.consensus.metric.ConsensusPipeBacklog;
 import org.apache.iotdb.db.pipe.event.common.tablet.PipeRawTabletInsertionEvent;
 import org.apache.iotdb.db.pipe.event.common.tsfile.PipeTsFileInsertionEvent;
 import org.apache.iotdb.db.pipe.event.realtime.PipeRealtimeEvent;
@@ -79,6 +80,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -341,6 +343,118 @@ public class PipeRealtimeExtractTest {
 
       Assert.assertEquals(0, extractor.getObservedTsFileEventCount());
     }
+  }
+
+  @Test
+  public void testConsensusBacklogFollowsActualHybridTabletDropAndFileCompletion()
+      throws Exception {
+    verifyConsensusBacklogThroughHybrid(false);
+  }
+
+  @Test
+  public void testConsensusBacklogRetainsQueuedTabletAlongsideItsFallbackFile() throws Exception {
+    verifyConsensusBacklogThroughHybrid(true);
+  }
+
+  private void verifyConsensusBacklogThroughHybrid(final boolean retainEarlierTablet)
+      throws Exception {
+    registerTestPipeMeta();
+    try (final PipeRealtimeDataRegionHybridSource extractor =
+        new PipeRealtimeDataRegionHybridSource()) {
+      final Map<String, String> attributes = new HashMap<>();
+      attributes.put(PipeSourceConstant.EXTRACTOR_PATTERN_KEY, pattern1);
+      attributes.put(
+          PipeSourceConstant.SOURCE_REALTIME_REGION_LEVEL_DOWNGRADING_KEY,
+          Boolean.FALSE.toString());
+      final PipeParameters parameters = new PipeParameters(attributes);
+      final PipeTaskMeta pipeTaskMeta = new PipeTaskMeta(MinimumProgressIndex.INSTANCE, 1);
+      extractor.validate(new PipeParameterValidator(parameters));
+      extractor.customize(
+          parameters,
+          new PipeTaskRuntimeConfiguration(
+              new PipeTaskSourceRuntimeEnvironment(
+                  TEST_PIPE_NAME, TEST_PIPE_CREATION_TIME, dataRegion1, pipeTaskMeta)));
+      final ConsensusPipeBacklog backlog =
+          ConsensusPipeBacklog.create(
+              TEST_PIPE_NAME, TEST_PIPE_CREATION_TIME, extractor.getSourceId());
+      extractor.setConsensusPipeBacklog(backlog);
+      backlog.markHistoricalReady();
+      backlog.markRealtimeReady();
+      final TsFileResource resource =
+          createTsFileResource(
+              dataRegion1, retainEarlierTablet ? "131-131-0-0.tsfile" : "130-130-0-0.tsfile");
+
+      PipeRealtimeEvent retainedTablet = null;
+      if (retainEarlierTablet) {
+        retainedTablet =
+            createCountedConsensusTablet(extractor, pipeTaskMeta, resource, "retained-tablet");
+        Assert.assertTrue(retainedTablet.increaseReferenceCount(TEST_REFERENCE_HOLDER));
+        extractor.extract(retainedTablet);
+        Assert.assertEquals(1, backlog.snapshot().getTabletCount());
+        Assert.assertEquals(0, backlog.snapshot().getFileCount());
+      }
+      final PipeRealtimeEvent discardedTablet =
+          createCountedConsensusTablet(extractor, pipeTaskMeta, resource, "discarded-tablet");
+      Assert.assertTrue(discardedTablet.increaseReferenceCount(TEST_REFERENCE_HOLDER));
+      CommonDescriptor.getInstance().getConfig().setPipeTotalFloatingMemoryProportion(0);
+      try {
+        extractor.extract(discardedTablet);
+      } finally {
+        CommonDescriptor.getInstance()
+            .getConfig()
+            .setPipeTotalFloatingMemoryProportion(pipeTotalFloatingMemoryProportion);
+      }
+      Assert.assertTrue(discardedTablet.getEvent().isReleased());
+      Assert.assertEquals(retainEarlierTablet ? 1 : 0, backlog.snapshot().getTabletCount());
+      Assert.assertEquals(1, backlog.snapshot().getFileCount());
+      Assert.assertEquals(ConsensusPipeBacklog.VALID, backlog.snapshot().getState());
+
+      final PipeRealtimeEvent file =
+          bindToTestPipe(
+              PipeRealtimeEventFactory.createRealtimeEvent(false, DATABASE, resource, false),
+              extractor,
+              pipeTaskMeta);
+      Assert.assertTrue(file.increaseReferenceCount(TEST_REFERENCE_HOLDER));
+      extractor.extract(file);
+      Assert.assertEquals(1, backlog.snapshot().getFileCount());
+      if (retainEarlierTablet) {
+        final Event suppliedTablet = extractor.supply();
+        Assert.assertSame(retainedTablet.getEvent(), suppliedTablet);
+        Assert.assertEquals(1, backlog.snapshot().getTabletCount());
+        Assert.assertEquals(1, backlog.snapshot().getFileCount());
+        Assert.assertTrue(
+            ((EnrichedEvent) suppliedTablet).decreaseReferenceCount(TEST_REFERENCE_HOLDER, false));
+        Assert.assertEquals(0, backlog.snapshot().getTabletCount());
+        Assert.assertEquals(1, backlog.snapshot().getFileCount());
+      }
+      final Event suppliedFile = extractor.supply();
+      Assert.assertSame(file.getEvent(), suppliedFile);
+      Assert.assertEquals(1, backlog.snapshot().getFileCount());
+      Assert.assertTrue(
+          ((EnrichedEvent) suppliedFile).decreaseReferenceCount(TEST_REFERENCE_HOLDER, false));
+      Assert.assertEquals(0, backlog.snapshot().getFileCount());
+      Assert.assertEquals(ConsensusPipeBacklog.VALID, backlog.snapshot().getState());
+      Assert.assertNull(extractor.supply());
+    }
+  }
+
+  private PipeRealtimeEvent createCountedConsensusTablet(
+      final PipeRealtimeDataRegionHybridSource extractor,
+      final PipeTaskMeta pipeTaskMeta,
+      final TsFileResource resource,
+      final String planNodeId)
+      throws Exception {
+    final PipeRealtimeEvent event =
+        bindToTestPipe(
+            PipeRealtimeEventFactory.createRealtimeEvent(
+                false, DATABASE, createInsertRowNode(planNodeId, "a"), resource),
+            extractor,
+            pipeTaskMeta);
+    // Isolate the source lifecycle: the assigner normally supplies this token before extraction.
+    event.getTsFileEpoch().markLocalReplicationData();
+    event.bindReplicationEventToken(
+        extractor.getConsensusPipeBacklog().newToken(ConsensusPipeBacklog.Kind.TABLET));
+    return event;
   }
 
   @Test

@@ -42,7 +42,10 @@ import org.apache.iotdb.confignode.manager.load.balancer.router.leader.HashLeade
 import org.apache.iotdb.confignode.manager.load.balancer.router.priority.GreedyPriorityBalancer;
 import org.apache.iotdb.confignode.manager.load.balancer.router.priority.IPriorityBalancer;
 import org.apache.iotdb.confignode.manager.load.balancer.router.priority.LeaderPriorityBalancer;
+import org.apache.iotdb.confignode.manager.load.cache.ReplicationBacklogCache.SelectionSnapshot;
 import org.apache.iotdb.confignode.manager.load.cache.consensus.ConsensusGroupHeartbeatSample;
+import org.apache.iotdb.confignode.manager.load.cache.node.NodeStatistics;
+import org.apache.iotdb.confignode.manager.load.cache.region.RegionStatistics;
 import org.apache.iotdb.confignode.manager.load.subscriber.ConsensusGroupStatisticsChangeEvent;
 import org.apache.iotdb.confignode.manager.load.subscriber.IClusterStatusSubscriber;
 import org.apache.iotdb.confignode.manager.load.subscriber.NodeStatisticsChangeEvent;
@@ -338,20 +341,49 @@ public class RouteBalancer implements IClusterStatusSubscriber {
     // Collect the latest data and generate the optimal leader distribution
     Map<TConsensusGroupId, Integer> currentLeaderMap =
         getLoadManager().getLoadCache().getRegionLeaderMap(leaderBalanceContext.regionGroupType);
-    Map<TConsensusGroupId, Integer> optimalLeaderMap =
-        leaderBalanceContext.leaderBalancer.generateOptimalLeaderDistribution(
-            getLoadManager()
-                .getLoadCache()
-                .getCurrentDatabaseRegionGroupMap(leaderBalanceContext.regionGroupType),
-            getLoadManager()
-                .getLoadCache()
-                .getCurrentRegionLocationMap(leaderBalanceContext.regionGroupType),
-            currentLeaderMap,
-            getLoadManager().getLoadCache().getCurrentDataNodeStatisticsMap(),
-            getLoadManager()
-                .getLoadCache()
-                .getCurrentRegionStatisticsMap(leaderBalanceContext.regionGroupType));
-
+    Map<String, List<TConsensusGroupId>> databaseGroups =
+        getLoadManager()
+            .getLoadCache()
+            .getCurrentDatabaseRegionGroupMap(leaderBalanceContext.regionGroupType);
+    Map<TConsensusGroupId, Set<Integer>> locations =
+        getLoadManager()
+            .getLoadCache()
+            .getCurrentRegionLocationMap(leaderBalanceContext.regionGroupType);
+    Map<Integer, NodeStatistics> nodes =
+        getLoadManager().getLoadCache().getCurrentDataNodeStatisticsMap();
+    Map<TConsensusGroupId, Map<Integer, RegionStatistics>> regions =
+        getLoadManager()
+            .getLoadCache()
+            .getCurrentRegionStatisticsMap(leaderBalanceContext.regionGroupType);
+    Map<TConsensusGroupId, Integer> optimalLeaderMap;
+    SelectionSnapshot backlogSelection = null;
+    if (leaderBalanceContext.regionGroupType == TConsensusGroupType.DataRegion
+        && leaderBalanceContext.leaderBalancer instanceof CostFlowSelectionLeaderBalancer
+        && (ConsensusFactory.IOT_CONSENSUS.equals(leaderBalanceContext.consensusProtocolClass)
+            || ConsensusFactory.IOT_CONSENSUS_V2.equals(
+                leaderBalanceContext.consensusProtocolClass))) {
+      backlogSelection =
+          getLoadManager()
+              .getReplicationBacklogService()
+              .captureSelection(locations, nodes, regions);
+      optimalLeaderMap =
+          ((CostFlowSelectionLeaderBalancer) leaderBalanceContext.leaderBalancer)
+              .generateOptimalLeaderDistribution(
+                  databaseGroups,
+                  locations,
+                  currentLeaderMap,
+                  nodes,
+                  regions,
+                  backlogSelection.getCandidates());
+    } else {
+      optimalLeaderMap =
+          leaderBalanceContext.leaderBalancer.generateOptimalLeaderDistribution(
+              databaseGroups, locations, currentLeaderMap, nodes, regions);
+    }
+    if (backlogSelection != null
+        && !getLoadManager().getReplicationBacklogService().validateSelection(backlogSelection)) {
+      return DataRegionLeaderBalanceResult.empty();
+    }
     LeaderTransferContext leaderTransferContext = new LeaderTransferContext(System.nanoTime());
     optimalLeaderMap.forEach(
         (regionGroupId, newLeaderId) ->
@@ -789,5 +821,17 @@ public class RouteBalancer implements IClusterStatusSubscriber {
             event.getDifferentConsensusGroupStatisticsMap().keySet());
     balanceRegionPriority();
     handleBalanceAction(leaderBalanceResult);
+  }
+
+  /** Backlog changes affect only IoTConsensus DataRegions and never change the cost function. */
+  public void balanceDataRegionLeadersForReplicationBacklog() {
+    if (!(dataRegionLeaderBalanceContext.leaderBalancer instanceof CostFlowSelectionLeaderBalancer)
+        || !(ConsensusFactory.IOT_CONSENSUS.equals(DATA_REGION_CONSENSUS_PROTOCOL_CLASS)
+            || ConsensusFactory.IOT_CONSENSUS_V2.equals(DATA_REGION_CONSENSUS_PROTOCOL_CLASS))) {
+      return;
+    }
+    DataRegionLeaderBalanceResult result = balanceSelectedRegionLeaders(false, true);
+    balanceRegionPriority();
+    handleBalanceAction(result);
   }
 }

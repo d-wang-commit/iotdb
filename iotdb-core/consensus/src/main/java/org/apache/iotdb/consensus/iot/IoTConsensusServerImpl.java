@@ -1347,6 +1347,13 @@ public class IoTConsensusServerImpl {
     return getSearchIndex() - minSyncIndex;
   }
 
+  public IoTConsensusReplicationSnapshot getReplicationBacklogSnapshot() {
+    // Match write/offer ordering without acquiring the dispatcher's lifecycle monitor.
+    synchronized (searchIndex) {
+      return logDispatcher.getReplicationBacklogSnapshot(searchIndex.get(), active);
+    }
+  }
+
   public IoTConsensusConfig getConfig() {
     return config;
   }

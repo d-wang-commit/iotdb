@@ -52,6 +52,9 @@ public class DataNodeHeartbeatHandler implements AsyncMethodCallback<TDataNodeHe
   private final int nodeId;
 
   private final LoadManager loadManager;
+  private long backlogRequestTime;
+  private long backlogEpoch;
+  private boolean backlogRequested;
 
   private final Map<Integer, Long> deviceNum;
   private final Map<Integer, Long> timeSeriesNum;
@@ -90,6 +93,15 @@ public class DataNodeHeartbeatHandler implements AsyncMethodCallback<TDataNodeHe
     cachePipeHeartbeat(heartbeatResp);
     cacheConfirmedConfigNodeEndPoints(heartbeatResp);
     cacheRegionSizeSamples(heartbeatResp);
+    if (backlogRequested && heartbeatResp.isSetReplicationBacklogReport()) {
+      loadManager
+          .getReplicationBacklogService()
+          .cacheReport(
+              nodeId,
+              heartbeatResp.getReplicationBacklogReport(),
+              backlogRequestTime,
+              backlogEpoch);
+    }
   }
 
   private void cacheNodeHeartbeatSample(TDataNodeHeartbeatResp heartbeatResp) {
@@ -223,5 +235,11 @@ public class DataNodeHeartbeatHandler implements AsyncMethodCallback<TDataNodeHe
       loadManager.trySetNodeStatus(nodeId, NodeStatus.Unknown, false);
     }
     loadManager.getLoadCache().resetHeartbeatProcessing(nodeId);
+  }
+
+  public void setReplicationBacklogRequest(long requestTime, long epoch) {
+    backlogRequestTime = requestTime;
+    backlogEpoch = epoch;
+    backlogRequested = true;
   }
 }

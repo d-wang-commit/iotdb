@@ -162,6 +162,8 @@ public class ConfigNodeDescriptor {
   private void loadProperties(TrimProperties properties) throws BadNodeUrlException, IOException {
     ConfigurationFileUtils.updateAppliedProperties(properties, false);
     memoryConfig.init(properties);
+    conf.setReplicationBacklogConfig(
+        ReplicationBacklogConfig.load(properties, conf.getReplicationBacklogConfig()));
 
     conf.setClusterName(properties.getProperty(IoTDBConstant.CLUSTER_NAME, conf.getClusterName()));
 
@@ -927,6 +929,8 @@ public class ConfigNodeDescriptor {
   }
 
   public void loadHotModifiedProps(TrimProperties properties) throws IOException {
+    ReplicationBacklogConfig backlogConfig =
+        ReplicationBacklogConfig.load(properties, conf.getReplicationBacklogConfig());
     Optional.ofNullable(properties.getProperty(IoTDBConstant.CLUSTER_NAME))
         .ifPresent(conf::setClusterName);
     long heartbeatIntervalInMs = loadHotReloadHeartbeatIntervalInMs(properties);
@@ -944,6 +948,7 @@ public class ConfigNodeDescriptor {
     commonDescriptor.loadHotModifiedDiskSpaceWarningThreshold(properties);
     loadHotModifiedProcedureConfig(properties);
     loadPipeHotModifiedProp(properties);
+    conf.setReplicationBacklogConfig(backlogConfig);
     ConfigurationFileUtils.updateAppliedProperties(properties, true);
   }
 

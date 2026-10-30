@@ -20,6 +20,8 @@
 package org.apache.iotdb.confignode.i18n;
 
 public final class ConfigNodeMessages {
+  public static final String LOG_REPLICATIONBACKLOG_REGION_ARG_REPLICA_ARG_KNOWN_ARG_AVAILABLE_ARG_PROPOSEDEXCLUDED_ARG_RAW_REQUEST_TABLET_FILE_DELETION_ARG_EWMA_ARG_MODE_ARG_819B0890 =
+      "[ReplicationBacklog] Region {}, replica {}, known={}, available={}, proposedExcluded={}, raw [request,tablet,file,deletion]={}, EWMA={}, mode={}.";
   public static final String EXCEPTION_CONFIGNODE_SIMPLECONSENSUS_WRITES_ARE_DISABLED_AFTER_A_WAL_CLEANUP_FAILURE_RESTART_IS_REQUIRED_D52F0107 =
       "ConfigNode SimpleConsensus writes are disabled after a WAL cleanup failure; restart is required.";
   public static final String EXCEPTION_FAILED_TO_CLOSE_THE_CONFIGNODE_SIMPLECONSENSUS_LOG_WRITER_BC0F417C =
@@ -745,4 +747,5 @@ public final class ConfigNodeMessages {
   public static final String
       LOG_FAILED_TO_TRANSFER_CONFIGNODE_LEADERSHIP_BEFORE_SHUTDOWN_CONTINUING_SHUTDOWN_2B9364D5 =
           "Failed to transfer ConfigNode leadership before shutdown; continuing shutdown.";
+  public static final String EXCEPTION_INVALID_REPLICATION_BACKLOG_CONFIGURATION_ARG_283A8D2F = "Invalid replication backlog configuration: %s.";
 }

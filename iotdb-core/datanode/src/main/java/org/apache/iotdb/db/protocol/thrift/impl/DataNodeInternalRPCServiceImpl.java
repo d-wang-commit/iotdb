@@ -112,6 +112,7 @@ import org.apache.iotdb.db.auth.AuthorityChecker;
 import org.apache.iotdb.db.auth.LoginLockManager;
 import org.apache.iotdb.db.conf.IoTDBDescriptor;
 import org.apache.iotdb.db.consensus.DataRegionConsensusImpl;
+import org.apache.iotdb.db.consensus.ReplicationBacklogCollector;
 import org.apache.iotdb.db.consensus.SchemaRegionConsensusImpl;
 import org.apache.iotdb.db.exception.StorageEngineException;
 import org.apache.iotdb.db.i18n.DataNodeMiscMessages;
@@ -2502,6 +2503,11 @@ public class DataNodeInternalRPCServiceImpl implements IDataNodeRPCService.Iface
     // Update pipe meta if necessary
     if (req.isNeedPipeMetaList()) {
       PipeDataNodeAgent.task().collectPipeMetaList(resp);
+    }
+
+    if (req.isSetNeedReplicationBacklog() && req.isNeedReplicationBacklog()) {
+      resp.setReplicationBacklogReport(
+          ReplicationBacklogCollector.getInstance().collect(DataRegionConsensusImpl.getInstance()));
     }
 
     if (req.isSetConfigNodeEndPoints()) {

@@ -335,29 +335,36 @@ public class IoTConsensusV2AsyncSink extends IoTDBSink implements ConsensusPipeS
       return false;
     }
 
-    TCommitId tCommitId;
-    TConsensusGroupId tConsensusGroupId =
-        new TConsensusGroupId(TConsensusGroupType.DataRegion, consensusGroupId);
-    tCommitId =
-        new TCommitId(
-            pipeInsertNodeTabletInsertionEvent.getReplicateIndexForIoTV2(),
-            pipeInsertNodeTabletInsertionEvent.getCommitterKey().getRestartTimes(),
-            pipeInsertNodeTabletInsertionEvent.getRebootTimes());
+    try {
+      TCommitId tCommitId;
+      TConsensusGroupId tConsensusGroupId =
+          new TConsensusGroupId(TConsensusGroupType.DataRegion, consensusGroupId);
+      tCommitId =
+          new TCommitId(
+              pipeInsertNodeTabletInsertionEvent.getReplicateIndexForIoTV2(),
+              pipeInsertNodeTabletInsertionEvent.getCommitterKey().getRestartTimes(),
+              pipeInsertNodeTabletInsertionEvent.getRebootTimes());
 
-    final InsertNode insertNode = pipeInsertNodeTabletInsertionEvent.getInsertNode();
-    final ProgressIndex progressIndex = pipeInsertNodeTabletInsertionEvent.getProgressIndex();
-    final TIoTConsensusV2TransferReq iotConsensusV2TransferReq =
-        IoTConsensusV2TabletInsertNodeReq.toTIoTConsensusV2TransferReq(
-            insertNode, tCommitId, tConsensusGroupId, progressIndex, thisDataNodeId);
-    final IoTConsensusV2TabletInsertNodeEventHandler iotConsensusV2InsertNodeReqHandler =
-        new IoTConsensusV2TabletInsertNodeEventHandler(
-            pipeInsertNodeTabletInsertionEvent,
-            iotConsensusV2TransferReq,
-            this,
-            iotConsensusV2SinkMetrics);
+      final InsertNode insertNode = pipeInsertNodeTabletInsertionEvent.getInsertNode();
+      final ProgressIndex progressIndex = pipeInsertNodeTabletInsertionEvent.getProgressIndex();
+      final TIoTConsensusV2TransferReq iotConsensusV2TransferReq =
+          IoTConsensusV2TabletInsertNodeReq.toTIoTConsensusV2TransferReq(
+              insertNode, tCommitId, tConsensusGroupId, progressIndex, thisDataNodeId);
+      final IoTConsensusV2TabletInsertNodeEventHandler iotConsensusV2InsertNodeReqHandler =
+          new IoTConsensusV2TabletInsertNodeEventHandler(
+              pipeInsertNodeTabletInsertionEvent,
+              iotConsensusV2TransferReq,
+              this,
+              iotConsensusV2SinkMetrics);
 
-    transfer(iotConsensusV2InsertNodeReqHandler);
-    return true;
+      transfer(iotConsensusV2InsertNodeReqHandler);
+      return true;
+    } catch (final Exception e) {
+      // Preparation failures can leave references without a handler that will release them.
+      // Keep the existing retry behavior, but do not use uncertain work counts for balancing.
+      pipeInsertNodeTabletInsertionEvent.invalidateReplicationEventToken();
+      throw e;
+    }
   }
 
   private void transfer(
@@ -402,36 +409,41 @@ public class IoTConsensusV2AsyncSink extends IoTDBSink implements ConsensusPipeS
       return false;
     }
 
-    TCommitId tCommitId =
-        new TCommitId(
-            pipeTsFileInsertionEvent.getReplicateIndexForIoTV2(),
-            pipeTsFileInsertionEvent.getCommitterKey().getRestartTimes(),
-            pipeTsFileInsertionEvent.getRebootTimes());
-    TConsensusGroupId tConsensusGroupId =
-        new TConsensusGroupId(TConsensusGroupType.DataRegion, consensusGroupId);
-
     try {
-      // Just in case. To avoid the case that exception occurred when constructing the handler.
-      if (!pipeTsFileInsertionEvent.getTsFile().exists()) {
-        throw new FileNotFoundException(pipeTsFileInsertionEvent.getTsFile().getAbsolutePath());
+      TCommitId tCommitId =
+          new TCommitId(
+              pipeTsFileInsertionEvent.getReplicateIndexForIoTV2(),
+              pipeTsFileInsertionEvent.getCommitterKey().getRestartTimes(),
+              pipeTsFileInsertionEvent.getRebootTimes());
+      TConsensusGroupId tConsensusGroupId =
+          new TConsensusGroupId(TConsensusGroupType.DataRegion, consensusGroupId);
+
+      try {
+        // Just in case. To avoid the case that exception occurred when constructing the handler.
+        if (!pipeTsFileInsertionEvent.getTsFile().exists()) {
+          throw new FileNotFoundException(pipeTsFileInsertionEvent.getTsFile().getAbsolutePath());
+        }
+
+        final IoTConsensusV2TsFileInsertionEventHandler iotConsensusV2TsFileInsertionEventHandler =
+            new IoTConsensusV2TsFileInsertionEventHandler(
+                pipeTsFileInsertionEvent,
+                this,
+                tCommitId,
+                tConsensusGroupId,
+                consensusPipeName,
+                thisDataNodeId,
+                iotConsensusV2SinkMetrics);
+
+        transfer(iotConsensusV2TsFileInsertionEventHandler);
+        return true;
+      } catch (Exception e) {
+        // Just in case. To avoid the case that exception occurred when constructing the handler.
+        pipeTsFileInsertionEvent.decreaseReferenceCount(
+            IoTConsensusV2AsyncSink.class.getName(), false);
+        throw e;
       }
-
-      final IoTConsensusV2TsFileInsertionEventHandler iotConsensusV2TsFileInsertionEventHandler =
-          new IoTConsensusV2TsFileInsertionEventHandler(
-              pipeTsFileInsertionEvent,
-              this,
-              tCommitId,
-              tConsensusGroupId,
-              consensusPipeName,
-              thisDataNodeId,
-              iotConsensusV2SinkMetrics);
-
-      transfer(iotConsensusV2TsFileInsertionEventHandler);
-      return true;
-    } catch (Exception e) {
-      // Just in case. To avoid the case that exception occurred when constructing the handler.
-      pipeTsFileInsertionEvent.decreaseReferenceCount(
-          IoTConsensusV2AsyncSink.class.getName(), false);
+    } catch (final Exception e) {
+      pipeTsFileInsertionEvent.invalidateReplicationEventToken();
       throw e;
     }
   }
@@ -484,28 +496,33 @@ public class IoTConsensusV2AsyncSink extends IoTDBSink implements ConsensusPipeS
       return false;
     }
 
-    final ProgressIndex progressIndex = pipeDeleteDataNodeEvent.getProgressIndex();
-    final TCommitId tCommitId =
-        new TCommitId(
-            pipeDeleteDataNodeEvent.getReplicateIndexForIoTV2(),
-            pipeDeleteDataNodeEvent.getCommitterKey().getRestartTimes(),
-            pipeDeleteDataNodeEvent.getRebootTimes());
-    final TConsensusGroupId tConsensusGroupId =
-        new TConsensusGroupId(TConsensusGroupType.DataRegion, consensusGroupId);
+    try {
+      final ProgressIndex progressIndex = pipeDeleteDataNodeEvent.getProgressIndex();
+      final TCommitId tCommitId =
+          new TCommitId(
+              pipeDeleteDataNodeEvent.getReplicateIndexForIoTV2(),
+              pipeDeleteDataNodeEvent.getCommitterKey().getRestartTimes(),
+              pipeDeleteDataNodeEvent.getRebootTimes());
+      final TConsensusGroupId tConsensusGroupId =
+          new TConsensusGroupId(TConsensusGroupType.DataRegion, consensusGroupId);
 
-    final TIoTConsensusV2TransferReq iotConsensusV2TransferReq =
-        IoTConsensusV2DeleteNodeReq.toTIoTConsensusV2TransferReq(
-            pipeDeleteDataNodeEvent.getDeleteDataNode(),
-            tCommitId,
-            tConsensusGroupId,
-            progressIndex,
-            thisDataNodeId);
-    final IoTConsensusV2DeleteEventHandler iotConsensusV2DeleteEventHandler =
-        new IoTConsensusV2DeleteEventHandler(
-            pipeDeleteDataNodeEvent, iotConsensusV2TransferReq, this, iotConsensusV2SinkMetrics);
+      final TIoTConsensusV2TransferReq iotConsensusV2TransferReq =
+          IoTConsensusV2DeleteNodeReq.toTIoTConsensusV2TransferReq(
+              pipeDeleteDataNodeEvent.getDeleteDataNode(),
+              tCommitId,
+              tConsensusGroupId,
+              progressIndex,
+              thisDataNodeId);
+      final IoTConsensusV2DeleteEventHandler iotConsensusV2DeleteEventHandler =
+          new IoTConsensusV2DeleteEventHandler(
+              pipeDeleteDataNodeEvent, iotConsensusV2TransferReq, this, iotConsensusV2SinkMetrics);
 
-    transfer(iotConsensusV2DeleteEventHandler);
-    return true;
+      transfer(iotConsensusV2DeleteEventHandler);
+      return true;
+    } catch (final RuntimeException e) {
+      pipeDeleteDataNodeEvent.invalidateReplicationEventToken();
+      throw e;
+    }
   }
 
   private void transfer(final IoTConsensusV2DeleteEventHandler iotConsensusV2DeleteEventHandler) {
@@ -628,6 +645,10 @@ public class IoTConsensusV2AsyncSink extends IoTDBSink implements ConsensusPipeS
         addFailureEventToRetryQueue(tsFileInsertionEvent);
       }
     } catch (final Exception e) {
+      // A failed handler construction may already have released its reference. The existing
+      // retry cleanup can therefore exhaust references without an ACK; do not report a valid zero.
+      // Network retries handled by the async callback do not enter this branch.
+      tsFileInsertionEvent.invalidateReplicationEventToken();
       tsFileInsertionEvent.decreaseReferenceCount(IoTConsensusV2AsyncSink.class.getName(), false);
       addFailureEventToRetryQueue(tsFileInsertionEvent);
     }

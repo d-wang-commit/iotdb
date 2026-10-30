@@ -44,6 +44,7 @@ import org.apache.iotdb.confignode.manager.load.cache.node.NodeStatistics;
 import org.apache.iotdb.confignode.manager.load.cache.region.RegionHeartbeatSample;
 import org.apache.iotdb.confignode.manager.load.service.EventService;
 import org.apache.iotdb.confignode.manager.load.service.HeartbeatService;
+import org.apache.iotdb.confignode.manager.load.service.ReplicationBacklogService;
 import org.apache.iotdb.confignode.manager.load.service.StatisticsService;
 import org.apache.iotdb.confignode.manager.load.service.TopologyService;
 import org.apache.iotdb.confignode.manager.partition.RegionGroupStatus;
@@ -78,6 +79,7 @@ public class LoadManager {
 
   protected HeartbeatService heartbeatService;
   private final StatisticsService statisticsService;
+  private final ReplicationBacklogService replicationBacklogService;
   private final EventService eventService;
   private final TopologyService topologyService;
   private final AtomicBoolean loadServicesStarted;
@@ -99,6 +101,7 @@ public class LoadManager {
         plan -> configManager.getConsensusManager().write(plan));
     setHeartbeatService(configManager, loadCache);
     this.statisticsService = new StatisticsService(loadCache);
+    this.replicationBacklogService = new ReplicationBacklogService(this, loadCache);
     this.topologyService = new TopologyService(configManager, loadCache::updateTopology);
     this.eventService = new EventService(loadCache);
     this.eventService.register(configManager.getPipeManager().getPipeRuntimeCoordinator());
@@ -172,6 +175,7 @@ public class LoadManager {
     loadReadyReason = "ConfigNode leader is waiting for cluster heartbeat sampling.";
     loadCache.initHeartbeatCache(configManager);
     loadServicesStarted.set(true);
+    replicationBacklogService.start();
     heartbeatService.startHeartbeatService();
     statisticsService.startLoadStatisticsService();
     eventService.startEventService();
@@ -183,6 +187,7 @@ public class LoadManager {
     loadReadyStartTimeMillis.set(0);
     loadReady.set(false);
     loadReadyReason = "ConfigNode leader load services are stopped.";
+    replicationBacklogService.stop();
     heartbeatService.stopHeartbeatService();
     statisticsService.stopLoadStatisticsService();
     eventService.stopEventService();
@@ -588,5 +593,9 @@ public class LoadManager {
   @TestOnly
   public EventService getEventService() {
     return eventService;
+  }
+
+  public ReplicationBacklogService getReplicationBacklogService() {
+    return replicationBacklogService;
   }
 }

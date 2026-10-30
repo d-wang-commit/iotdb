@@ -288,6 +288,7 @@ public class PipeRealtimeDataRegionHybridSource extends PipeRealtimeDataRegionSo
     switch (state) {
       case USING_TABLET:
         if (isRegionLevelDowngradingEnabled && isRegionLevelDegraded) {
+          bindReplicationFileIfNeeded(event);
           pendingQueue.offer(event);
           return;
         }
@@ -301,6 +302,7 @@ public class PipeRealtimeDataRegionHybridSource extends PipeRealtimeDataRegionSo
       case EMPTY:
       case USING_TSFILE:
       case USING_BOTH:
+        bindReplicationFileIfNeeded(event);
         pendingQueue.offer(event);
         break;
       default:
