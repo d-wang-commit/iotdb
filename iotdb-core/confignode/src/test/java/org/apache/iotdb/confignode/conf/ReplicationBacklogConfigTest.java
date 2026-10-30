@@ -25,7 +25,6 @@ import java.util.Arrays;
 import java.util.Properties;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
@@ -33,17 +32,27 @@ import static org.junit.Assert.fail;
 
 public class ReplicationBacklogConfigTest {
   @Test
-  public void defaultObservesWithoutInventingThresholds() throws Exception {
+  public void defaultsEnforceWithConfiguredThresholds() throws Exception {
     ReplicationBacklogConfig conf = ReplicationBacklogConfig.defaults();
-    assertEquals(ReplicationBacklogConfig.Mode.OBSERVE, conf.getMode());
-    assertFalse(conf.hasThresholds((byte) 1));
-    assertFalse(conf.hasThresholds((byte) 2));
+    assertEquals(ReplicationBacklogConfig.Mode.ENFORCE, conf.getMode());
+    assertTrue(conf.hasThresholds((byte) 1));
+    assertTrue(conf.hasThresholds((byte) 2));
+    for (int dimension = 0; dimension < 4; dimension++) {
+      assertEquals(10, conf.getAbsoluteGap(dimension));
+    }
     assertSame(conf, ReplicationBacklogConfig.load(new Properties(), conf));
   }
 
   @Test
   public void validateAllValuesBeforePublishingEnforce() throws Exception {
     ConfigNodeConfig conf = new ConfigNodeConfig();
+    Properties observation = new Properties();
+    observation.setProperty(ReplicationBacklogConfig.PREFIX + "mode", "OBSERVE");
+    for (String kind : Arrays.asList("request", "tablet", "file", "deletion")) {
+      observation.setProperty(ReplicationBacklogConfig.PREFIX + kind + "_gap", "-1");
+    }
+    conf.setReplicationBacklogConfig(
+        ReplicationBacklogConfig.load(observation, conf.getReplicationBacklogConfig()));
     ReplicationBacklogConfig original = conf.getReplicationBacklogConfig();
     Properties props = new Properties();
     props.setProperty(ReplicationBacklogConfig.PREFIX + "mode", "ENFORCE");

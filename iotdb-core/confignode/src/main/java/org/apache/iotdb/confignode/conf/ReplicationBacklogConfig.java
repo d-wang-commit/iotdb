@@ -68,7 +68,7 @@ public final class ReplicationBacklogConfig {
 
   public static ReplicationBacklogConfig defaults() {
     return new ReplicationBacklogConfig(
-        Mode.OBSERVE, 5000, 30000, 10000, 0.5, 1.0, 3, new long[] {-1, -1, -1, -1});
+        Mode.ENFORCE, 5000, 30000, 10000, 0.5, 1.0, 3, new long[] {10, 10, 10, 10});
   }
 
   public static ReplicationBacklogConfig load(Properties properties, ReplicationBacklogConfig old)

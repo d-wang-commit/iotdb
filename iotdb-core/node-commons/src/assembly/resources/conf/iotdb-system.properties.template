@@ -790,7 +790,7 @@ enable_auto_leader_balance_for_ratis_consensus=true
 # Modes change only by administrator configuration, never automatically.
 # effectiveMode: hot_reload
 # Datatype: String (OFF, OBSERVE, ENFORCE)
-iot_consensus_replication_backlog_mode=OBSERVE
+iot_consensus_replication_backlog_mode=ENFORCE
 
 # Sampling is piggybacked on heartbeats, so it cannot run faster than heartbeats.
 # Sample validity must be at least the sample interval. Balancing coalesces candidate changes;
@@ -820,10 +820,10 @@ iot_consensus_replication_backlog_confirmation_rounds=3
 # Changing thresholds resets confirmation; invalid configuration keeps the old settings.
 # effectiveMode: hot_reload
 # Datatype: long (-1 or positive)
-iot_consensus_replication_backlog_request_gap=-1
-iot_consensus_replication_backlog_tablet_gap=-1
-iot_consensus_replication_backlog_file_gap=-1
-iot_consensus_replication_backlog_deletion_gap=-1
+iot_consensus_replication_backlog_request_gap=10
+iot_consensus_replication_backlog_tablet_gap=10
+iot_consensus_replication_backlog_file_gap=10
+iot_consensus_replication_backlog_deletion_gap=10
 
 ####################
 ### Cluster management

@@ -85,6 +85,7 @@ public class ReplicationBacklogServiceTest {
     oldProtocol = conf.getDataRegionConsensusProtocolClass();
     conf.setDataRegionConsensusProtocolClass(ConsensusFactory.IOT_CONSENSUS);
     Properties properties = new Properties();
+    properties.setProperty(ReplicationBacklogConfig.PREFIX + "mode", "OBSERVE");
     for (String type : new String[] {"request", "tablet", "file", "deletion"}) {
       properties.setProperty(ReplicationBacklogConfig.PREFIX + type + "_gap", "10");
     }
