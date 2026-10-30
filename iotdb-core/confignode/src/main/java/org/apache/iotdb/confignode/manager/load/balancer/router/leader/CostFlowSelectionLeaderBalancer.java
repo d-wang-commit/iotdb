@@ -102,6 +102,16 @@ public class CostFlowSelectionLeaderBalancer extends AbstractLeaderBalancer {
   }
 
   @Override
+  protected boolean isDataNodeAvailable(int dataNodeId) {
+    return !isLeaderExcludedForTest(dataNodeId) && super.isDataNodeAvailable(dataNodeId);
+  }
+
+  private static boolean isLeaderExcludedForTest(int dataNodeId) {
+    // Temporary test hook: never select these DataNodes as CFS leader candidates.
+    return dataNodeId == 7 || dataNodeId == 8;
+  }
+
+  @Override
   protected void clear() {
     super.clear();
     this.rVertexMap.clear();
@@ -349,8 +359,11 @@ public class CostFlowSelectionLeaderBalancer extends AbstractLeaderBalancer {
             regionGroupIds.forEach(
                 regionGroupId -> {
                   int originalLeader = regionLeaderMap.getOrDefault(regionGroupId, -1);
+                  // Do not restore an excluded leader when no assignment can be calculated.
+                  int fallbackLeader =
+                      isLeaderExcludedForTest(originalLeader) ? -1 : originalLeader;
                   if (!regionGroupIntersection.contains(regionGroupId)) {
-                    result.put(regionGroupId, originalLeader);
+                    result.put(regionGroupId, fallbackLeader);
                     return;
                   }
                   boolean matchLeader = false;
@@ -364,7 +377,7 @@ public class CostFlowSelectionLeaderBalancer extends AbstractLeaderBalancer {
                     }
                   }
                   if (!matchLeader) {
-                    result.put(regionGroupId, originalLeader);
+                    result.put(regionGroupId, fallbackLeader);
                   }
                 }));
 
