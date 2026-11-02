@@ -813,7 +813,7 @@ iot_consensus_replication_backlog_balance_interval_ms=10000
 # effectiveMode: hot_reload
 # Datatype: double (alpha in (0, 1], relative gap > 0), int (rounds > 0)
 iot_consensus_replication_backlog_ewma_alpha=0.5
-iot_consensus_replication_backlog_relative_gap=1.0
+iot_consensus_replication_backlog_relative_gap=0.3
 iot_consensus_replication_backlog_confirmation_rounds=3
 
 # Absolute gaps are counts, not rows, bytes or time. v1 uses the request sequence span;
