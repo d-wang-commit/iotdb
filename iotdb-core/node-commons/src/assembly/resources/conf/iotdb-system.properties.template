@@ -784,20 +784,19 @@ enable_auto_leader_balance_for_ratis_consensus=true
 
 # Incoming replication backlog observation for IoTConsensus v1/v2 DataRegions.
 # OFF stops ConfigNode sampling and filtering; DataNode lifecycle counters remain active.
-# OBSERVE samples without changing leaders. ENFORCE also filters persistently heavier
-# available candidates for CFS; original per-database/global costs remain unchanged.
-# Missing, recovering or expired reports never mean zero and withdraw load-based exclusions.
-# ENFORCE also keeps newly started/recovered replicas out until their backlog classification
-# is confirmed. Missing or expired reports do not release this admission gate. Only when no
-# confirmed replica is available (including cluster bootstrap) do normal candidates apply.
+# OBSERVE samples without changing leaders. ENFORCE first lets CFS select Running replicas,
+# then prefers stable L (light) candidates. If all Running candidates are H (heavy), all remain
+# eligible; original per-database/global costs remain unchanged. Initial and recovered replicas
+# start at H, with the same three-sample EWMA warmup. Missing load is never treated as zero.
 # Modes change only by administrator configuration, never automatically.
 # effectiveMode: hot_reload
 # Datatype: String (OFF, OBSERVE, ENFORCE)
 iot_consensus_replication_backlog_mode=ENFORCE
 
 # Sampling is piggybacked on heartbeats, so it cannot run faster than heartbeats.
-# Sample validity must be at least the sample interval. Balancing coalesces candidate changes;
-# ordinary health-triggered failover does not wait for this interval.
+# ttl_ms limits the age of arriving reports, not how long the last EWMA is retained.
+# It must be at least the sample interval. Balancing coalesces candidate changes;
+# ordinary health-triggered failover does not wait for the balance interval.
 # effectiveMode: hot_reload
 # Datatype: long, in milliseconds
 iot_consensus_replication_backlog_sample_interval_ms=5000
@@ -805,11 +804,15 @@ iot_consensus_replication_backlog_ttl_ms=30000
 iot_consensus_replication_backlog_balance_interval_ms=10000
 
 # EWMA = alpha * new sample + (1 - alpha) * previous EWMA. Missing/duplicate reports
-# do not update EWMA or confirmation. A round requires new reports from every member.
+# do not update EWMA or light confirmation. Each target observation requires new reports
+# from all other members, whose outgoing edges are summed as that target's incoming backlog.
 # A heavier replica must be no lighter in every dimension and exceed both the absolute
 # gap and relative_gap * max(lighter_count, 1) in at least one dimension.
-# Exit thresholds are half the entry thresholds, with the same confirmation count.
-# Recovery admission uses the same count, with fresh observations collected after recovery.
+# H applies immediately when a mature candidate is heavier. H to L requires confirmation_rounds
+# consecutive new light observations (M, default 3). EWMA warmup is fixed at three observations;
+# the third observation is the first eligible light confirmation, including after recovery.
+# Missing reports retain the last EWMA. After M consecutive sampling rounds without a new
+# observation the candidate returns to H; duplicate reports and CFS calls advance neither count.
 # effectiveMode: hot_reload
 # Datatype: double (alpha in (0, 1], relative gap > 0), int (rounds > 0)
 iot_consensus_replication_backlog_ewma_alpha=0.5

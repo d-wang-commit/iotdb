@@ -60,6 +60,7 @@ import static org.junit.Assert.assertEquals;
  */
 public class ReplicationBacklogScaleBenchmark {
   private static final long SECOND = TimeUnit.SECONDS.toNanos(1);
+  private static final int OBSERVATION_ROUNDS = 5;
 
   @Test
   public void measure() throws Exception {
@@ -78,12 +79,14 @@ public class ReplicationBacklogScaleBenchmark {
     }
     cache.configure(ReplicationBacklogConfig.load(properties, ReplicationBacklogConfig.defaults()));
     long topologyStart = System.nanoTime();
-    cache.updateTopology(fixture.locations, fixture.nodes, fixture.regions, 0);
+    cache.updateTopology(fixture.locations, 0);
+    cache.evaluate(fixture.locations, 0);
     long topologyNanos = System.nanoTime() - topologyStart;
     Measurement measurement = populate(cache, fixture, protocol);
     long cacheHeap = retainedHeap() - baseHeap;
     long snapshotStart = System.nanoTime();
-    Map<TConsensusGroupId, Set<Integer>> candidates = cache.eligibleCandidates(20 * SECOND);
+    Map<TConsensusGroupId, Set<Integer>> candidates =
+        cache.eligibleCandidates(OBSERVATION_ROUNDS * 5 * SECOND);
     long snapshotNanos = System.nanoTime() - snapshotStart;
     assertEquals(fixture.locations.size(), candidates.size());
     long snapshotHeap = retainedHeap() - baseHeap - cacheHeap;
@@ -98,8 +101,8 @@ public class ReplicationBacklogScaleBenchmark {
         cacheHeap,
         snapshotHeap,
         millis(topologyNanos),
-        millis(measurement.ingestNanos) / 4,
-        millis(measurement.evaluateNanos) / 4,
+        millis(measurement.ingestNanos) / OBSERVATION_ROUNDS,
+        millis(measurement.evaluateNanos) / OBSERVATION_ROUNDS,
         millis(snapshotNanos),
         measurement.binaryBytes,
         measurement.compactBytes,
@@ -110,7 +113,7 @@ public class ReplicationBacklogScaleBenchmark {
       measureCfs(fixture, candidates, "filtered");
     }
     // Keep the measured cache reachable until every retained-heap measurement has finished.
-    assertEquals(3, cache.getDiagnostics(0, 20 * SECOND).size());
+    assertEquals(3, cache.getDiagnostics(0, OBSERVATION_ROUNDS * 5 * SECOND).size());
   }
 
   private static Measurement populate(ReplicationBacklogCache cache, Fixture fixture, byte protocol)
@@ -118,7 +121,7 @@ public class ReplicationBacklogScaleBenchmark {
     Measurement result = new Measurement();
     TSerializer binary = new TSerializer(new TBinaryProtocol.Factory());
     TSerializer compact = new TSerializer(new TCompactProtocol.Factory());
-    for (int sequence = 1; sequence <= 4; sequence++) {
+    for (int sequence = 1; sequence <= OBSERVATION_ROUNDS; sequence++) {
       long now = sequence * 5 * SECOND;
       for (Map.Entry<Integer, List<TConsensusGroupId>> entry : fixture.outgoing.entrySet()) {
         TReplicationBacklogReport report = fixture.report(entry.getKey(), sequence, protocol);
@@ -135,7 +138,7 @@ public class ReplicationBacklogScaleBenchmark {
         result.ingestNanos += System.nanoTime() - start;
       }
       long start = System.nanoTime();
-      cache.evaluate(now);
+      cache.evaluate(fixture.locations, now);
       result.evaluateNanos += System.nanoTime() - start;
     }
     return result;
@@ -146,7 +149,7 @@ public class ReplicationBacklogScaleBenchmark {
     CostFlowSelectionLeaderBalancer cfs = new CostFlowSelectionLeaderBalancer();
     long start = System.nanoTime();
     Map<TConsensusGroupId, Integer> result =
-        cfs.generateOptimalLeaderDistribution(
+        cfs.generateOptimalLeaderDistributionWithBacklog(
             fixture.databases,
             fixture.locations,
             fixture.leaders,

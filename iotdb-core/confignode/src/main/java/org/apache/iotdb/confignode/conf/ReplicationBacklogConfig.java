@@ -164,6 +164,7 @@ public final class ReplicationBacklogConfig {
     return sampleIntervalMs;
   }
 
+  /** Maximum age of an arriving report; missing reports do not expire the stored EWMA. */
   public long getTtlMs() {
     return ttlMs;
   }
@@ -180,6 +181,9 @@ public final class ReplicationBacklogConfig {
     return relativeGap;
   }
 
+  /**
+   * New light observations required for H to L, and missed sampling rounds before returning to H.
+   */
   public int getConfirmationRounds() {
     return confirmationRounds;
   }

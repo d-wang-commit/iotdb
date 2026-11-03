@@ -58,7 +58,7 @@ public class ReplicationBacklogLeaderBalancerTest {
     int originalCost = balancer.getMinimumCost();
     assertEquals(Integer.valueOf(1), original.get(group));
     Map<TConsensusGroupId, Integer> filtered =
-        balancer.generateOptimalLeaderDistribution(
+        balancer.generateOptimalLeaderDistributionWithBacklog(
             Collections.singletonMap("root.test", Collections.singletonList(group)),
             Collections.singletonMap(group, members),
             Collections.singletonMap(group, 1),
@@ -70,7 +70,7 @@ public class ReplicationBacklogLeaderBalancerTest {
     assertEquals(originalCost + 1, balancer.getMinimumCost());
     assertEquals(
         original,
-        balancer.generateOptimalLeaderDistribution(
+        balancer.generateOptimalLeaderDistributionWithBacklog(
             Collections.singletonMap("root.test", Collections.singletonList(group)),
             Collections.singletonMap(group, members),
             Collections.singletonMap(group, 1),
@@ -84,7 +84,7 @@ public class ReplicationBacklogLeaderBalancerTest {
     assertEquals(
         Integer.valueOf(1),
         balancer
-            .generateOptimalLeaderDistribution(
+            .generateOptimalLeaderDistributionWithBacklog(
                 Collections.singletonMap("root.test", Collections.singletonList(group)),
                 Collections.singletonMap(group, members),
                 Collections.singletonMap(group, 1),
@@ -92,5 +92,41 @@ public class ReplicationBacklogLeaderBalancerTest {
                 Collections.singletonMap(group, regions),
                 Collections.singletonMap(group, Collections.singleton(2)))
             .get(group));
+  }
+
+  @Test
+  public void runningCandidatesRequireMembershipAndBothHealthChecks() {
+    TConsensusGroupId group = new TConsensusGroupId(TConsensusGroupType.DataRegion, 1);
+    Set<Integer> members = Set.of(1, 2, 3, 4, 5);
+    Map<Integer, NodeStatistics> nodes = new HashMap<>();
+    Map<Integer, RegionStatistics> regions = new HashMap<>();
+    for (int node : new int[] {1, 2, 3, 4, 6}) {
+      nodes.put(node, new NodeStatistics(NodeStatus.Running));
+      regions.put(node, new RegionStatistics(RegionStatus.Running));
+    }
+    nodes.put(2, new NodeStatistics(NodeStatus.Unknown));
+    regions.put(3, new RegionStatistics(RegionStatus.Unknown));
+    regions.remove(4);
+    assertEquals(
+        Collections.singletonMap(group, Set.of(1)),
+        CostFlowSelectionLeaderBalancer.getRunningCandidates(
+            Collections.singletonMap(group, members),
+            nodes,
+            Collections.singletonMap(group, regions)));
+
+    // Neither a nonmember nor a non-Running preference can remove the actual Running candidate.
+    CostFlowSelectionLeaderBalancer balancer = new CostFlowSelectionLeaderBalancer();
+    assertEquals(
+        Integer.valueOf(1),
+        balancer
+            .generateOptimalLeaderDistributionWithBacklog(
+                Collections.singletonMap("root.test", Collections.singletonList(group)),
+                Collections.singletonMap(group, members),
+                Collections.singletonMap(group, 2),
+                nodes,
+                Collections.singletonMap(group, regions),
+                Collections.singletonMap(group, Set.of(2, 3, 4, 5, 6)))
+            .get(group));
+    assertEquals(5, members.size());
   }
 }

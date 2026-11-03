@@ -368,7 +368,7 @@ public class RouteBalancer implements IClusterStatusSubscriber {
               .captureSelection(locations, nodes, regions);
       optimalLeaderMap =
           ((CostFlowSelectionLeaderBalancer) leaderBalanceContext.leaderBalancer)
-              .generateOptimalLeaderDistribution(
+              .generateOptimalLeaderDistributionWithBacklog(
                   databaseGroups,
                   locations,
                   currentLeaderMap,

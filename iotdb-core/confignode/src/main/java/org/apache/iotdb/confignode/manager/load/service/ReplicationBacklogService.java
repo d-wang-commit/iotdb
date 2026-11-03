@@ -28,6 +28,7 @@ import org.apache.iotdb.confignode.conf.ReplicationBacklogConfig;
 import org.apache.iotdb.confignode.conf.ReplicationBacklogConfig.Mode;
 import org.apache.iotdb.confignode.i18n.ConfigNodeMessages;
 import org.apache.iotdb.confignode.manager.load.LoadManager;
+import org.apache.iotdb.confignode.manager.load.balancer.router.leader.CostFlowSelectionLeaderBalancer;
 import org.apache.iotdb.confignode.manager.load.cache.LoadCache;
 import org.apache.iotdb.confignode.manager.load.cache.ReplicationBacklogCache;
 import org.apache.iotdb.confignode.manager.load.cache.ReplicationBacklogCache.SelectionSnapshot;
@@ -44,6 +45,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -58,12 +60,17 @@ public final class ReplicationBacklogService {
   private final ScheduledExecutorService executor =
       IoTDBThreadPoolFactory.newSingleThreadScheduledExecutor(
           ThreadName.CONFIG_NODE_LOAD_STATISTIC.getName());
+  private final ExecutorService balanceExecutor =
+      IoTDBThreadPoolFactory.newSingleThreadExecutor(
+          ThreadName.CONFIG_NODE_LOAD_STATISTIC.getName() + "-LeaderBalance");
   private Future<?> future;
   private volatile boolean running;
   private long nextEvaluation;
+  private long samplingRound;
   private long nextBalance;
   private long nextDiagnostic;
   private boolean pendingBalance;
+  private boolean balanceInProgress;
   private Mode lastMode = Mode.OBSERVE;
   private ReplicationBacklogConfig lastConfiguration;
 
@@ -80,6 +87,7 @@ public final class ReplicationBacklogService {
     lastConfiguration = configuration();
     cache.configure(lastConfiguration);
     nextSample.clear();
+    samplingRound = 0;
     nextEvaluation = System.nanoTime();
     nextBalance = nextEvaluation;
     nextDiagnostic = nextEvaluation + TimeUnit.MINUTES.toNanos(1);
@@ -146,8 +154,10 @@ public final class ReplicationBacklogService {
       long now = System.nanoTime();
       ReplicationBacklogConfig conf = synchronizeConfiguration(now);
       if (conf.getMode() != Mode.OFF && supportedProtocol() && now - nextEvaluation >= 0) {
-        refreshTopology(now);
-        cache.evaluate(now);
+        Map<TConsensusGroupId, Set<Integer>> runningCandidates = refreshTopology(now);
+        // Only scheduled sampling rounds count missing reports. Solver/query calls never do.
+        cache.advanceSamplingRound(++samplingRound);
+        cache.evaluate(runningCandidates, now);
         nextEvaluation = now + TimeUnit.MILLISECONDS.toNanos(conf.getSampleIntervalMs());
       }
       if (conf.getMode() != Mode.OFF && supportedProtocol() && now - nextDiagnostic >= 0) {
@@ -157,15 +167,31 @@ public final class ReplicationBacklogService {
       boolean changed = cache.consumeDirty();
       pendingBalance |= changed && (conf.getMode() == Mode.ENFORCE || lastMode == Mode.ENFORCE);
       lastMode = conf.getMode();
-      balance = pendingBalance && now - nextBalance >= 0 && supportedProtocol();
+      balance =
+          pendingBalance && !balanceInProgress && now - nextBalance >= 0 && supportedProtocol();
       if (balance) {
         pendingBalance = false;
+        balanceInProgress = true;
         nextBalance = now + TimeUnit.MILLISECONDS.toNanos(conf.getBalanceIntervalMs());
       }
       epoch = cache.getEpoch();
     }
-    if (balance && running && epoch == cache.getEpoch()) {
-      loadManager.getRouteBalancer().balanceDataRegionLeadersForReplicationBacklog();
+    if (balance) {
+      // CFS may take longer than a sampling interval. Keep sampling independent, and merge all
+      // changes during this solve into pendingBalance instead of queuing more solves.
+      balanceExecutor.execute(() -> balance(epoch));
+    }
+  }
+
+  private void balance(long epoch) {
+    try {
+      if (running && epoch == cache.getEpoch()) {
+        loadManager.getRouteBalancer().balanceDataRegionLeadersForReplicationBacklog();
+      }
+    } finally {
+      synchronized (this) {
+        balanceInProgress = false;
+      }
     }
   }
 
@@ -181,13 +207,15 @@ public final class ReplicationBacklogService {
                     (node, diagnostic) ->
                         LOGGER.info(
                             ConfigNodeMessages
-                                .LOG_REPLICATIONBACKLOG_REGION_ARG_REPLICA_ARG_KNOWN_ARG_AVAILABLE_ARG_ADMISSIONPENDING_ARG_PROPOSEDEXCLUDED_ARG_RAW_REQUEST_TABLET_FILE_DELETION_ARG_EWMA_ARG_MODE_ARG_BADEAF0E,
+                                .LOG_REPLICATIONBACKLOG_REGION_ARG_REPLICA_ARG_AVAILABLE_ARG_STABLEHEAVY_ARG_INSTANTHEAVY_ARG_WARMUPSAMPLES_ARG_LIGHTSTREAK_ARG_MISSINGROUNDS_ARG_RAW_REQUEST_TABLET_FILE_DELETION_ARG_EWMA_ARG_MODE_ARG_3DEECD59,
                             region,
                             node,
-                            diagnostic.isKnown(),
                             diagnostic.isAvailable(),
-                            diagnostic.isAdmissionPending(),
                             diagnostic.isHeavy(),
+                            diagnostic.isInstantHeavy(),
+                            diagnostic.getWarmupSamples(),
+                            diagnostic.getLightStreak(),
+                            diagnostic.getMissingRounds(),
                             Arrays.toString(diagnostic.getCounts()),
                             Arrays.toString(diagnostic.getSmoothedCounts()),
                             mode)));
@@ -215,7 +243,7 @@ public final class ReplicationBacklogService {
       Map<TConsensusGroupId, Map<Integer, RegionStatistics>> regions) {
     long now = System.nanoTime();
     if (running && supportedProtocol() && synchronizeConfiguration(now).getMode() != Mode.OFF) {
-      cache.updateTopology(locations, nodes, regions, now);
+      refreshTopology(locations, nodes, regions, now);
     }
     return cache.captureSelection(now);
   }
@@ -231,12 +259,10 @@ public final class ReplicationBacklogService {
     long now = System.nanoTime();
     if (synchronizeConfiguration(now).getMode() != Mode.OFF) {
       refreshTopology(now);
-      cache.evaluate(now);
     }
     boolean valid = cache.isSelectionValid(snapshot, now);
     if (!valid) {
       pendingBalance = true;
-      nextEvaluation = now;
     }
     return valid;
   }
@@ -262,12 +288,24 @@ public final class ReplicationBacklogService {
     return cache.getDiagnostics(regionId, System.nanoTime());
   }
 
-  private void refreshTopology(long now) {
-    cache.updateTopology(
+  private Map<TConsensusGroupId, Set<Integer>> refreshTopology(long now) {
+    return refreshTopology(
         loadCache.getCurrentRegionLocationMap(TConsensusGroupType.DataRegion),
         loadCache.getCurrentDataNodeStatisticsMap(),
         loadCache.getCurrentRegionStatisticsMap(TConsensusGroupType.DataRegion),
         now);
+  }
+
+  private Map<TConsensusGroupId, Set<Integer>> refreshTopology(
+      Map<TConsensusGroupId, Set<Integer>> locations,
+      Map<Integer, NodeStatistics> nodes,
+      Map<TConsensusGroupId, Map<Integer, RegionStatistics>> regions,
+      long now) {
+    cache.updateTopology(locations, now);
+    Map<TConsensusGroupId, Set<Integer>> runningCandidates =
+        CostFlowSelectionLeaderBalancer.getRunningCandidates(locations, nodes, regions);
+    cache.evaluate(runningCandidates, now);
+    return runningCandidates;
   }
 
   private static ReplicationBacklogConfig configuration() {

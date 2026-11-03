@@ -35,12 +35,26 @@ public class ReplicationBacklogConfigTest {
   public void defaultsEnforceWithConfiguredThresholds() throws Exception {
     ReplicationBacklogConfig conf = ReplicationBacklogConfig.defaults();
     assertEquals(ReplicationBacklogConfig.Mode.ENFORCE, conf.getMode());
+    assertEquals(3, conf.getConfirmationRounds());
     assertTrue(conf.hasThresholds((byte) 1));
     assertTrue(conf.hasThresholds((byte) 2));
     for (int dimension = 0; dimension < 4; dimension++) {
       assertEquals(10, conf.getAbsoluteGap(dimension));
     }
     assertSame(conf, ReplicationBacklogConfig.load(new Properties(), conf));
+  }
+
+  @Test
+  public void reloadsConfirmationRoundsWithoutChangingPreviousSettings() throws Exception {
+    ReplicationBacklogConfig original = ReplicationBacklogConfig.defaults();
+    Properties properties = new Properties();
+    properties.setProperty(ReplicationBacklogConfig.PREFIX + "confirmation_rounds", "5");
+    ReplicationBacklogConfig updated = ReplicationBacklogConfig.load(properties, original);
+    assertEquals(5, updated.getConfirmationRounds());
+    assertEquals(3, original.getConfirmationRounds());
+    assertEquals(original.getMode(), updated.getMode());
+    assertEquals(original.getAlpha(), updated.getAlpha(), 0);
+    assertSame(updated, ReplicationBacklogConfig.load(properties, updated));
   }
 
   @Test

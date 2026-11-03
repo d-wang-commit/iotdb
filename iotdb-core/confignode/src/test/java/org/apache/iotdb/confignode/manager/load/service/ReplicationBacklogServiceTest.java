@@ -22,6 +22,7 @@ import org.apache.iotdb.common.rpc.thrift.TConsensusGroupId;
 import org.apache.iotdb.common.rpc.thrift.TConsensusGroupType;
 import org.apache.iotdb.commons.cluster.NodeStatus;
 import org.apache.iotdb.commons.cluster.RegionStatus;
+import org.apache.iotdb.commons.concurrent.threadpool.ScheduledExecutorUtil;
 import org.apache.iotdb.confignode.conf.ConfigNodeConfig;
 import org.apache.iotdb.confignode.conf.ConfigNodeDescriptor;
 import org.apache.iotdb.confignode.conf.ReplicationBacklogConfig;
@@ -30,6 +31,7 @@ import org.apache.iotdb.confignode.manager.load.LoadManager;
 import org.apache.iotdb.confignode.manager.load.balancer.RouteBalancer;
 import org.apache.iotdb.confignode.manager.load.balancer.router.leader.CostFlowSelectionLeaderBalancer;
 import org.apache.iotdb.confignode.manager.load.cache.LoadCache;
+import org.apache.iotdb.confignode.manager.load.cache.ReplicationBacklogCache.SelectionSnapshot;
 import org.apache.iotdb.confignode.manager.load.cache.node.NodeStatistics;
 import org.apache.iotdb.confignode.manager.load.cache.region.RegionStatistics;
 import org.apache.iotdb.consensus.ConsensusFactory;
@@ -50,17 +52,25 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.RETURNS_DEFAULTS;
+import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -118,6 +128,15 @@ public class ReplicationBacklogServiceTest {
                     ? scheduled
                     : RETURNS_DEFAULTS.answer(invocation));
     setField(service, "executor", executor);
+    ExecutorService directBalanceExecutor = mock(ExecutorService.class);
+    doAnswer(
+            invocation -> {
+              invocation.<Runnable>getArgument(0).run();
+              return null;
+            })
+        .when(directBalanceExecutor)
+        .execute(any(Runnable.class));
+    setField(service, "balanceExecutor", directBalanceExecutor);
   }
 
   @After
@@ -154,7 +173,7 @@ public class ReplicationBacklogServiceTest {
   @Test
   public void observeEnforceAndOffApplyAndWithdrawOnlyConfirmedConstraints() throws Exception {
     service.start();
-    for (int sequence = 1; sequence <= 4; sequence++) {
+    for (int sequence = 1; sequence <= 5; sequence++) {
       round(sequence);
     }
     assertTrue(service.getDiagnostics(7).get(1).isHeavy());
@@ -162,18 +181,18 @@ public class ReplicationBacklogServiceTest {
     verify(routeBalancer, never()).balanceDataRegionLeadersForReplicationBacklog();
     configure("mode", "ENFORCE");
     assertEquals(Set.of(2), service.getEligibleCandidates().get(GROUP));
-    tick(true);
+    round(6);
     verify(routeBalancer).balanceDataRegionLeadersForReplicationBacklog();
-    tick(true);
+    invokeTick();
     verify(routeBalancer).balanceDataRegionLeadersForReplicationBacklog();
     configure("mode", "OBSERVE");
     assertTrue(service.getEligibleCandidates().isEmpty());
     assertTrue(service.getDiagnostics(7).get(1).isHeavy());
-    tick(true);
+    round(7);
     verify(routeBalancer, times(2)).balanceDataRegionLeadersForReplicationBacklog();
     configure("mode", "ENFORCE");
     assertEquals(Set.of(2), service.getEligibleCandidates().get(GROUP));
-    tick(true);
+    round(8);
     verify(routeBalancer, times(3)).balanceDataRegionLeadersForReplicationBacklog();
     configure("mode", "OFF");
     assertTrue(service.getEligibleCandidates().isEmpty());
@@ -185,7 +204,7 @@ public class ReplicationBacklogServiceTest {
     assertFalse(service.getDiagnostics(7).get(2).isKnown());
     tick(true);
     verify(routeBalancer, times(4)).balanceDataRegionLeadersForReplicationBacklog();
-    for (int sequence = 5; sequence <= 8; sequence++) {
+    for (int sequence = 9; sequence <= 13; sequence++) {
       round(sequence);
     }
     assertEquals(Set.of(2), service.getEligibleCandidates().get(GROUP));
@@ -212,15 +231,59 @@ public class ReplicationBacklogServiceTest {
   }
 
   @Test
-  public void expiredSamplesDuringSolveDiscardTransfersAndScheduleRecomputation() throws Exception {
+  public void repeatedSelectionsDoNotAdvanceWarmupOrLowConfirmation() throws Exception {
+    configure("mode", "ENFORCE");
+    service.start();
+    for (int sequence = 1; sequence <= 3; sequence++) {
+      round(sequence);
+    }
+    for (int call = 0; call < 10; call++) {
+      assertTrue(service.getEligibleCandidates().isEmpty());
+      SelectionSnapshot snapshot = captureSelection();
+      assertTrue(service.validateSelection(snapshot));
+      invokeTick();
+    }
+    assertTrue(service.getDiagnostics(7).get(2).isHeavy());
+    round(4);
+    assertTrue(service.getDiagnostics(7).get(2).isHeavy());
+    round(5);
+    assertFalse(service.getDiagnostics(7).get(2).isHeavy());
+    assertEquals(Set.of(2), service.getEligibleCandidates().get(GROUP));
+  }
+
+  @Test
+  public void onlyMissingSamplingRoundsTurnAnEstablishedLightReplicaHeavy() throws Exception {
     prepareFilteredSelection();
+    double[] previous = service.getDiagnostics(7).get(2).getSmoothedCounts();
+    for (int round = 0; round < 2; round++) {
+      tick(false);
+      for (int call = 0; call < 10; call++) {
+        assertEquals(Set.of(2), service.getEligibleCandidates().get(GROUP));
+        SelectionSnapshot snapshot = captureSelection();
+        assertTrue(service.validateSelection(snapshot));
+        invokeTick();
+      }
+    }
+    tick(false);
+    assertTrue(service.getDiagnostics(7).get(2).isHeavy());
+    assertTrue(service.getEligibleCandidates().isEmpty());
+    assertEquals(previous[0], service.getDiagnostics(7).get(2).getSmoothedCounts()[0], 0);
+    // Missing rounds keep the estimate but do not count toward H -> L confirmation.
+    round(6);
+    round(7);
+    assertTrue(service.getDiagnostics(7).get(2).isHeavy());
+    round(8);
+    assertEquals(Set.of(2), service.getEligibleCandidates().get(GROUP));
+  }
+
+  @Test
+  public void missingRoundsDuringSolveDiscardTransfersAndScheduleRecomputation() throws Exception {
+    prepareFilteredSelection();
+    setField(service, "nextBalance", System.nanoTime() + TimeUnit.MINUTES.toNanos(1));
     runSelection(
         () -> {
-          Object cache = getField(service, "cache");
-          Object group = ((Map<?, ?>) getField(cache, "groups")).get(7);
-          // Advance the age of already accepted samples, without delivering an invalidating report.
-          for (Object source : (Object[]) getField(group, "sources")) {
-            setField(source, "sampledAt", System.nanoTime() - TimeUnit.SECONDS.toNanos(31));
+          for (int round = 0; round < 3; round++) {
+            tick(false);
           }
         });
     verify(loadManager, never()).forceUpdateConsensusGroupCache(anyMap());
@@ -229,6 +292,94 @@ public class ReplicationBacklogServiceTest {
     tick(true);
     assertFalse((boolean) getField(service, "pendingBalance"));
     verify(routeBalancer, times(2)).balanceDataRegionLeadersForReplicationBacklog();
+  }
+
+  @Test
+  public void blockedBalanceDoesNotBlockSamplingAndCoalescesFurtherChanges() throws Exception {
+    configure("sample_interval_ms", "50");
+    configure("balance_interval_ms", "50");
+    prepareFilteredSelection();
+    clearInvocations(routeBalancer);
+    ExecutorService balancing = Executors.newSingleThreadExecutor();
+    ScheduledExecutorService sampling = Executors.newSingleThreadScheduledExecutor();
+    CountDownLatch started = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    CountDownLatch completed = new CountDownLatch(1);
+    CountDownLatch missed = new CountDownLatch(1);
+    AtomicInteger solves = new AtomicInteger();
+    AtomicBoolean accepted = new AtomicBoolean(true);
+    AtomicReference<Throwable> failure = new AtomicReference<>();
+    doAnswer(
+            invocation -> {
+              solves.incrementAndGet();
+              SelectionSnapshot snapshot = captureSelection();
+              started.countDown();
+              try {
+                if (!release.await(10, TimeUnit.SECONDS)) {
+                  throw new AssertionError("Timed out waiting to finish the blocked solve");
+                }
+                accepted.set(service.validateSelection(snapshot));
+              } catch (Throwable e) {
+                failure.set(e);
+              } finally {
+                completed.countDown();
+              }
+              return null;
+            })
+        .when(routeBalancer)
+        .balanceDataRegionLeadersForReplicationBacklog();
+    ScheduledFuture<?> samplingTask = null;
+    try {
+      setField(service, "balanceExecutor", balancing);
+      setField(service, "pendingBalance", true);
+      setField(service, "nextBalance", System.nanoTime() - 1);
+      // This single scheduler invokes the production tick. It must continue while the separate
+      // balancing executor is blocked, rather than relying on recursive calls inside the solve.
+      samplingTask =
+          ScheduledExecutorUtil.safelyScheduleWithFixedDelay(
+              sampling,
+              () -> {
+                try {
+                  invokeTick();
+                  if (!started.await(5, TimeUnit.SECONDS)) {
+                    throw new AssertionError("The balance task did not start");
+                  }
+                  if (service.getDiagnostics(7).get(2).getMissingRounds() >= 3) {
+                    missed.countDown();
+                  }
+                } catch (Throwable e) {
+                  failure.set(e);
+                }
+              },
+              0,
+              10,
+              TimeUnit.MILLISECONDS);
+      assertTrue(started.await(5, TimeUnit.SECONDS));
+      assertTrue(missed.await(5, TimeUnit.SECONDS));
+      assertEquals(1, solves.get());
+      assertTrue(service.getDiagnostics(7).get(2).isHeavy());
+      assertTrue(service.getEligibleCandidates().isEmpty());
+      assertTrue((boolean) getField(service, "pendingBalance"));
+      samplingTask.cancel(false);
+      sampling.submit(() -> {}).get(5, TimeUnit.SECONDS);
+      release.countDown();
+      assertTrue(completed.await(5, TimeUnit.SECONDS));
+      balancing.submit(() -> {}).get(5, TimeUnit.SECONDS);
+      assertFalse(accepted.get());
+      assertFalse((boolean) getField(service, "balanceInProgress"));
+      if (failure.get() != null) {
+        throw new AssertionError(failure.get());
+      }
+    } finally {
+      if (samplingTask != null) {
+        samplingTask.cancel(false);
+      }
+      release.countDown();
+      sampling.shutdownNow();
+      balancing.shutdownNow();
+      assertTrue(sampling.awaitTermination(5, TimeUnit.SECONDS));
+      assertTrue(balancing.awaitTermination(5, TimeUnit.SECONDS));
+    }
   }
 
   @Test
@@ -278,7 +429,7 @@ public class ReplicationBacklogServiceTest {
     runSelection(
         () -> {
           for (int source : new int[] {1, 2, 3}) {
-            cache(source, 5, service.getEpoch());
+            cache(source, 6, service.getEpoch());
           }
         });
     verify(loadManager)
@@ -290,32 +441,27 @@ public class ReplicationBacklogServiceTest {
   private void prepareFilteredSelection() throws Exception {
     configure("mode", "ENFORCE");
     service.start();
-    for (int sequence = 1; sequence <= 4; sequence++) {
+    for (int sequence = 1; sequence <= 5; sequence++) {
       round(sequence);
     }
     assertEquals(Set.of(2), service.getEligibleCandidates().get(GROUP));
   }
 
   @Test
-  public void recoveryGateReachesRealSolverBeforeFreshBacklogArrives() throws Exception {
+  public void recoveryResetsToHeavyBeforeTheImmediateSolveAndRepeatsWarmup() throws Exception {
     prepareFilteredSelection();
     loadCache.getCurrentDataNodeStatisticsMap().put(2, new NodeStatistics(NodeStatus.Unknown));
     service.getEligibleCandidates();
     loadCache.getCurrentDataNodeStatisticsMap().put(2, new NodeStatistics(NodeStatus.Running));
-    // The immediate health-triggered solve must already exclude replica 2, before a sampling tick.
-    assertEquals(Set.of(1, 3), service.getEligibleCandidates().get(GROUP));
-    runSelection(Set.of(1, 3), 2, () -> {});
-    verify(loadManager)
-        .forceUpdateConsensusGroupCache(
-            argThat(
-                updates ->
-                    updates.size() == 1
-                        && Set.of(1, 3).contains(updates.get(GROUP).getLeaderId())));
-    for (int seq = 5; seq <= 6; seq++) {
+    // All replicas are now H, so availability takes priority and CFS may use any Running member.
+    assertTrue(service.getEligibleCandidates().isEmpty());
+    assertTrue(service.getDiagnostics(7).get(2).isHeavy());
+    runSelection(Set.of(1, 2, 3), 2, () -> {});
+    for (int seq = 6; seq <= 9; seq++) {
       round(seq);
-      assertEquals(Set.of(1, 3), service.getEligibleCandidates().get(GROUP));
+      assertTrue(service.getDiagnostics(7).get(2).isHeavy());
     }
-    round(7);
+    round(10);
     assertEquals(Set.of(2), service.getEligibleCandidates().get(GROUP));
     runSelection(() -> {});
     verify(loadManager)
@@ -325,6 +471,13 @@ public class ReplicationBacklogServiceTest {
 
   private void runSelection(CheckedAction duringSolve) throws Exception {
     runSelection(Set.of(2), 1, duringSolve);
+  }
+
+  private SelectionSnapshot captureSelection() {
+    return service.captureSelection(
+        loadCache.getCurrentRegionLocationMap(TConsensusGroupType.DataRegion),
+        loadCache.getCurrentDataNodeStatisticsMap(),
+        loadCache.getCurrentRegionStatisticsMap(TConsensusGroupType.DataRegion));
   }
 
   private void runSelection(Set<Integer> expectedCandidates, int leader, CheckedAction duringSolve)
@@ -344,16 +497,21 @@ public class ReplicationBacklogServiceTest {
         "leaderBalancer",
         new CostFlowSelectionLeaderBalancer() {
           @Override
-          public Map<TConsensusGroupId, Integer> generateOptimalLeaderDistribution(
+          public Map<TConsensusGroupId, Integer> generateOptimalLeaderDistributionWithBacklog(
               Map<String, List<TConsensusGroupId>> databases,
               Map<TConsensusGroupId, Set<Integer>> locations,
               Map<TConsensusGroupId, Integer> leaders,
               Map<Integer, NodeStatistics> nodes,
               Map<TConsensusGroupId, Map<Integer, RegionStatistics>> regions,
               Map<TConsensusGroupId, Set<Integer>> candidates) {
-            assertEquals(expectedCandidates, candidates.get(GROUP));
+            assertEquals(
+                expectedCandidates,
+                candidates.getOrDefault(
+                    GROUP,
+                    CostFlowSelectionLeaderBalancer.getRunningCandidates(locations, nodes, regions)
+                        .get(GROUP)));
             Map<TConsensusGroupId, Integer> result =
-                super.generateOptimalLeaderDistribution(
+                super.generateOptimalLeaderDistributionWithBacklog(
                     databases, locations, leaders, nodes, regions, candidates);
             assertTrue(expectedCandidates.contains(result.get(GROUP)));
             solved.set(true);
@@ -434,6 +592,10 @@ public class ReplicationBacklogServiceTest {
     if (balanceDue) {
       setField(service, "nextBalance", System.nanoTime() - 1);
     }
+    invokeTick();
+  }
+
+  private void invokeTick() throws Exception {
     Method method = ReplicationBacklogService.class.getDeclaredMethod("tick");
     method.setAccessible(true);
     method.invoke(service);

@@ -20,6 +20,8 @@
 package org.apache.iotdb.confignode.manager.load.balancer.router.leader;
 
 import org.apache.iotdb.common.rpc.thrift.TConsensusGroupId;
+import org.apache.iotdb.commons.cluster.NodeStatus;
+import org.apache.iotdb.commons.cluster.RegionStatus;
 import org.apache.iotdb.commons.utils.TestOnly;
 import org.apache.iotdb.confignode.manager.load.cache.node.NodeStatistics;
 import org.apache.iotdb.confignode.manager.load.cache.region.RegionStatistics;
@@ -27,6 +29,7 @@ import org.apache.iotdb.confignode.manager.load.cache.region.RegionStatistics;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -91,7 +94,7 @@ public class CostFlowSelectionLeaderBalancer extends AbstractLeaderBalancer {
       Map<TConsensusGroupId, Integer> regionLeaderMap,
       Map<Integer, NodeStatistics> dataNodeStatisticsMap,
       Map<TConsensusGroupId, Map<Integer, RegionStatistics>> regionStatisticsMap) {
-    return generateOptimalLeaderDistribution(
+    return generateOptimalLeaderDistributionWithBacklog(
         databaseRegionGroupMap,
         regionLocationMap,
         regionLeaderMap,
@@ -100,7 +103,7 @@ public class CostFlowSelectionLeaderBalancer extends AbstractLeaderBalancer {
         Collections.emptyMap());
   }
 
-  public Map<TConsensusGroupId, Integer> generateOptimalLeaderDistribution(
+  public Map<TConsensusGroupId, Integer> generateOptimalLeaderDistributionWithBacklog(
       Map<String, List<TConsensusGroupId>> databaseRegionGroupMap,
       Map<TConsensusGroupId, Set<Integer>> regionLocationMap,
       Map<TConsensusGroupId, Integer> regionLeaderMap,
@@ -113,12 +116,49 @@ public class CostFlowSelectionLeaderBalancer extends AbstractLeaderBalancer {
         regionLeaderMap,
         dataNodeStatisticsMap,
         regionStatisticsMap);
-    this.eligibleCandidates = eligibleCandidates;
+    this.eligibleCandidates =
+        getRunningCandidates(regionLocationMap, dataNodeStatisticsMap, regionStatisticsMap);
+    this.eligibleCandidates.forEach(
+        (group, running) -> {
+          Set<Integer> preferred = eligibleCandidates.get(group);
+          if (preferred != null && !Collections.disjoint(running, preferred)) {
+            running.retainAll(preferred);
+          }
+        });
     Map<TConsensusGroupId, Integer> result;
     constructFlowNetwork();
     dinicAlgorithm();
     result = collectLeaderDistribution();
     clear();
+    return result;
+  }
+
+  /**
+   * Determine availability before consulting load. The sampling service uses the same rule when
+   * maintaining stable load classifications between full CFS solves.
+   */
+  public static Map<TConsensusGroupId, Set<Integer>> getRunningCandidates(
+      Map<TConsensusGroupId, Set<Integer>> locations,
+      Map<Integer, NodeStatistics> nodes,
+      Map<TConsensusGroupId, Map<Integer, RegionStatistics>> regions) {
+    Map<TConsensusGroupId, Set<Integer>> result = new TreeMap<>();
+    locations.forEach(
+        (group, members) -> {
+          Set<Integer> running = new HashSet<>();
+          Map<Integer, RegionStatistics> replicas =
+              regions.getOrDefault(group, Collections.emptyMap());
+          for (int node : members) {
+            NodeStatistics nodeStatistics = nodes.get(node);
+            RegionStatistics regionStatistics = replicas.get(node);
+            if (nodeStatistics != null
+                && nodeStatistics.getStatus() == NodeStatus.Running
+                && regionStatistics != null
+                && regionStatistics.getRegionStatus() == RegionStatus.Running) {
+              running.add(node);
+            }
+          }
+          result.put(group, running);
+        });
     return result;
   }
 
@@ -198,9 +238,7 @@ public class CostFlowSelectionLeaderBalancer extends AbstractLeaderBalancer {
               .get(regionGroupId)
               .forEach(
                   dataNodeId -> {
-                    if (isDataNodeAvailable(dataNodeId)
-                        && isRegionAvailable(regionGroupId, dataNodeId)
-                        && isBacklogEligible(regionGroupId, dataNodeId)) {
+                    if (eligibleCandidates.get(regionGroupId).contains(dataNodeId)) {
                       int sDVertex = sDVertexMap.get(database).get(dataNodeId);
                       // Capacity: 1, Cost: 0 if the DataNode is the current leader of the
                       // RegionGroup;
@@ -266,22 +304,6 @@ public class CostFlowSelectionLeaderBalancer extends AbstractLeaderBalancer {
   private void addAdjacentEdges(int fromVertex, int destVertex, int capacity, int cost) {
     addEdge(fromVertex, destVertex, capacity, cost);
     addEdge(destVertex, fromVertex, 0, -cost);
-  }
-
-  private boolean isBacklogEligible(TConsensusGroupId groupId, int nodeId) {
-    Set<Integer> candidates = eligibleCandidates.get(groupId);
-    if (candidates == null || candidates.isEmpty()) {
-      return true;
-    }
-    // Availability may change after a telemetry snapshot. Never exclude the last usable replica.
-    boolean anyAvailable =
-        candidates.stream()
-            .anyMatch(
-                id ->
-                    regionLocationMap.get(groupId).contains(id)
-                        && isDataNodeAvailable(id)
-                        && isRegionAvailable(groupId, id));
-    return !anyAvailable || candidates.contains(nodeId);
   }
 
   private void addEdge(int fromVertex, int destVertex, int capacity, int cost) {

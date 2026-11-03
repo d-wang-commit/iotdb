@@ -20,11 +20,8 @@ package org.apache.iotdb.confignode.manager.load.cache;
 
 import org.apache.iotdb.common.rpc.thrift.TConsensusGroupId;
 import org.apache.iotdb.common.rpc.thrift.TConsensusGroupType;
-import org.apache.iotdb.commons.cluster.NodeStatus;
-import org.apache.iotdb.commons.cluster.RegionStatus;
 import org.apache.iotdb.confignode.conf.ReplicationBacklogConfig;
-import org.apache.iotdb.confignode.manager.load.cache.node.NodeStatistics;
-import org.apache.iotdb.confignode.manager.load.cache.region.RegionStatistics;
+import org.apache.iotdb.confignode.manager.load.cache.ReplicationBacklogCache.ReplicaDiagnostic;
 import org.apache.iotdb.mpp.rpc.thrift.TRegionReplicationBacklog;
 import org.apache.iotdb.mpp.rpc.thrift.TReplicationBacklogEdge;
 import org.apache.iotdb.mpp.rpc.thrift.TReplicationBacklogReport;
@@ -34,8 +31,7 @@ import org.junit.Test;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -48,37 +44,33 @@ import static org.junit.Assert.assertTrue;
 public class ReplicationBacklogCacheTest {
   private static final TConsensusGroupId GROUP =
       new TConsensusGroupId(TConsensusGroupType.DataRegion, 7);
-  private static final Set<Integer> MEMBERS = new HashSet<>(Arrays.asList(1, 2, 3));
+  private static final Set<Integer> MEMBERS = Set.of(1, 2, 3);
+  private static final Map<TConsensusGroupId, Set<Integer>> RUNNING =
+      Collections.singletonMap(GROUP, MEMBERS);
   private static final long SECOND = TimeUnit.SECONDS.toNanos(1);
+  private static final long[] BACKLOG = {30, 5, 20};
 
-  private static ReplicationBacklogConfig config(String mode) throws Exception {
+  private static ReplicationBacklogConfig config(String mode, int rounds) throws Exception {
     Properties properties = new Properties();
     properties.setProperty(ReplicationBacklogConfig.PREFIX + "mode", mode);
+    properties.setProperty(
+        ReplicationBacklogConfig.PREFIX + "confirmation_rounds", Integer.toString(rounds));
     for (String type : Arrays.asList("request", "tablet", "file", "deletion")) {
       properties.setProperty(ReplicationBacklogConfig.PREFIX + type + "_gap", "10");
     }
     return ReplicationBacklogConfig.load(properties, ReplicationBacklogConfig.defaults());
   }
 
-  private static Map<Integer, NodeStatistics> nodes(Set<Integer> members) {
-    Map<Integer, NodeStatistics> result = new HashMap<>();
-    members.forEach(id -> result.put(id, new NodeStatistics(NodeStatus.Running)));
-    return result;
-  }
-
-  private static Map<TConsensusGroupId, Map<Integer, RegionStatistics>> regions(
-      Set<Integer> members) {
-    Map<Integer, RegionStatistics> result = new HashMap<>();
-    members.forEach(id -> result.put(id, new RegionStatistics(RegionStatus.Running)));
-    return Collections.singletonMap(GROUP, result);
-  }
-
-  private static ReplicationBacklogCache cache(String mode) throws Exception {
+  private static ReplicationBacklogCache cache(String mode, int rounds) throws Exception {
     ReplicationBacklogCache cache = new ReplicationBacklogCache();
-    cache.configure(config(mode));
-    cache.updateTopology(
-        Collections.singletonMap(GROUP, MEMBERS), nodes(MEMBERS), regions(MEMBERS), 0);
+    cache.configure(config(mode, rounds));
+    cache.updateTopology(RUNNING, 0);
+    cache.evaluate(RUNNING, 0);
     return cache;
+  }
+
+  private static ReplicationBacklogCache cache() throws Exception {
+    return cache("ENFORCE", 3);
   }
 
   private static TReplicationBacklogEdge edge(
@@ -109,556 +101,604 @@ public class ReplicationBacklogCacheTest {
                     .setTargets(Arrays.asList(edges))));
   }
 
-  private static TReplicationBacklogReport v1(int source, long sequence) {
-    if (source == 1) {
-      return report(source, sequence, (byte) 1, edge(2, 5, 0, 0, 0), edge(3, 10, 0, 0, 0));
-    }
-    if (source == 2) {
-      return report(source, sequence, (byte) 1, edge(1, 30, 0, 0, 0), edge(3, 10, 0, 0, 0));
-    }
-    return report(source, sequence, (byte) 1, edge(1, 0, 0, 0, 0), edge(2, 0, 0, 0, 0));
-  }
-
-  private static void round(ReplicationBacklogCache cache, int seq) {
-    long time = seq * 5 * SECOND;
-    for (int source : MEMBERS) {
-      cache.cacheReport(source, v1(source, seq), time, cache.getEpoch(), time);
-    }
-    cache.evaluate(time);
-  }
-
-  @Test
-  public void recoveredLightReplicaWaitsForThreeNewCompleteRounds() throws Exception {
-    ReplicationBacklogCache cache = warmedCache();
-    recover(cache, 2);
-    assertEquals(Set.of(1, 3), cache.eligibleCandidates(22 * SECOND).get(GROUP));
-    assertTrue(cache.getDiagnostics(7, 22 * SECOND).get(2).isAdmissionPending());
-    assertFalse(cache.getDiagnostics(7, 22 * SECOND).get(1).isAdmissionPending());
-    ReplicationBacklogCache.SelectionSnapshot pending = cache.captureSelection(22 * SECOND);
-    assertTrue(cache.isSelectionValid(pending, 22 * SECOND));
-    for (int seq = 5; seq <= 6; seq++) {
-      round(cache, seq);
-      // Neither repeated evaluations nor duplicate reports provide another confirmation.
-      for (int i = 0; i < 10; i++) {
-        round(cache, seq);
-      }
-      assertEquals(Set.of(1, 3), cache.eligibleCandidates(seq * 5 * SECOND).get(GROUP));
-    }
-    round(cache, 7);
-    assertFalse(cache.getDiagnostics(7, 35 * SECOND).get(2).isAdmissionPending());
-    assertEquals(Set.of(2), cache.eligibleCandidates(35 * SECOND).get(GROUP));
-    assertFalse(cache.isSelectionValid(pending, 35 * SECOND));
-  }
-
-  @Test
-  public void confirmingHeavyRecoveryDoesNotAdmitIt() throws Exception {
-    ReplicationBacklogCache cache = warmedCache();
-    recover(cache, 1);
-    assertEquals(Set.of(2, 3), cache.eligibleCandidates(22 * SECOND).get(GROUP));
-    for (int seq = 5; seq <= 7; seq++) {
-      round(cache, seq);
-    }
-    assertFalse(cache.getDiagnostics(7, 35 * SECOND).get(1).isAdmissionPending());
-    assertTrue(cache.getDiagnostics(7, 35 * SECOND).get(1).isHeavy());
-    assertEquals(Set.of(2), cache.eligibleCandidates(35 * SECOND).get(GROUP));
-  }
-
-  @Test
-  public void missingOrExpiredTelemetryDoesNotOpenRecoveryGate() throws Exception {
-    ReplicationBacklogCache cache = warmedCache();
-    recover(cache, 2);
-    round(cache, 5);
-    // One invalid source breaks confirmation; it must not readmit the recovering replica.
-    cache.cacheReport(3, null, 26 * SECOND, cache.getEpoch(), 26 * SECOND);
-    cache.evaluate(26 * SECOND);
-    assertEquals(Set.of(1, 3), cache.eligibleCandidates(26 * SECOND).get(GROUP));
-    ReplicationBacklogCache.SelectionSnapshot pending = cache.captureSelection(26 * SECOND);
-    assertTrue(cache.isSelectionValid(pending, 26 * SECOND));
-    cache.evaluate(60 * SECOND);
-    assertEquals(Set.of(1, 3), cache.eligibleCandidates(60 * SECOND).get(GROUP));
-    assertTrue(cache.isSelectionValid(pending, 60 * SECOND));
-    // Source reinitialization establishes a baseline, then three new rounds are required.
-    for (int seq = 13; seq <= 15; seq++) {
-      round(cache, seq);
-      assertTrue(cache.getDiagnostics(7, seq * 5 * SECOND).get(2).isAdmissionPending());
-    }
-    round(cache, 16);
-    assertFalse(cache.getDiagnostics(7, 80 * SECOND).get(2).isAdmissionPending());
-  }
-
-  @Test
-  public void delayedPreRecoverySamplesCannotConfirmAdmission() throws Exception {
-    ReplicationBacklogCache cache = warmedCache();
-    recover(cache, 2);
-    for (int seq = 5; seq <= 7; seq++) {
-      long now = seq * 5 * SECOND;
-      for (int source : MEMBERS) {
-        cache.cacheReport(
-            source,
-            v1(source, seq).setSampleAgeNanos(now - 20 * SECOND),
-            now,
-            cache.getEpoch(),
-            now);
-      }
-      cache.evaluate(now);
-      assertTrue(cache.getDiagnostics(7, now).get(2).isAdmissionPending());
-      assertEquals(Set.of(1, 3), cache.eligibleCandidates(now).get(GROUP));
-    }
-    for (int seq = 8; seq <= 10; seq++) {
-      round(cache, seq);
-      assertEquals(seq < 10, cache.getDiagnostics(7, seq * 5 * SECOND).get(2).isAdmissionPending());
-    }
-  }
-
-  @Test
-  public void restartIdentityClosesAdmissionWithoutAnOfflineHeartbeat() throws Exception {
-    ReplicationBacklogCache cache = warmedCache();
-    TReplicationBacklogReport restarted = v1(2, 1).setSourceInstanceId("restarted");
-    cache.cacheReport(2, restarted, 25 * SECOND, cache.getEpoch(), 25 * SECOND);
-    assertTrue(cache.getDiagnostics(7, 25 * SECOND).get(2).isAdmissionPending());
-    assertEquals(Set.of(1, 3), cache.eligibleCandidates(25 * SECOND).get(GROUP));
-    // A delayed response from the previous process must not reopen or replace the new instance.
-    cache.cacheReport(2, v1(2, 100), 24 * SECOND, cache.getEpoch(), 26 * SECOND);
-    assertEquals(Set.of(1, 3), cache.eligibleCandidates(26 * SECOND).get(GROUP));
-    for (int seq = 6; seq <= 8; seq++) {
-      long now = seq * 5 * SECOND;
-      for (int source : MEMBERS) {
-        TReplicationBacklogReport sample = v1(source, seq);
-        if (source == 2) {
-          sample.setSourceInstanceId("restarted");
-        }
-        cache.cacheReport(source, sample, now, cache.getEpoch(), now);
-      }
-      cache.evaluate(now);
-      assertEquals(seq < 8, cache.getDiagnostics(7, now).get(2).isAdmissionPending());
-    }
-  }
-
-  @Test
-  public void v2PipeRecreationPreservesHealthyAdmissionDuringPeerRecovery() throws Exception {
-    ReplicationBacklogCache cache = cache("ENFORCE");
-    for (int seq = 1; seq <= 7; seq++) {
-      if (seq == 5) {
-        recover(cache, 2);
-      }
-      long now = seq * 5 * SECOND;
-      for (int source : MEMBERS) {
-        ArrayList<TReplicationBacklogEdge> edges = new ArrayList<>();
-        for (int target : MEMBERS) {
-          if (source != target) {
-            edges.add(
-                edge(target, 0, 0, 0, 0)
-                    .setGeneration(source == 1 && target == 2 && seq >= 5 ? 2 : 1));
-          }
-        }
-        cache.cacheReport(
-            source,
-            report(source, seq, (byte) 2, edges.toArray(new TReplicationBacklogEdge[0])),
-            now,
-            cache.getEpoch(),
-            now);
-      }
-      cache.evaluate(now);
-      if (seq == 5 || seq == 6) {
-        assertFalse(cache.getDiagnostics(7, now).get(1).isAdmissionPending());
-        assertTrue(cache.getDiagnostics(7, now).get(2).isAdmissionPending());
-        assertEquals(Set.of(1, 3), cache.eligibleCandidates(now).get(GROUP));
+  private static TReplicationBacklogReport v1(int source, int sequence, long[] incoming) {
+    List<TReplicationBacklogEdge> edges = new ArrayList<>();
+    for (int target = 1; target <= 3; target++) {
+      if (target != source) {
+        // Put the target's load on one incoming edge; the other edge explicitly reports zero.
+        int producer = target == 1 ? 2 : 1;
+        edges.add(edge(target, source == producer ? incoming[target - 1] : 0, 0, 0, 0));
       }
     }
-    assertFalse(cache.getDiagnostics(7, 35 * SECOND).get(2).isAdmissionPending());
-    assertTrue(cache.eligibleCandidates(35 * SECOND).isEmpty());
+    return report(source, sequence, (byte) 1, edges.toArray(new TReplicationBacklogEdge[0]));
   }
 
-  @Test
-  public void regionRecoveryOnRunningNodeClosesAdmission() throws Exception {
-    ReplicationBacklogCache cache = warmedCache();
-    Map<TConsensusGroupId, Map<Integer, RegionStatistics>> health = regions(MEMBERS);
-    health.get(GROUP).put(2, new RegionStatistics(RegionStatus.Unknown));
-    cache.updateTopology(
-        Collections.singletonMap(GROUP, MEMBERS), nodes(MEMBERS), health, 21 * SECOND);
-    cache.updateTopology(
-        Collections.singletonMap(GROUP, MEMBERS), nodes(MEMBERS), regions(MEMBERS), 22 * SECOND);
-    assertEquals(Set.of(1, 3), cache.eligibleCandidates(22 * SECOND).get(GROUP));
-    assertTrue(cache.getDiagnostics(7, 22 * SECOND).get(2).isAdmissionPending());
+  private static void send(
+      ReplicationBacklogCache cache, int source, TReplicationBacklogReport report, long now) {
+    cache.cacheReport(source, report, now, cache.getEpoch(), now);
   }
 
-  @Test
-  public void newLocalRegionGenerationClosesAdmissionWithoutHealthChange() throws Exception {
-    ReplicationBacklogCache cache = warmedCache();
-    TReplicationBacklogReport sample = v1(2, 5);
-    sample.getGroups().get(0).setGeneration(2);
-    cache.cacheReport(2, sample, 25 * SECOND, cache.getEpoch(), 25 * SECOND);
-    assertEquals(Set.of(1, 3), cache.eligibleCandidates(25 * SECOND).get(GROUP));
-    assertTrue(cache.getDiagnostics(7, 25 * SECOND).get(2).isAdmissionPending());
+  private static void sample(
+      ReplicationBacklogCache cache,
+      int sequence,
+      long[] incoming,
+      Map<TConsensusGroupId, Set<Integer>> running) {
+    long now = sequence * 5 * SECOND;
+    for (int source = 1; source <= 3; source++) {
+      send(cache, source, v1(source, sequence, incoming), now);
+    }
+    cache.evaluate(running, now);
+    cache.advanceSamplingRound(sequence);
+    cache.evaluate(running, now);
   }
 
-  @Test
-  public void membershipChangeKeepsExistingAdmissionButGatesNewReplica() throws Exception {
-    ReplicationBacklogCache cache = warmedCache();
-    Set<Integer> members = Set.of(1, 2, 4);
-    cache.updateTopology(
-        Collections.singletonMap(GROUP, members), nodes(members), regions(members), 21 * SECOND);
-    assertEquals(Set.of(1, 2), cache.eligibleCandidates(21 * SECOND).get(GROUP));
-    assertTrue(cache.getDiagnostics(7, 21 * SECOND).get(4).isAdmissionPending());
-    assertFalse(cache.getDiagnostics(7, 21 * SECOND).get(1).isAdmissionPending());
-  }
-
-  @Test
-  public void availabilityFallbackRequiresNoConfirmedAvailableReplica() throws Exception {
-    ReplicationBacklogCache cache = warmedCache();
-    recover(cache, 2);
-    Map<Integer, NodeStatistics> health = nodes(MEMBERS);
-    health.put(1, new NodeStatistics(NodeStatus.Unknown));
-    cache.updateTopology(
-        Collections.singletonMap(GROUP, MEMBERS), health, regions(MEMBERS), 23 * SECOND);
-    assertEquals(Set.of(3), cache.eligibleCandidates(23 * SECOND).get(GROUP));
-    health.put(3, new NodeStatistics(NodeStatus.Unknown));
-    cache.updateTopology(
-        Collections.singletonMap(GROUP, MEMBERS), health, regions(MEMBERS), 24 * SECOND);
-    assertTrue(cache.eligibleCandidates(24 * SECOND).isEmpty());
-    assertTrue(cache.getDiagnostics(7, 24 * SECOND).get(2).isAdmissionPending());
-    // Bootstrap likewise cannot wait for an already confirmed replica that does not exist yet.
-    assertTrue(cache("ENFORCE").eligibleCandidates(0).isEmpty());
-  }
-
-  @Test
-  public void observeAndOffDoNotEnforceRecoveryGate() throws Exception {
-    ReplicationBacklogCache cache = warmedCache();
-    recover(cache, 2);
-    cache.configure(config("OBSERVE"));
-    assertTrue(cache.getDiagnostics(7, 22 * SECOND).get(2).isAdmissionPending());
-    assertTrue(cache.eligibleCandidates(22 * SECOND).isEmpty());
-    cache.configure(config("ENFORCE"));
-    assertEquals(Set.of(1, 3), cache.eligibleCandidates(22 * SECOND).get(GROUP));
-    cache.configure(config("OFF"));
-    assertTrue(cache.eligibleCandidates(22 * SECOND).isEmpty());
+  private static void sample(ReplicationBacklogCache cache, int sequence) {
+    sample(cache, sequence, BACKLOG, RUNNING);
   }
 
   private static ReplicationBacklogCache warmedCache() throws Exception {
-    ReplicationBacklogCache cache = cache("ENFORCE");
-    for (int seq = 1; seq <= 4; seq++) {
-      round(cache, seq);
+    ReplicationBacklogCache cache = cache();
+    for (int sequence = 1; sequence <= 5; sequence++) {
+      sample(cache, sequence);
     }
     return cache;
   }
 
-  private static void recover(ReplicationBacklogCache cache, int node) {
-    Map<Integer, NodeStatistics> health = nodes(MEMBERS);
-    health.put(node, new NodeStatistics(NodeStatus.Unknown));
-    cache.updateTopology(
-        Collections.singletonMap(GROUP, MEMBERS), health, regions(MEMBERS), 21 * SECOND);
-    cache.updateTopology(
-        Collections.singletonMap(GROUP, MEMBERS), nodes(MEMBERS), regions(MEMBERS), 22 * SECOND);
+  private static ReplicaDiagnostic diagnostic(ReplicationBacklogCache cache, int target) {
+    return cache.getDiagnostics(7, 0).get(target);
   }
 
   @Test
-  public void multiSourceIncomingAggregationAndObserveMode() throws Exception {
-    ReplicationBacklogCache cache = cache("OBSERVE");
-    for (int i = 1; i <= 4; i++) {
-      round(cache, i);
+  public void threeWarmupSamplesAndThreeLightVotesRequireFiveRealObservations() throws Exception {
+    ReplicationBacklogCache cache = cache();
+    for (int sequence = 1; sequence <= 5; sequence++) {
+      sample(cache, sequence);
+      assertEquals(Math.min(sequence, 3), diagnostic(cache, 2).getWarmupSamples());
+      assertEquals(Math.max(0, sequence - 2), diagnostic(cache, 2).getLightStreak());
+      assertEquals(sequence < 5, diagnostic(cache, 2).isHeavy());
+      if (sequence < 5) {
+        assertTrue(cache.eligibleCandidates(0).isEmpty());
+      }
     }
-    Map<Integer, ReplicationBacklogCache.ReplicaDiagnostic> diagnostics =
-        cache.getDiagnostics(7, 20 * SECOND);
-    assertTrue(diagnostics.get(1).isKnown());
-    assertEquals(30, diagnostics.get(1).getCounts()[0], 0);
-    assertEquals(5, diagnostics.get(2).getCounts()[0], 0);
-    assertEquals(20, diagnostics.get(3).getCounts()[0], 0);
-    assertTrue(diagnostics.get(1).isHeavy());
-    assertFalse(diagnostics.get(2).isHeavy());
-    assertTrue(diagnostics.get(3).isHeavy());
-    assertTrue(cache.eligibleCandidates(20 * SECOND).isEmpty());
-    cache.configure(config("ENFORCE"));
-    assertEquals(Collections.singleton(2), cache.eligibleCandidates(20 * SECOND).get(GROUP));
+    assertEquals(Set.of(2), cache.eligibleCandidates(0).get(GROUP));
+    assertTrue(diagnostic(cache, 1).isHeavy());
+    assertTrue(diagnostic(cache, 1).isInstantHeavy());
+    assertFalse(diagnostic(cache, 2).isInstantHeavy());
+    assertTrue(diagnostic(cache, 3).isHeavy());
   }
 
   @Test
-  public void repeatedTicksAreNotNewObservations() throws Exception {
-    ReplicationBacklogCache cache = cache("ENFORCE");
-    round(cache, 1);
-    round(cache, 2);
+  public void oneLightVoteStillRequiresThreeWarmupSamples() throws Exception {
+    ReplicationBacklogCache cache = cache("ENFORCE", 1);
+    sample(cache, 1);
+    sample(cache, 2);
+    assertTrue(cache.eligibleCandidates(0).isEmpty());
+    sample(cache, 3);
+    assertEquals(Set.of(2), cache.eligibleCandidates(0).get(GROUP));
+  }
+
+  @Test
+  public void everyRealObservationIsClassifiedEvenWithoutScheduledEvaluation() throws Exception {
+    ReplicationBacklogCache cache = cache();
+    for (int sequence = 1; sequence <= 5; sequence++) {
+      for (int source = 1; source <= 3; source++) {
+        send(cache, source, v1(source, sequence, BACKLOG), sequence * 5 * SECOND);
+      }
+    }
+    assertEquals(Set.of(2), cache.eligibleCandidates(0).get(GROUP));
+    assertEquals(3, diagnostic(cache, 2).getLightStreak());
+  }
+
+  @Test
+  public void anIntermediateHeavyObservationBreaksLightConfirmationWithoutEvaluation()
+      throws Exception {
+    ReplicationBacklogCache cache = cache();
+    for (int sequence = 1; sequence <= 4; sequence++) {
+      sample(cache, sequence, new long[] {10, 10, 10}, RUNNING);
+    }
+    assertEquals(2, diagnostic(cache, 1).getLightStreak());
+    // The first new observation is H; the next two return to similar loads. No evaluate() occurs
+    // between them, so a version difference alone could incorrectly count all three as light votes.
+    for (int sequence = 5; sequence <= 7; sequence++) {
+      long[] incoming = sequence == 5 ? new long[] {1000, 10, 10} : new long[] {0, 1000, 1000};
+      for (int source = 1; source <= 3; source++) {
+        send(cache, source, v1(source, sequence, incoming), sequence * 5 * SECOND);
+      }
+    }
+    assertTrue(diagnostic(cache, 1).isHeavy());
+    assertEquals(2, diagnostic(cache, 1).getLightStreak());
+    sample(cache, 8, new long[] {0, 1000, 1000}, RUNNING);
+    assertFalse(diagnostic(cache, 1).isHeavy());
+  }
+
+  @Test
+  public void repeatedReportsAndQueriesCannotAdvanceWarmupOrConfirmation() throws Exception {
+    ReplicationBacklogCache cache = cache();
+    sample(cache, 1);
     for (int i = 0; i < 20; i++) {
-      cache.evaluate(11 * SECOND);
+      for (int source = 1; source <= 3; source++) {
+        send(cache, source, v1(source, 1, BACKLOG), 5 * SECOND + i + 1);
+      }
+      cache.evaluate(RUNNING, 6 * SECOND);
+      cache.captureSelection(6 * SECOND);
+      cache.advanceSamplingRound(1);
     }
-    assertTrue(cache.eligibleCandidates(11 * SECOND).isEmpty());
-    round(cache, 3);
-    assertTrue(cache.eligibleCandidates(15 * SECOND).isEmpty());
-    round(cache, 4);
-    assertEquals(Collections.singleton(2), cache.eligibleCandidates(20 * SECOND).get(GROUP));
+    assertEquals(1, diagnostic(cache, 2).getWarmupSamples());
+    assertEquals(0, diagnostic(cache, 2).getLightStreak());
+    sample(cache, 2);
+    sample(cache, 3);
+    for (int i = 0; i < 20; i++) {
+      cache.evaluate(RUNNING, 16 * SECOND);
+      cache.eligibleCandidates(16 * SECOND);
+      cache.captureSelection(16 * SECOND);
+    }
+    assertEquals(1, diagnostic(cache, 2).getLightStreak());
+    assertTrue(diagnostic(cache, 2).isHeavy());
+    sample(cache, 4);
+    sample(cache, 5);
+    assertFalse(diagnostic(cache, 2).isHeavy());
   }
 
   @Test
-  public void missingAndDuplicateSamplesHoldButNeverRefreshExpiry() throws Exception {
-    ReplicationBacklogCache cache = cache("ENFORCE");
-    for (int i = 1; i <= 4; i++) {
-      round(cache, i);
+  public void missingReportsKeepEwmaButThreeSamplingRoundsRestoreHeavy() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    double ewma = diagnostic(cache, 2).getSmoothedCounts()[0];
+    for (int round = 6; round <= 8; round++) {
+      cache.advanceSamplingRound(round);
+      for (int i = 0; i < 10; i++) {
+        cache.evaluate(RUNNING, 100 * SECOND);
+        cache.captureSelection(100 * SECOND);
+        cache.advanceSamplingRound(round);
+      }
+      assertEquals(round - 5, diagnostic(cache, 2).getMissingRounds());
+      assertEquals(round == 8, diagnostic(cache, 2).isHeavy());
+      assertEquals(ewma, diagnostic(cache, 2).getSmoothedCounts()[0], 0);
     }
-    for (int sequence = 5; sequence <= 9; sequence++) {
+    assertTrue(cache.eligibleCandidates(0).isEmpty());
+    assertEquals(0, diagnostic(cache, 2).getLightStreak());
+    assertFalse(diagnostic(cache, 2).isKnown());
+    for (int sequence = 9; sequence <= 11; sequence++) {
+      sample(cache, sequence);
+      // Missing samples do not trigger another N-sample warmup.
+      assertEquals(3, diagnostic(cache, 2).getWarmupSamples());
+      assertEquals(sequence < 11, diagnostic(cache, 2).isHeavy());
+    }
+  }
+
+  @Test
+  public void missingDoesNotSupplyALightVoteAndFreshValuesResumeConfirmation() throws Exception {
+    ReplicationBacklogCache cache = cache();
+    for (int sequence = 1; sequence <= 3; sequence++) {
+      sample(cache, sequence);
+    }
+    cache.advanceSamplingRound(4);
+    cache.advanceSamplingRound(5);
+    cache.evaluate(RUNNING, 25 * SECOND);
+    assertEquals(1, diagnostic(cache, 2).getLightStreak());
+    sample(cache, 6);
+    assertEquals(2, diagnostic(cache, 2).getLightStreak());
+    sample(cache, 7);
+    assertFalse(diagnostic(cache, 2).isHeavy());
+  }
+
+  @Test
+  public void firstSamplingRoundIsOnlyABaseline() throws Exception {
+    ReplicationBacklogCache cache = cache();
+    cache.advanceSamplingRound(10);
+    assertEquals(0, diagnostic(cache, 1).getMissingRounds());
+    cache.advanceSamplingRound(10);
+    cache.advanceSamplingRound(9);
+    assertEquals(0, diagnostic(cache, 1).getMissingRounds());
+    cache.advanceSamplingRound(11);
+    assertEquals(1, diagnostic(cache, 1).getMissingRounds());
+  }
+
+  @Test
+  public void targetObservationsNeedOnlyItsIncomingSources() throws Exception {
+    ReplicationBacklogCache cache = cache();
+    for (int sequence = 1; sequence <= 5; sequence++) {
       long now = sequence * 5 * SECOND;
-      cache.cacheReport(1, v1(1, sequence), now, cache.getEpoch(), now);
-      cache.cacheReport(2, v1(2, sequence), now, cache.getEpoch(), now);
-      // source 3 repeatedly returns the same cached snapshot. This is not fresh evidence.
-      cache.cacheReport(3, v1(3, 4), now, cache.getEpoch(), now);
-      cache.evaluate(now);
-      assertEquals(Collections.singleton(2), cache.eligibleCandidates(now).get(GROUP));
+      // dn2 never reports its output edges; its own incoming load remains fully observable.
+      send(cache, 1, v1(1, sequence, BACKLOG), now);
+      send(cache, 3, v1(3, sequence, BACKLOG), now);
+      cache.evaluate(RUNNING, now);
+      cache.advanceSamplingRound(sequence);
     }
-    cache.evaluate(50 * SECOND);
-    assertTrue(cache.eligibleCandidates(50 * SECOND).isEmpty());
-    assertFalse(cache.getDiagnostics(7, 50 * SECOND).get(1).isKnown());
+    assertEquals(Set.of(2), cache.eligibleCandidates(0).get(GROUP));
+    assertFalse(diagnostic(cache, 1).isKnown());
+    assertFalse(diagnostic(cache, 3).isKnown());
+    assertEquals(5, diagnostic(cache, 2).getCounts()[0], 0);
+  }
+
+  @Test
+  public void alternatingMissingSourcesCannotReuseOldEdgesAsNewObservations() throws Exception {
+    ReplicationBacklogCache cache = cache();
+    send(cache, 1, v1(1, 1, BACKLOG), 5 * SECOND);
+    send(cache, 3, v1(3, 1, BACKLOG), 5 * SECOND);
+    assertEquals(1, diagnostic(cache, 2).getWarmupSamples());
+    send(cache, 1, v1(1, 2, BACKLOG), 10 * SECOND);
+    send(cache, 1, v1(1, 3, BACKLOG), 15 * SECOND);
+    assertEquals(1, diagnostic(cache, 2).getWarmupSamples());
+    send(cache, 3, v1(3, 2, BACKLOG), 20 * SECOND);
+    assertEquals(2, diagnostic(cache, 2).getWarmupSamples());
+    send(cache, 3, v1(3, 3, BACKLOG), 25 * SECOND);
+    assertEquals(2, diagnostic(cache, 2).getWarmupSamples());
+  }
+
+  @Test
+  public void unreadyAndLongMissingTargetsCannotActAsZeroLoadWitnesses() throws Exception {
+    ReplicationBacklogCache cache = cache();
+    long[] incoming = {1000, 1000, 1000};
+    for (int sequence = 1; sequence <= 5; sequence++) {
+      long now = sequence * 5 * SECOND;
+      send(cache, 1, v1(1, sequence, incoming), now);
+      send(cache, 3, v1(3, sequence, incoming), now);
+      cache.evaluate(RUNNING, now);
+      cache.advanceSamplingRound(sequence);
+    }
+    assertFalse(diagnostic(cache, 2).isHeavy());
+    assertEquals(Set.of(2), cache.eligibleCandidates(0).get(GROUP));
+  }
+
+  @Test
+  public void nearbyCandidatesBecomeLightEvenWhenBothWereStableHeavy() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    Map<TConsensusGroupId, Set<Integer>> running = Collections.singletonMap(GROUP, Set.of(1, 3));
+    cache.evaluate(running, 26 * SECOND);
+    long[] nearby = {30, 0, 29};
+    for (int sequence = 6; sequence <= 8; sequence++) {
+      sample(cache, sequence, nearby, running);
+      assertFalse(diagnostic(cache, 1).isInstantHeavy());
+      assertFalse(diagnostic(cache, 3).isInstantHeavy());
+      assertEquals(sequence < 8, diagnostic(cache, 1).isHeavy());
+      assertEquals(sequence < 8, diagnostic(cache, 3).isHeavy());
+    }
+    assertTrue(cache.eligibleCandidates(0).isEmpty());
+  }
+
+  @Test
+  public void highButSimilarLoadsKeepAllCandidates() throws Exception {
+    ReplicationBacklogCache cache = cache();
+    for (int sequence = 1; sequence <= 5; sequence++) {
+      sample(cache, sequence, new long[] {2000000, 2000001, 2000002}, RUNNING);
+    }
+    for (int target : MEMBERS) {
+      assertFalse(diagnostic(cache, target).isHeavy());
+    }
+    assertTrue(cache.eligibleCandidates(0).isEmpty());
+  }
+
+  @Test
+  public void anExpiredMissingEstimateIsNoLongerALighterReference() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    for (int sequence = 6; sequence <= 11; sequence++) {
+      long now = sequence * 5 * SECOND;
+      send(cache, 1, v1(1, sequence, BACKLOG), now);
+      send(cache, 2, v1(2, sequence, BACKLOG), now);
+      cache.advanceSamplingRound(sequence);
+      cache.evaluate(RUNNING, now);
+    }
+    assertEquals(5, diagnostic(cache, 2).getSmoothedCounts()[0], 0);
+    assertTrue(diagnostic(cache, 2).isHeavy());
+    assertFalse(diagnostic(cache, 3).isHeavy());
+    assertEquals(Set.of(3), cache.eligibleCandidates(0).get(GROUP));
+  }
+
+  @Test
+  public void recoveryPreservesOtherReplicasStableLightState() throws Exception {
+    ReplicationBacklogCache cache = cache();
+    for (int sequence = 1; sequence <= 5; sequence++) {
+      sample(cache, sequence, new long[] {10, 10, 10}, RUNNING);
+    }
+    cache.evaluate(Collections.singletonMap(GROUP, Set.of(1, 3)), 26 * SECOND);
+    cache.evaluate(RUNNING, 27 * SECOND);
+    assertFalse(diagnostic(cache, 1).isHeavy());
+    assertFalse(diagnostic(cache, 3).isHeavy());
+    assertTrue(diagnostic(cache, 2).isHeavy());
+    assertEquals(Set.of(1, 3), cache.eligibleCandidates(0).get(GROUP));
+  }
+
+  @Test
+  public void significantNewLoadTurnsLightToHeavyImmediately() throws Exception {
+    ReplicationBacklogCache cache = cache();
+    for (int sequence = 1; sequence <= 5; sequence++) {
+      sample(cache, sequence, new long[] {10, 10, 10}, RUNNING);
+    }
+    sample(cache, 6, new long[] {1000, 10, 10}, RUNNING);
+    assertTrue(diagnostic(cache, 1).isHeavy());
+    assertTrue(diagnostic(cache, 1).isInstantHeavy());
+    assertEquals(0, diagnostic(cache, 1).getLightStreak());
+    assertEquals(Set.of(2, 3), cache.eligibleCandidates(0).get(GROUP));
+  }
+
+  @Test
+  public void initializationAndRecoveryUseTheSameWarmupAndLightConfirmation() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    cache.evaluate(Collections.singletonMap(GROUP, Set.of(1, 3)), 26 * SECOND);
+    cache.evaluate(RUNNING, 27 * SECOND);
+    assertTrue(diagnostic(cache, 2).isHeavy());
+    assertEquals(0, diagnostic(cache, 2).getWarmupSamples());
+    assertEquals(0, diagnostic(cache, 2).getSmoothedCounts()[0], 0);
+    assertEquals(3, diagnostic(cache, 1).getWarmupSamples());
+    // No L remains, so all Running H replicas are allowed during recovery.
+    assertTrue(cache.eligibleCandidates(0).isEmpty());
+    for (int sequence = 6; sequence <= 10; sequence++) {
+      sample(cache, sequence);
+      assertEquals(sequence < 10, diagnostic(cache, 2).isHeavy());
+    }
+    assertEquals(Set.of(2), cache.eligibleCandidates(0).get(GROUP));
+  }
+
+  @Test
+  public void returningRunningResetsImmediatelyWithoutAnyNewReport() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    cache.evaluate(Collections.singletonMap(GROUP, Set.of(1, 3)), 26 * SECOND);
+    cache.evaluate(RUNNING, 100 * SECOND);
+    assertTrue(diagnostic(cache, 2).isHeavy());
+    assertEquals(0, diagnostic(cache, 2).getWarmupSamples());
+    for (int i = 0; i < 10; i++) {
+      cache.evaluate(RUNNING, 101 * SECOND);
+    }
+    assertTrue(diagnostic(cache, 2).isHeavy());
+  }
+
+  @Test
+  public void delayedPreRecoverySamplesCannotWarmTheRecoveredTarget() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    cache.evaluate(Collections.singletonMap(GROUP, Set.of(1, 3)), 26 * SECOND);
+    cache.evaluate(RUNNING, 27 * SECOND);
+    for (int source = 1; source <= 3; source++) {
+      send(cache, source, v1(source, 6, BACKLOG).setSampleAgeNanos(5 * SECOND), 30 * SECOND);
+    }
+    cache.evaluate(RUNNING, 30 * SECOND);
+    assertEquals(0, diagnostic(cache, 2).getWarmupSamples());
+    sample(cache, 7);
+    assertEquals(1, diagnostic(cache, 2).getWarmupSamples());
+  }
+
+  @Test
+  public void restartIdentityAndLocalRegionGenerationResetOnlyTheRecoveredReplica()
+      throws Exception {
+    for (boolean reboot : new boolean[] {true, false}) {
+      ReplicationBacklogCache cache = warmedCache();
+      TReplicationBacklogReport changed = v1(2, 6, BACKLOG);
+      if (reboot) {
+        changed.setSourceInstanceId("new-boot-2");
+      } else {
+        changed.getGroups().get(0).setGeneration(2);
+      }
+      send(cache, 2, changed, 30 * SECOND);
+      cache.evaluate(RUNNING, 30 * SECOND);
+      assertTrue(diagnostic(cache, 2).isHeavy());
+      assertEquals(0, diagnostic(cache, 2).getWarmupSamples());
+      assertEquals(3, diagnostic(cache, 1).getWarmupSamples());
+      assertEquals(3, diagnostic(cache, 3).getWarmupSamples());
+    }
+  }
+
+  @Test
+  public void recoveringNewLocalGenerationResetsLightBeforeTheFirstValidReport() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    TReplicationBacklogReport recovering = v1(2, 6, BACKLOG);
+    recovering.getGroups().get(0).setGeneration(2).setState((byte) 1).unsetTargets();
+    send(cache, 2, recovering, 30 * SECOND);
+    assertTrue(diagnostic(cache, 2).isHeavy());
+    assertEquals(0, diagnostic(cache, 2).getWarmupSamples());
+    assertEquals(3, diagnostic(cache, 1).getWarmupSamples());
+    assertEquals(3, diagnostic(cache, 3).getWarmupSamples());
+    // Only the recovered target can form a new incoming observation while this source is missing.
+    send(cache, 1, v1(1, 6, BACKLOG), 31 * SECOND);
+    send(cache, 3, v1(3, 6, BACKLOG), 31 * SECOND);
+    assertEquals(1, diagnostic(cache, 2).getWarmupSamples());
+    assertEquals(30, diagnostic(cache, 1).getCounts()[0], 0);
+  }
+
+  @Test
+  public void recoveringExistingRegionAndErrorGenerationZeroPreserveTheEstimate() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    TReplicationBacklogReport recovering = v1(2, 6, BACKLOG);
+    recovering.getGroups().get(0).setState((byte) 1).unsetTargets();
+    send(cache, 2, recovering, 30 * SECOND);
+    assertFalse(diagnostic(cache, 2).isHeavy());
+    assertEquals(3, diagnostic(cache, 2).getWarmupSamples());
+    TReplicationBacklogReport error = v1(2, 7, BACKLOG);
+    error.getGroups().get(0).setGeneration(0).setState((byte) 2).unsetTargets();
+    send(cache, 2, error, 35 * SECOND);
+    assertFalse(diagnostic(cache, 2).isHeavy());
+    assertEquals(5, diagnostic(cache, 2).getSmoothedCounts()[0], 0);
+  }
+
+  @Test
+  public void newPipeGenerationResetsOnlyItsDestination() throws Exception {
+    ReplicationBacklogCache cache = cache();
+    for (int sequence = 1; sequence <= 5; sequence++) {
+      sample(cache, sequence, new long[] {10, 10, 10}, RUNNING);
+    }
+    TReplicationBacklogReport changed = v1(1, 6, new long[] {10, 10, 10});
+    changed.getGroups().get(0).getTargets().get(0).setGeneration(2);
+    send(cache, 1, changed, 30 * SECOND);
+    cache.evaluate(RUNNING, 30 * SECOND);
+    assertTrue(diagnostic(cache, 2).isHeavy());
+    assertEquals(0, diagnostic(cache, 2).getWarmupSamples());
+    assertFalse(diagnostic(cache, 1).isHeavy());
+    assertFalse(diagnostic(cache, 3).isHeavy());
+    assertEquals(Set.of(1, 3), cache.eligibleCandidates(0).get(GROUP));
   }
 
   @Test
   public void v2ClassificationKeepsIncomparableReplicas() throws Exception {
-    ReplicationBacklogCache cache = cache("ENFORCE");
-    for (int seq = 1; seq <= 4; seq++) {
-      long now = seq * 5 * SECOND;
-      cache.cacheReport(
+    ReplicationBacklogCache cache = cache();
+    for (int sequence = 1; sequence <= 5; sequence++) {
+      long now = sequence * 5 * SECOND;
+      send(
+          cache,
           1,
-          report(1, seq, (byte) 2, edge(2, 0, 1000, 5, 20), edge(3, 0, 500, 8, 20)),
-          now,
-          cache.getEpoch(),
+          report(1, sequence, (byte) 2, edge(2, 0, 1000, 5, 20), edge(3, 0, 500, 8, 20)),
           now);
-      cache.cacheReport(
+      send(
+          cache,
           2,
-          report(2, seq, (byte) 2, edge(1, 0, 5000, 20, 100), edge(3, 0, 0, 0, 0)),
-          now,
-          cache.getEpoch(),
+          report(2, sequence, (byte) 2, edge(1, 0, 5000, 20, 100), edge(3, 0, 0, 0, 0)),
           now);
-      cache.cacheReport(
-          3,
-          report(3, seq, (byte) 2, edge(1, 0, 0, 0, 0), edge(2, 0, 0, 0, 0)),
-          now,
-          cache.getEpoch(),
-          now);
-      cache.evaluate(now);
+      send(cache, 3, report(3, sequence, (byte) 2, edge(1, 0, 0, 0, 0), edge(2, 0, 0, 0, 0)), now);
+      cache.evaluate(RUNNING, now);
+      cache.advanceSamplingRound(sequence);
     }
-    assertEquals(
-        new HashSet<>(Arrays.asList(2, 3)), cache.eligibleCandidates(20 * SECOND).get(GROUP));
+    assertEquals(Set.of(2, 3), cache.eligibleCandidates(0).get(GROUP));
+    assertTrue(diagnostic(cache, 1).isInstantHeavy());
+    assertFalse(diagnostic(cache, 2).isInstantHeavy());
+    assertFalse(diagnostic(cache, 3).isInstantHeavy());
   }
 
   @Test
-  public void allHighAndEqualKeepsAllCandidates() throws Exception {
-    ReplicationBacklogCache cache = cache("ENFORCE");
-    for (int seq = 1; seq <= 5; seq++) {
-      long now = seq * 5 * SECOND;
-      for (int source : MEMBERS) {
-        ArrayList<TReplicationBacklogEdge> edges = new ArrayList<>();
-        MEMBERS.stream()
-            .filter(target -> target != source)
-            .forEach(target -> edges.add(edge(target, 1000000, 0, 0, 0)));
-        cache.cacheReport(
-            source,
-            report(source, seq, (byte) 1, edges.toArray(new TReplicationBacklogEdge[0])),
-            now,
-            cache.getEpoch(),
-            now);
-      }
-      cache.evaluate(now);
-    }
-    assertTrue(cache.eligibleCandidates(25 * SECOND).isEmpty());
-    assertEquals(2000000, cache.getDiagnostics(7, 25 * SECOND).get(1).getCounts()[0], 0);
-  }
-
-  @Test
-  public void invalidCountersAndMembershipAreUnknownNotZero() throws Exception {
-    ReplicationBacklogCache cache = cache("ENFORCE");
-    for (int i = 1; i <= 4; i++) {
-      round(cache, i);
-    }
-    TReplicationBacklogReport corrupt = v1(3, 5);
-    corrupt.getGroups().get(0).getTargets().get(0).setRequestCount(-1);
-    cache.cacheReport(3, corrupt, 25 * SECOND, cache.getEpoch(), 25 * SECOND);
-    cache.evaluate(25 * SECOND);
-    assertTrue(cache.eligibleCandidates(25 * SECOND).isEmpty());
-    assertFalse(cache.getDiagnostics(7, 25 * SECOND).get(1).isKnown());
-    TReplicationBacklogReport wrongMember = v1(3, 6);
+  public void invalidEnvelopeEdgesAndDuplicateGroupsHoldPreviousEstimate() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    List<TReplicationBacklogReport> invalid = new ArrayList<>();
+    invalid.add(null);
+    TReplicationBacklogReport negative = v1(3, 6, BACKLOG);
+    negative.getGroups().get(0).getTargets().get(0).setRequestCount(-1);
+    invalid.add(negative);
+    TReplicationBacklogReport missingCounter = v1(3, 7, BACKLOG);
+    missingCounter.getGroups().get(0).getTargets().get(0).unsetFileCount();
+    invalid.add(missingCounter);
+    TReplicationBacklogReport wrongMember = v1(3, 8, BACKLOG);
     wrongMember.getGroups().get(0).getTargets().get(0).setTargetNodeId(99);
-    cache.cacheReport(3, wrongMember, 30 * SECOND, cache.getEpoch(), 30 * SECOND);
-    assertFalse(cache.getDiagnostics(7, 30 * SECOND).get(1).isKnown());
+    invalid.add(wrongMember);
+    TReplicationBacklogReport duplicate = v1(3, 9, BACKLOG);
+    duplicate.setGroups(Arrays.asList(duplicate.getGroups().get(0), duplicate.getGroups().get(0)));
+    invalid.add(duplicate);
+    long now = 30 * SECOND;
+    for (TReplicationBacklogReport bad : invalid) {
+      send(cache, 3, bad, now++);
+      cache.evaluate(RUNNING, now);
+      assertFalse(diagnostic(cache, 2).isHeavy());
+      assertEquals(5, diagnostic(cache, 2).getSmoothedCounts()[0], 0);
+    }
+    cache.advanceSamplingRound(6);
+    cache.advanceSamplingRound(7);
+    cache.advanceSamplingRound(8);
+    assertTrue(diagnostic(cache, 2).isHeavy());
+  }
+
+  @Test
+  public void elapsedReportAgeIsRejectedButStoredEwmaDoesNotExpireByTime() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    TReplicationBacklogReport late =
+        v1(1, 6, new long[] {30, 9999, 20}).setSampleAgeNanos(29 * SECOND);
+    cache.cacheReport(1, late, 30 * SECOND, cache.getEpoch(), 32 * SECOND);
+    send(cache, 3, v1(3, 6, BACKLOG), 32 * SECOND);
+    cache.evaluate(RUNNING, 1000 * SECOND);
+    assertEquals(5, diagnostic(cache, 2).getSmoothedCounts()[0], 0);
+    assertFalse(diagnostic(cache, 2).isHeavy());
+  }
+
+  @Test
+  public void ewmaUsesUniqueCompleteIncomingObservations() throws Exception {
+    ReplicationBacklogCache cache = cache("OBSERVE", 3);
+    sample(cache, 1, new long[] {30, 100, 20}, RUNNING);
+    sample(cache, 2, new long[] {30, 1000, 20}, RUNNING);
+    assertEquals(550, diagnostic(cache, 2).getSmoothedCounts()[0], 0);
+    for (int source = 1; source <= 3; source++) {
+      send(cache, source, v1(source, 2, new long[] {30, 9999, 20}), 11 * SECOND);
+    }
+    cache.evaluate(RUNNING, 11 * SECOND);
+    assertEquals(550, diagnostic(cache, 2).getSmoothedCounts()[0], 0);
   }
 
   @Test
   public void serviceEpochAndOutOfOrderBootResponsesAreRejected() throws Exception {
-    ReplicationBacklogCache cache = cache("ENFORCE");
-    for (int i = 1; i <= 4; i++) {
-      round(cache, i);
-    }
+    ReplicationBacklogCache cache = warmedCache();
     long oldEpoch = cache.getEpoch();
     cache.reset();
-    cache.updateTopology(
-        Collections.singletonMap(GROUP, MEMBERS), nodes(MEMBERS), regions(MEMBERS), 21 * SECOND);
-    cache.cacheReport(1, v1(1, 100), 22 * SECOND, oldEpoch, 22 * SECOND);
-    assertFalse(cache.getDiagnostics(7, 22 * SECOND).get(2).isKnown());
-    TReplicationBacklogReport reboot = v1(1, 1).setSourceInstanceId("new-boot");
-    cache.cacheReport(1, reboot, 25 * SECOND, cache.getEpoch(), 25 * SECOND);
-    TReplicationBacklogReport lateOldBoot = v1(1, 100);
-    lateOldBoot.getGroups().get(0).getTargets().get(0).setRequestCount(9999);
-    cache.cacheReport(1, lateOldBoot, 24 * SECOND, cache.getEpoch(), 26 * SECOND);
-    assertEquals(5, cache.getDiagnostics(7, 26 * SECOND).get(2).getCounts()[0], 0);
+    cache.updateTopology(RUNNING, 26 * SECOND);
+    cache.evaluate(RUNNING, 26 * SECOND);
+    cache.cacheReport(1, v1(1, 100, BACKLOG), 27 * SECOND, oldEpoch, 27 * SECOND);
+    assertFalse(diagnostic(cache, 2).isKnown());
+    send(cache, 1, v1(1, 1, BACKLOG).setSourceInstanceId("new-boot"), 30 * SECOND);
+    cache.cacheReport(
+        1, v1(1, 100, new long[] {30, 9999, 20}), 29 * SECOND, cache.getEpoch(), 31 * SECOND);
+    send(cache, 3, v1(3, 1, BACKLOG), 31 * SECOND);
+    assertEquals(5, diagnostic(cache, 2).getCounts()[0], 0);
   }
 
   @Test
-  public void topologyAndAvailabilityChangesWithdrawExclusions() throws Exception {
-    ReplicationBacklogCache cache = cache("ENFORCE");
-    for (int i = 1; i <= 4; i++) {
-      round(cache, i);
-    }
-    Map<Integer, NodeStatistics> health = nodes(MEMBERS);
-    health.put(2, new NodeStatistics(NodeStatus.Unknown));
-    cache.updateTopology(
-        Collections.singletonMap(GROUP, MEMBERS), health, regions(MEMBERS), 21 * SECOND);
-    assertTrue(cache.eligibleCandidates(21 * SECOND).isEmpty());
-    Set<Integer> newMembers = new HashSet<>(Arrays.asList(1, 2, 4));
-    cache.updateTopology(
-        Collections.singletonMap(GROUP, newMembers),
-        nodes(newMembers),
-        regions(newMembers),
-        22 * SECOND);
-    assertFalse(cache.getDiagnostics(7, 22 * SECOND).containsKey(3));
-    assertFalse(cache.getDiagnostics(7, 22 * SECOND).get(4).isKnown());
-    cache.updateTopology(
-        Collections.emptyMap(), Collections.emptyMap(), Collections.emptyMap(), 23 * SECOND);
-    assertTrue(cache.getDiagnostics(7, 23 * SECOND).isEmpty());
-  }
-
-  @Test
-  public void elapsedSampleAgeIsNotRefreshedAtReceipt() throws Exception {
-    ReplicationBacklogCache cache = cache("ENFORCE");
-    TReplicationBacklogReport report = v1(1, 1).setSampleAgeNanos(29 * SECOND);
-    cache.cacheReport(1, report, SECOND, cache.getEpoch(), 3 * SECOND);
-    assertFalse(cache.getDiagnostics(7, 3 * SECOND).get(2).isKnown());
-  }
-
-  @Test
-  public void ewmaUpdatesOnlyOnUniqueSamplesAndResetsForNewPipeGeneration() throws Exception {
-    ReplicationBacklogCache cache = cache("OBSERVE");
-    TReplicationBacklogReport report = v1(1, 1);
-    report.getGroups().get(0).getTargets().get(0).setRequestCount(100);
-    cache.cacheReport(1, report, SECOND, cache.getEpoch(), SECOND);
-    TReplicationBacklogReport spike = v1(1, 2);
-    spike.getGroups().get(0).getTargets().get(0).setRequestCount(1000);
-    cache.cacheReport(1, spike, 2 * SECOND, cache.getEpoch(), 2 * SECOND);
-    assertEquals(550, cache.getDiagnostics(7, 2 * SECOND).get(2).getSmoothedCounts()[0], 0);
-    cache.cacheReport(1, spike, 3 * SECOND, cache.getEpoch(), 3 * SECOND);
-    assertEquals(550, cache.getDiagnostics(7, 3 * SECOND).get(2).getSmoothedCounts()[0], 0);
-    TReplicationBacklogReport restarted = v1(1, 3);
-    restarted.getGroups().get(0).getTargets().get(0).setGeneration(2);
-    cache.cacheReport(1, restarted, 4 * SECOND, cache.getEpoch(), 4 * SECOND);
-    assertEquals(5, cache.getDiagnostics(7, 4 * SECOND).get(2).getSmoothedCounts()[0], 0);
-  }
-
-  @Test
-  public void disablingFilteringNeverRestoresOldDecisions() throws Exception {
-    ReplicationBacklogCache cache = cache("ENFORCE");
-    for (int i = 1; i <= 4; i++) {
-      round(cache, i);
-    }
-    cache.configure(config("OFF"));
-    assertTrue(cache.eligibleCandidates(20 * SECOND).isEmpty());
-    assertTrue(cache.getDiagnostics(7, 20 * SECOND).isEmpty());
-    cache.configure(config("ENFORCE"));
-    cache.updateTopology(
-        Collections.singletonMap(GROUP, MEMBERS), nodes(MEMBERS), regions(MEMBERS), 20 * SECOND);
-    assertTrue(cache.eligibleCandidates(20 * SECOND).isEmpty());
-    assertFalse(cache.getDiagnostics(7, 20 * SECOND).get(1).isKnown());
-  }
-
-  @Test
-  public void topologyAndUnchangedSamplesDoNotRequestAnotherBalance() throws Exception {
-    ReplicationBacklogCache cache = cache("OBSERVE");
-    assertFalse(cache.consumeDirty());
-    for (int i = 1; i <= 4; i++) {
-      round(cache, i);
-    }
-    assertTrue(cache.consumeDirty());
-    round(cache, 5);
-    assertFalse(cache.consumeDirty());
-    cache.configure(config("ENFORCE"));
-    assertTrue(cache.consumeDirty());
-    assertEquals(Collections.singleton(2), cache.eligibleCandidates(25 * SECOND).get(GROUP));
-    cache.configure(config("OFF"));
-    assertTrue(cache.consumeDirty());
-    assertTrue(cache.eligibleCandidates(25 * SECOND).isEmpty());
-  }
-
-  @Test
-  public void malformedEnvelopeInvalidatesSourceButAnOlderCallbackCannot() throws Exception {
-    ReplicationBacklogCache cache = cache("ENFORCE");
-    for (int i = 1; i <= 4; i++) {
-      round(cache, i);
-    }
-    TReplicationBacklogReport malformed = v1(1, 5).setSampleAgeNanos(-1);
-    cache.cacheReport(1, malformed, 19 * SECOND, cache.getEpoch(), 21 * SECOND);
-    assertEquals(Collections.singleton(2), cache.eligibleCandidates(21 * SECOND).get(GROUP));
-    cache.cacheReport(1, malformed, 25 * SECOND, cache.getEpoch(), 25 * SECOND);
-    assertTrue(cache.eligibleCandidates(25 * SECOND).isEmpty());
-    assertFalse(cache.getDiagnostics(7, 25 * SECOND).get(2).isKnown());
-  }
-
-  @Test
-  public void hysteresisKeepsIntermediateDifferenceThenRequiresThreeReleaseRounds()
-      throws Exception {
-    ReplicationBacklogCache cache = cache("ENFORCE");
-    Properties parameters = new Properties();
-    parameters.setProperty(ReplicationBacklogConfig.PREFIX + "ewma_alpha", "1");
-    cache.configure(ReplicationBacklogConfig.load(parameters, config("ENFORCE")));
-    cache.updateTopology(
-        Collections.singletonMap(GROUP, MEMBERS), nodes(MEMBERS), regions(MEMBERS), 0);
-    for (int i = 1; i <= 4; i++) {
-      round(cache, i);
-    }
-    for (int sequence = 5; sequence <= 10; sequence++) {
-      long now = sequence * 5 * SECOND;
-      for (int source : MEMBERS) {
-        TReplicationBacklogReport sample = v1(source, sequence);
-        if (source == 2) {
-          sample.getGroups().get(0).getTargets().get(0).setRequestCount(sequence <= 7 ? 12 : 8);
-        }
-        cache.cacheReport(source, sample, now, cache.getEpoch(), now);
-      }
-      cache.evaluate(now);
-      if (sequence < 10) {
-        assertEquals(Collections.singleton(2), cache.eligibleCandidates(now).get(GROUP));
-      } else {
-        assertEquals(new HashSet<>(Arrays.asList(1, 2)), cache.eligibleCandidates(now).get(GROUP));
-      }
-    }
-  }
-
-  @Test
-  public void solverSnapshotUsesCurrentFreshnessWithoutExpiringOnOrdinarySamples()
-      throws Exception {
-    ReplicationBacklogCache cache = cache("ENFORCE");
-    for (int sequence = 1; sequence <= 4; sequence++) {
-      round(cache, sequence);
-    }
-    ReplicationBacklogCache.SelectionSnapshot snapshot = cache.captureSelection(20 * SECOND);
-    assertEquals(Set.of(2), snapshot.getCandidates().get(GROUP));
-    assertTrue(cache.isSelectionValid(snapshot, 21 * SECOND));
-    assertFalse(cache.isSelectionValid(snapshot, 50 * SECOND));
-    for (int sequence = 5; sequence <= 12; sequence++) {
-      long now = sequence * 5 * SECOND;
-      for (int source : MEMBERS) {
-        TReplicationBacklogReport sample = v1(source, sequence);
-        if (source == 1) {
-          sample.getGroups().get(0).getTargets().get(0).setRequestCount(sequence % 2 == 0 ? 6 : 5);
-        }
-        cache.cacheReport(source, sample, now, cache.getEpoch(), now);
-      }
-      cache.evaluate(now);
-      assertTrue(cache.isSelectionValid(snapshot, now));
-    }
-  }
-
-  @Test
-  public void evenAnEmptySolverConstraintIsBoundToItsConfigurationAndLeadership() throws Exception {
-    ReplicationBacklogCache cache = cache("OFF");
+  public void topologyChangeDropsOldEdgesAndInvalidatesSolverSnapshot() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
     ReplicationBacklogCache.SelectionSnapshot snapshot = cache.captureSelection(0);
-    assertTrue(snapshot.getCandidates().isEmpty());
-    assertTrue(cache.isSelectionValid(snapshot, 0));
-    cache.configure(config("ENFORCE"));
-    assertFalse(cache.isSelectionValid(snapshot, 0));
-    snapshot = cache.captureSelection(0);
+    Map<TConsensusGroupId, Set<Integer>> next = Collections.singletonMap(GROUP, Set.of(1, 2, 4));
+    cache.updateTopology(next, 26 * SECOND);
+    cache.evaluate(next, 26 * SECOND);
+    assertFalse(cache.isSelectionValid(snapshot, 26 * SECOND));
+    assertFalse(cache.getDiagnostics(7, 0).containsKey(3));
+    assertFalse(diagnostic(cache, 4).isKnown());
+    assertTrue(diagnostic(cache, 4).isHeavy());
+    cache.cacheReport(1, v1(1, 6, BACKLOG), 25 * SECOND, cache.getEpoch(), 27 * SECOND);
+    assertFalse(diagnostic(cache, 2).isKnown());
+    cache.updateTopology(Collections.emptyMap(), 28 * SECOND);
+    assertTrue(cache.getDiagnostics(7, 0).isEmpty());
+  }
+
+  @Test
+  public void observeAndOffNeverConstrainCandidates() throws Exception {
+    ReplicationBacklogCache cache = cache("OBSERVE", 3);
+    for (int sequence = 1; sequence <= 5; sequence++) {
+      sample(cache, sequence);
+    }
+    assertTrue(diagnostic(cache, 1).isHeavy());
+    assertFalse(diagnostic(cache, 2).isHeavy());
+    assertTrue(cache.eligibleCandidates(0).isEmpty());
+    cache.configure(config("ENFORCE", 3));
+    assertEquals(Set.of(2), cache.eligibleCandidates(0).get(GROUP));
+    cache.configure(config("OFF", 3));
+    assertTrue(cache.eligibleCandidates(0).isEmpty());
+    cache.configure(config("ENFORCE", 3));
+    cache.updateTopology(RUNNING, 26 * SECOND);
+    cache.evaluate(RUNNING, 26 * SECOND);
+    assertTrue(diagnostic(cache, 2).isHeavy());
+    assertEquals(0, diagnostic(cache, 2).getWarmupSamples());
+  }
+
+  @Test
+  public void unchangedSamplesAndRepeatedQueriesDoNotRequestAnotherBalance() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    assertTrue(cache.consumeDirty());
+    sample(cache, 6);
+    cache.updateTopology(RUNNING, 31 * SECOND);
+    cache.evaluate(RUNNING, 31 * SECOND);
+    assertFalse(cache.consumeDirty());
+    assertEquals(
+        2,
+        cache.sampleDiagnostics(1, 0).get(7).values().stream()
+            .filter(ReplicaDiagnostic::isHeavy)
+            .count());
+    assertTrue(cache.sampleDiagnostics(0, 0).isEmpty());
+  }
+
+  @Test
+  public void solverSnapshotTracksCandidatesRatherThanReportAge() throws Exception {
+    ReplicationBacklogCache cache = warmedCache();
+    ReplicationBacklogCache.SelectionSnapshot snapshot = cache.captureSelection(25 * SECOND);
+    sample(cache, 6);
+    assertTrue(cache.isSelectionValid(snapshot, 1000 * SECOND));
+    cache.advanceSamplingRound(7);
+    cache.advanceSamplingRound(8);
+    assertTrue(cache.isSelectionValid(snapshot, 1000 * SECOND));
+    cache.advanceSamplingRound(9);
+    assertFalse(cache.isSelectionValid(snapshot, 1000 * SECOND));
+  }
+
+  @Test
+  public void evenAnEmptySnapshotIsBoundToConfigurationLeadershipAndRunningCandidates()
+      throws Exception {
+    ReplicationBacklogCache cache = cache();
+    ReplicationBacklogCache.SelectionSnapshot snapshot = cache.captureSelection(0);
+    cache.evaluate(Collections.singletonMap(GROUP, Set.of(1, 3)), SECOND);
+    assertFalse(cache.isSelectionValid(snapshot, SECOND));
+    snapshot = cache.captureSelection(SECOND);
+    cache.configure(config("OBSERVE", 3));
+    assertFalse(cache.isSelectionValid(snapshot, SECOND));
+    snapshot = cache.captureSelection(SECOND);
     cache.reset();
-    assertFalse(cache.isSelectionValid(snapshot, 0));
+    assertFalse(cache.isSelectionValid(snapshot, SECOND));
   }
 }
