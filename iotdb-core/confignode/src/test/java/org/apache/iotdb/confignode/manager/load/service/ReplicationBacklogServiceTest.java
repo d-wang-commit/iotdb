@@ -154,6 +154,7 @@ public class ReplicationBacklogServiceTest {
     long oldEpoch = service.getEpoch();
     cache(1, 1, oldEpoch);
     cache(3, 1, oldEpoch);
+    tick(false);
     assertTrue(service.getDiagnostics(7).get(2).isKnown());
     service.stop();
     verify(scheduled).cancel(false);
@@ -166,6 +167,7 @@ public class ReplicationBacklogServiceTest {
     assertFalse(service.getDiagnostics(7).get(2).isKnown());
     assertEquals(0, service.getDiagnostics(7).get(2).getCounts()[0], 0);
     cache(1, 1, service.getEpoch());
+    tick(false);
     assertTrue(service.getDiagnostics(7).get(2).isKnown());
     assertEquals(5, service.getDiagnostics(7).get(2).getCounts()[0], 0);
   }
@@ -252,10 +254,10 @@ public class ReplicationBacklogServiceTest {
   }
 
   @Test
-  public void onlyMissingSamplingRoundsTurnAnEstablishedLightReplicaHeavy() throws Exception {
+  public void missingInputsExpireBySamplingRoundsWithoutAHeavyPenalty() throws Exception {
     prepareFilteredSelection();
     double[] previous = service.getDiagnostics(7).get(2).getSmoothedCounts();
-    for (int round = 0; round < 2; round++) {
+    for (int round = 0; round < 3; round++) {
       tick(false);
       for (int call = 0; call < 10; call++) {
         assertEquals(Set.of(2), service.getEligibleCandidates().get(GROUP));
@@ -264,15 +266,14 @@ public class ReplicationBacklogServiceTest {
         invokeTick();
       }
     }
-    tick(false);
-    assertTrue(service.getDiagnostics(7).get(2).isHeavy());
-    assertTrue(service.getEligibleCandidates().isEmpty());
     assertEquals(previous[0], service.getDiagnostics(7).get(2).getSmoothedCounts()[0], 0);
-    // Missing rounds keep the estimate but do not count toward H -> L confirmation.
+    tick(false);
+    assertFalse(service.getDiagnostics(7).get(2).isHeavy());
+    assertEquals(0, service.getDiagnostics(7).get(2).getCounts()[0], 0);
+    assertEquals(previous[0] / 2, service.getDiagnostics(7).get(2).getSmoothedCounts()[0], 0);
     round(6);
-    round(7);
-    assertTrue(service.getDiagnostics(7).get(2).isHeavy());
-    round(8);
+    assertEquals(previous[0], service.getDiagnostics(7).get(2).getCounts()[0], 0);
+    assertEquals(0, service.getDiagnostics(7).get(2).getMissingRounds());
     assertEquals(Set.of(2), service.getEligibleCandidates().get(GROUP));
   }
 
@@ -282,7 +283,7 @@ public class ReplicationBacklogServiceTest {
     setField(service, "nextBalance", System.nanoTime() + TimeUnit.MINUTES.toNanos(1));
     runSelection(
         () -> {
-          for (int round = 0; round < 3; round++) {
+          for (int round = 0; round < 7; round++) {
             tick(false);
           }
         });
@@ -344,7 +345,7 @@ public class ReplicationBacklogServiceTest {
                   if (!started.await(5, TimeUnit.SECONDS)) {
                     throw new AssertionError("The balance task did not start");
                   }
-                  if (service.getDiagnostics(7).get(2).getMissingRounds() >= 3) {
+                  if (service.getDiagnostics(7).values().stream().noneMatch(d -> d.isHeavy())) {
                     missed.countDown();
                   }
                 } catch (Throwable e) {
@@ -357,7 +358,7 @@ public class ReplicationBacklogServiceTest {
       assertTrue(started.await(5, TimeUnit.SECONDS));
       assertTrue(missed.await(5, TimeUnit.SECONDS));
       assertEquals(1, solves.get());
-      assertTrue(service.getDiagnostics(7).get(2).isHeavy());
+      assertFalse(service.getDiagnostics(7).get(2).isHeavy());
       assertTrue(service.getEligibleCandidates().isEmpty());
       assertTrue((boolean) getField(service, "pendingBalance"));
       samplingTask.cancel(false);

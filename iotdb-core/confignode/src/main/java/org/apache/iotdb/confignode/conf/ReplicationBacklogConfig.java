@@ -182,7 +182,7 @@ public final class ReplicationBacklogConfig {
   }
 
   /**
-   * New light observations required for H to L, and missed sampling rounds before returning to H.
+   * Light observations required for H to L, and maximum missing rounds to reuse a source sample.
    */
   public int getConfirmationRounds() {
     return confirmationRounds;

@@ -787,7 +787,7 @@ enable_auto_leader_balance_for_ratis_consensus=true
 # OBSERVE samples without changing leaders. ENFORCE first lets CFS select Running replicas,
 # then prefers stable L (light) candidates. If all Running candidates are H (heavy), all remain
 # eligible; original per-database/global costs remain unchanged. Initial and recovered replicas
-# start at H, with the same three-sample EWMA warmup. Missing load is never treated as zero.
+# start at H, with the same three-observation EWMA warmup.
 # Modes change only by administrator configuration, never automatically.
 # effectiveMode: hot_reload
 # Datatype: String (OFF, OBSERVE, ENFORCE)
@@ -803,16 +803,19 @@ iot_consensus_replication_backlog_sample_interval_ms=5000
 iot_consensus_replication_backlog_ttl_ms=30000
 iot_consensus_replication_backlog_balance_interval_ms=10000
 
-# EWMA = alpha * new sample + (1 - alpha) * previous EWMA. Missing/duplicate reports
-# do not update EWMA or light confirmation. Each target observation requires new reports
-# from all other members, whose outgoing edges are summed as that target's incoming backlog.
+# EWMA = alpha * round input + (1 - alpha) * previous EWMA. Once per sampling round,
+# sum the other members' outgoing edges as each target's incoming backlog. A missing source
+# reuses its last valid sample for at most confirmation_rounds (M), then contributes zero
+# from the next round. A fresh valid sample replaces the held values and resets the counter.
+# Held values participate in EWMA and light confirmation just like fresh values. Missing
+# telemetry alone does not force either the source or its destinations to H.
 # A heavier replica must be no lighter in every dimension and exceed both the absolute
 # gap and relative_gap * max(lighter_count, 1) in at least one dimension.
 # H applies immediately when a mature candidate is heavier. H to L requires confirmation_rounds
-# consecutive new light observations (M, default 3). EWMA warmup is fixed at three observations;
+# consecutive light observations (M, default 3). EWMA warmup is fixed at three observations;
 # the third observation is the first eligible light confirmation, including after recovery.
-# Missing reports retain the last EWMA. After M consecutive sampling rounds without a new
-# observation the candidate returns to H; duplicate reports and CFS calls advance neither count.
+# Duplicate reports do not renew held inputs. Repeated sampling-round IDs and CFS calls
+# advance neither missing counters nor observations. Expired inputs do not erase EWMA history.
 # effectiveMode: hot_reload
 # Datatype: double (alpha in (0, 1], relative gap > 0), int (rounds > 0)
 iot_consensus_replication_backlog_ewma_alpha=0.5

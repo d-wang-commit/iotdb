@@ -36,8 +36,9 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Leader-local incoming replication load. Availability belongs to CFS, which supplies the
- * candidates to compare. Missing reports retain the EWMA; only real observations can confirm a
- * light replica. Arrays contain actual members/edges, never a cluster-wide DN-by-DN matrix.
+ * candidates to compare. Each sampling round reuses missing inputs for at most M rounds before
+ * treating their contribution as zero. Arrays contain actual members/edges, never a cluster-wide
+ * DN-by-DN matrix.
  */
 public final class ReplicationBacklogCache {
   private static final int DIMENSIONS = 4;
@@ -49,7 +50,6 @@ public final class ReplicationBacklogCache {
   private long epoch;
   private long topologyRevision;
   private long candidateRevision;
-  private long sourceRevision;
   private long samplingRound = Long.MIN_VALUE;
   private boolean dirty;
   private int diagnosticCursor;
@@ -265,42 +265,46 @@ public final class ReplicationBacklogCache {
       }
     }
     group.sources[sourceIndex] =
-        new Source(
-            sample.getProtocol(),
-            sample.getGeneration(),
-            generations,
-            raw,
-            sampledAt,
-            ++sourceRevision);
-    updateObservations(group);
-    classify(group);
+        new Source(sample.getProtocol(), sample.getGeneration(), generations, raw, sampledAt);
     updateSelection(group);
   }
 
-  /** One observation needs a new sample from each incoming source, not from the target itself. */
+  /** Aggregate fresh, held and expired inputs once per sampling round, independently per source. */
   private void updateObservations(Group group) {
     if (group.members.length < 2) {
       return;
     }
     for (int targetIndex = 0; targetIndex < group.members.length; targetIndex++) {
       Target target = group.targets[targetIndex];
-      boolean complete = true;
+      boolean compatible = true;
       byte protocol = 0;
+      int missingRounds = 0;
       for (int sourceIndex = 0; sourceIndex < group.members.length; sourceIndex++) {
         if (sourceIndex == targetIndex) {
           continue;
         }
         Source source = group.sources[sourceIndex];
-        if (source == null
-            || source.revision <= target.observedSources[sourceIndex]
-            || source.sampledAt < target.since
-            || (protocol != 0 && protocol != source.protocol)) {
-          complete = false;
+        missingRounds =
+            Math.max(
+                missingRounds,
+                source == null ? config.getConfirmationRounds() + 1 : source.missingRounds);
+        if (!usable(source, target)) {
+          continue;
+        }
+        if (protocol != 0 && protocol != source.protocol) {
+          compatible = false;
           break;
         }
         protocol = source.protocol;
       }
-      if (!complete) {
+      if (!compatible) {
+        continue;
+      }
+      if (protocol == 0) {
+        protocol = target.protocol;
+      }
+      if (protocol == 0) {
+        // Initialization/recovery still needs a post-reset incoming sample to identify its units.
         continue;
       }
       if (target.observations > 0 && target.protocol != protocol) {
@@ -313,11 +317,13 @@ public final class ReplicationBacklogCache {
           continue;
         }
         Source source = group.sources[sourceIndex];
+        if (!usable(source, target)) {
+          continue;
+        }
         int offset = (targetIndex < sourceIndex ? targetIndex : targetIndex - 1) * DIMENSIONS;
         for (int dimension = 0; dimension < DIMENSIONS; dimension++) {
           target.raw[dimension] += source.raw[offset + dimension];
         }
-        target.observedSources[sourceIndex] = source.revision;
       }
       for (int dimension = 0; dimension < DIMENSIONS; dimension++) {
         target.smoothed[dimension] =
@@ -329,31 +335,38 @@ public final class ReplicationBacklogCache {
       target.protocol = protocol;
       target.observations = Math.min(WARMUP_OBSERVATIONS, target.observations + 1);
       target.version++;
-      target.missingRounds = 0;
+      target.missingRounds = missingRounds;
     }
   }
 
+  private boolean usable(Source source, Target target) {
+    return source != null
+        && source.sampledAt >= target.since
+        && source.missingRounds <= config.getConfirmationRounds();
+  }
+
   /**
-   * Only the sampling scheduler calls this method. The first round establishes a baseline; queries,
-   * repeated round identifiers and duplicate reports never turn into missing or confirming rounds.
+   * Only the sampling scheduler calls this method. Reports update inputs; this method advances
+   * missing counters, EWMA and light confirmation at most once per distinct round.
    */
   public synchronized void advanceSamplingRound(long roundId) {
     if (roundId <= samplingRound) {
       return;
     }
-    boolean first = samplingRound == Long.MIN_VALUE;
     samplingRound = roundId;
     for (Group group : groups.values()) {
-      for (Target target : group.targets) {
-        if (!first && target.roundVersion == target.version) {
-          target.missingRounds = Math.min(config.getConfirmationRounds(), target.missingRounds + 1);
-          if (target.missingRounds >= config.getConfirmationRounds()) {
-            target.heavy = true;
-            target.lightStreak = 0;
-          }
+      for (Source source : group.sources) {
+        if (source == null) {
+          continue;
         }
-        target.roundVersion = target.version;
+        if (!source.updated) {
+          source.missingRounds =
+              Math.min(config.getConfirmationRounds() + 1, source.missingRounds + 1);
+        }
+        source.updated = false;
       }
+      updateObservations(group);
+      classify(group);
       updateSelection(group);
     }
   }
@@ -418,8 +431,7 @@ public final class ReplicationBacklogCache {
   }
 
   private boolean comparable(Target target) {
-    return target.observations >= WARMUP_OBSERVATIONS
-        && target.missingRounds < config.getConfirmationRounds();
+    return target.observations >= WARMUP_OBSERVATIONS;
   }
 
   private boolean dominates(double[] heavy, double[] light, byte protocol) {
@@ -444,16 +456,11 @@ public final class ReplicationBacklogCache {
     Target target = group.targets[index];
     Arrays.fill(target.raw, 0);
     Arrays.fill(target.smoothed, 0);
-    for (int source = 0; source < group.sources.length; source++) {
-      target.observedSources[source] =
-          group.sources[source] == null ? 0 : group.sources[source].revision;
-    }
     target.since = now;
     target.protocol = 0;
     target.observations = 0;
     target.version = 0;
     target.classifiedVersion = 0;
-    target.roundVersion = 0;
     target.missingRounds = 0;
     target.lightStreak = 0;
     target.heavy = true;
@@ -575,7 +582,7 @@ public final class ReplicationBacklogCache {
       result.put(
           group.members[i],
           new ReplicaDiagnostic(
-              target.observations > 0 && target.missingRounds < config.getConfirmationRounds(),
+              target.observations > 0,
               group.available[i],
               target.heavy,
               target.instantHeavy,
@@ -679,14 +686,13 @@ public final class ReplicationBacklogCache {
       targets = new Target[members.length];
       available = new boolean[members.length];
       for (int i = 0; i < members.length; i++) {
-        targets[i] = new Target(members.length, now);
+        targets[i] = new Target(now);
       }
       createdAt = now;
     }
   }
 
   private static final class Target {
-    private final long[] observedSources;
     private final double[] raw = new double[DIMENSIONS];
     private final double[] smoothed = new double[DIMENSIONS];
     private long since;
@@ -694,14 +700,12 @@ public final class ReplicationBacklogCache {
     private int observations;
     private long version;
     private long classifiedVersion;
-    private long roundVersion;
     private int missingRounds;
     private int lightStreak;
     private boolean heavy = true;
     private boolean instantHeavy;
 
-    private Target(int members, long now) {
-      observedSources = new long[members];
+    private Target(long now) {
       since = now;
     }
   }
@@ -712,21 +716,16 @@ public final class ReplicationBacklogCache {
     private final long[] edgeGenerations;
     private final long[] raw;
     private final long sampledAt;
-    private final long revision;
+    private boolean updated = true;
+    private int missingRounds;
 
     private Source(
-        byte protocol,
-        long generation,
-        long[] edgeGenerations,
-        long[] raw,
-        long sampledAt,
-        long revision) {
+        byte protocol, long generation, long[] edgeGenerations, long[] raw, long sampledAt) {
       this.protocol = protocol;
       this.generation = generation;
       this.edgeGenerations = edgeGenerations;
       this.raw = raw;
       this.sampledAt = sampledAt;
-      this.revision = revision;
     }
   }
 }

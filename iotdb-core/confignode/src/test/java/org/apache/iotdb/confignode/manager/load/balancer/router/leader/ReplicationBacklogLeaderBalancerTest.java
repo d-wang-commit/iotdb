@@ -22,21 +22,130 @@ import org.apache.iotdb.common.rpc.thrift.TConsensusGroupId;
 import org.apache.iotdb.common.rpc.thrift.TConsensusGroupType;
 import org.apache.iotdb.commons.cluster.NodeStatus;
 import org.apache.iotdb.commons.cluster.RegionStatus;
+import org.apache.iotdb.confignode.manager.load.cache.ReplicationBacklogCache;
 import org.apache.iotdb.confignode.manager.load.cache.node.NodeStatistics;
 import org.apache.iotdb.confignode.manager.load.cache.region.RegionStatistics;
+import org.apache.iotdb.mpp.rpc.thrift.TRegionReplicationBacklog;
+import org.apache.iotdb.mpp.rpc.thrift.TReplicationBacklogEdge;
+import org.apache.iotdb.mpp.rpc.thrift.TReplicationBacklogReport;
 
 import org.junit.Test;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 public class ReplicationBacklogLeaderBalancerTest {
+  @Test
+  public void twoRecoveringNodesDoNotReceiveLeadersBecauseTheirPeersLostReports() {
+    ReplicationBacklogCache cache = new ReplicationBacklogCache();
+    Map<TConsensusGroupId, Set<Integer>> locations = new HashMap<>();
+    Map<TConsensusGroupId, Integer> leaders = new HashMap<>();
+    Map<Integer, NodeStatistics> nodes = new HashMap<>();
+    Map<TConsensusGroupId, Map<Integer, RegionStatistics>> regions = new HashMap<>();
+    for (int node = 1; node <= 8; node++) {
+      nodes.put(node, new NodeStatistics(NodeStatus.Running));
+    }
+    for (int index = 0; index < 128; index++) {
+      TConsensusGroupId group = new TConsensusGroupId(TConsensusGroupType.DataRegion, index);
+      Set<Integer> members = Set.of(index % 6 + 1, (index + 1) % 6 + 1, index % 2 + 7);
+      locations.put(group, members);
+      leaders.put(group, index % 6 + 1);
+      Map<Integer, RegionStatistics> replicas = new HashMap<>();
+      for (int member : members) {
+        replicas.put(member, new RegionStatistics(RegionStatus.Running));
+      }
+      regions.put(group, replicas);
+    }
+    cache.updateTopology(locations, 0);
+    cache.evaluate(
+        CostFlowSelectionLeaderBalancer.getRunningCandidates(locations, nodes, regions), 0);
+    for (int round = 1; round <= 5; round++) {
+      reportRound(cache, locations, round, 8, 0);
+    }
+    nodes.put(7, new NodeStatistics(NodeStatus.Unknown));
+    nodes.put(8, new NodeStatistics(NodeStatus.Unknown));
+    cache.evaluate(
+        CostFlowSelectionLeaderBalancer.getRunningCandidates(locations, nodes, regions),
+        TimeUnit.SECONDS.toNanos(26));
+    for (int round = 6; round <= 11; round++) {
+      reportRound(cache, locations, round, 6, 100);
+    }
+    for (TConsensusGroupId group : locations.keySet()) {
+      assertFalse(cache.getDiagnostics(group.getId(), 0).get(leaders.get(group)).isHeavy());
+    }
+    nodes.put(7, new NodeStatistics(NodeStatus.Running));
+    nodes.put(8, new NodeStatistics(NodeStatus.Running));
+    cache.evaluate(
+        CostFlowSelectionLeaderBalancer.getRunningCandidates(locations, nodes, regions),
+        TimeUnit.SECONDS.toNanos(56));
+
+    CostFlowSelectionLeaderBalancer balancer = new CostFlowSelectionLeaderBalancer();
+    Map<String, List<TConsensusGroupId>> databases =
+        Collections.singletonMap("root.test", new ArrayList<>(locations.keySet()));
+    Map<TConsensusGroupId, Integer> unrestricted =
+        balancer.generateOptimalLeaderDistribution(databases, locations, leaders, nodes, regions);
+    assertEquals(16, unrestricted.values().stream().filter(node -> node == 7).count());
+    assertEquals(16, unrestricted.values().stream().filter(node -> node == 8).count());
+    Map<TConsensusGroupId, Integer> filtered =
+        balancer.generateOptimalLeaderDistributionWithBacklog(
+            databases, locations, leaders, nodes, regions, cache.eligibleCandidates(0));
+    assertEquals(128, filtered.size());
+    assertTrue(filtered.values().stream().allMatch(node -> node <= 6));
+    for (int round = 12; round <= 16; round++) {
+      reportRound(cache, locations, round, 8, 100);
+      for (Map.Entry<TConsensusGroupId, Set<Integer>> entry : locations.entrySet()) {
+        Set<Integer> preferred = cache.eligibleCandidates(0).get(entry.getKey());
+        assertEquals(2, preferred.size());
+        assertTrue(preferred.stream().allMatch(node -> node <= 6));
+      }
+    }
+  }
+
+  private static void reportRound(
+      ReplicationBacklogCache cache,
+      Map<TConsensusGroupId, Set<Integer>> locations,
+      int round,
+      int reportingNodes,
+      long recoveringBacklog) {
+    long now = TimeUnit.SECONDS.toNanos(round * 5L);
+    for (int source = 1; source <= reportingNodes; source++) {
+      List<TRegionReplicationBacklog> groups = new ArrayList<>();
+      for (Map.Entry<TConsensusGroupId, Set<Integer>> entry : locations.entrySet()) {
+        if (!entry.getValue().contains(source)) {
+          continue;
+        }
+        List<TReplicationBacklogEdge> edges = new ArrayList<>();
+        for (int target : entry.getValue()) {
+          if (target != source) {
+            edges.add(
+                new TReplicationBacklogEdge(
+                    target, 1, target > 6 ? recoveringBacklog : 0, 0, 0, 0, (byte) 0));
+          }
+        }
+        groups.add(
+            new TRegionReplicationBacklog(entry.getKey().getId(), (byte) 1, 1, edges, (byte) 0));
+      }
+      cache.cacheReport(
+          source,
+          new TReplicationBacklogReport("boot-" + source, round, 0, groups),
+          now,
+          cache.getEpoch(),
+          now);
+    }
+    cache.advanceSamplingRound(round);
+  }
+
   @Test
   public void restrictsEdgesButPreservesTopologyAndUnfilteredCost() {
     TConsensusGroupId group = new TConsensusGroupId(TConsensusGroupType.DataRegion, 1);

@@ -37,6 +37,7 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -149,7 +150,97 @@ public class ReplicationBacklogCacheTest {
   }
 
   @Test
-  public void threeWarmupSamplesAndThreeLightVotesRequireFiveRealObservations() throws Exception {
+  public void missingSourceContributesItsLastValuesForExactlyMRounds() throws Exception {
+    for (int rounds : new int[] {1, 3}) {
+      ReplicationBacklogCache cache = cache("ENFORCE", rounds);
+      send(cache, 1, report(1, 1, (byte) 1, edge(2, 5, 0, 0, 0), edge(3, 10, 0, 0, 0)), SECOND);
+      send(cache, 2, report(2, 1, (byte) 1, edge(1, 30, 0, 0, 0), edge(3, 10, 0, 0, 0)), SECOND);
+      send(cache, 3, v1(3, 1, BACKLOG), SECOND);
+      cache.advanceSamplingRound(1);
+      for (int missing = 1; missing <= rounds + 1; missing++) {
+        int round = missing + 1;
+        long now = round * 5 * SECOND;
+        send(cache, 1, report(1, round, (byte) 1, edge(2, 50, 0, 0, 0), edge(3, 4, 0, 0, 0)), now);
+        send(cache, 3, v1(3, round, BACKLOG), now);
+        cache.advanceSamplingRound(round);
+        assertEquals(missing <= rounds ? 30 : 0, diagnostic(cache, 1).getCounts()[0], 0);
+        assertEquals(50, diagnostic(cache, 2).getCounts()[0], 0);
+        assertEquals(missing <= rounds ? 14 : 4, diagnostic(cache, 3).getCounts()[0], 0);
+        double[] ewma = diagnostic(cache, 3).getSmoothedCounts();
+        for (int call = 0; call < 10; call++) {
+          cache.advanceSamplingRound(round);
+          cache.evaluate(RUNNING, now);
+          cache.captureSelection(now);
+        }
+        assertArrayEquals(ewma, diagnostic(cache, 3).getSmoothedCounts(), 0);
+      }
+      // Dropping an input does not erase the EWMA's history.
+      assertEquals(15, diagnostic(cache, 1).getSmoothedCounts()[0], 0);
+    }
+  }
+
+  @Test
+  public void onlyANewValidSampleRenewsTheReuseWindow() throws Exception {
+    ReplicationBacklogCache cache = cache("ENFORCE", 1);
+    sample(cache, 1);
+    cache.advanceSamplingRound(2);
+    send(cache, 2, v1(2, 2, new long[] {40, 5, 20}), 15 * SECOND);
+    cache.advanceSamplingRound(3);
+    assertEquals(40, diagnostic(cache, 1).getCounts()[0], 0);
+    send(cache, 2, v1(2, 2, new long[] {999, 5, 20}), 20 * SECOND);
+    cache.advanceSamplingRound(4);
+    assertEquals(40, diagnostic(cache, 1).getCounts()[0], 0);
+    TReplicationBacklogReport invalid = v1(2, 3, BACKLOG);
+    invalid.getGroups().get(0).setState((byte) 3);
+    send(cache, 2, invalid, 25 * SECOND);
+    cache.advanceSamplingRound(5);
+    assertEquals(0, diagnostic(cache, 1).getCounts()[0], 0);
+    send(cache, 2, v1(2, 4, new long[] {7, 5, 20}), 30 * SECOND);
+    cache.advanceSamplingRound(6);
+    assertEquals(7, diagnostic(cache, 1).getCounts()[0], 0);
+  }
+
+  @Test
+  public void heldInputsConfirmLightAndMissingSourceHasNoHeavyPenalty() throws Exception {
+    ReplicationBacklogCache cache = cache();
+    for (int round = 1; round <= 3; round++) {
+      sample(cache, round, new long[] {5, 5, 5}, RUNNING);
+    }
+    for (int round = 4; round <= 9; round++) {
+      long now = round * 5 * SECOND;
+      send(cache, 1, v1(1, round, new long[] {5, 5, 5}), now);
+      send(cache, 3, v1(3, round, new long[] {5, 5, 5}), now);
+      cache.advanceSamplingRound(round);
+      if (round >= 5) {
+        for (int target : MEMBERS) {
+          assertFalse(diagnostic(cache, target).isHeavy());
+        }
+      }
+    }
+  }
+
+  @Test
+  public void v2ReusesAndExpiresEachCategoryWithoutClearingOtherSources() throws Exception {
+    ReplicationBacklogCache cache = cache();
+    send(cache, 1, report(1, 1, (byte) 2, edge(2, 0, 5, 1, 2), edge(3, 0, 100, 2, 1)), SECOND);
+    send(cache, 2, report(2, 1, (byte) 2, edge(1, 0, 30, 1, 2), edge(3, 0, 40, 3, 2)), SECOND);
+    send(cache, 3, report(3, 1, (byte) 2, edge(1, 0, 0, 0, 0), edge(2, 0, 0, 0, 0)), SECOND);
+    cache.advanceSamplingRound(1);
+    for (int round = 2; round <= 5; round++) {
+      long now = round * 5 * SECOND;
+      send(cache, 1, report(1, round, (byte) 2, edge(2, 0, 5, 1, 2), edge(3, 0, 100, 2, 1)), now);
+      send(cache, 3, report(3, round, (byte) 2, edge(1, 0, 0, 0, 0), edge(2, 0, 0, 0, 0)), now);
+      cache.advanceSamplingRound(round);
+      assertArrayEquals(
+          round <= 4 ? new double[] {0, 140, 5, 3} : new double[] {0, 100, 2, 1},
+          diagnostic(cache, 3).getCounts(),
+          0);
+      assertArrayEquals(new double[] {0, 5, 1, 2}, diagnostic(cache, 2).getCounts(), 0);
+    }
+  }
+
+  @Test
+  public void threeWarmupSamplesAndThreeLightVotesRequireFiveRoundObservations() throws Exception {
     ReplicationBacklogCache cache = cache();
     for (int sequence = 1; sequence <= 5; sequence++) {
       sample(cache, sequence);
@@ -178,15 +269,19 @@ public class ReplicationBacklogCacheTest {
   }
 
   @Test
-  public void everyRealObservationIsClassifiedEvenWithoutScheduledEvaluation() throws Exception {
+  public void reportsOnlyUpdateInputsUntilTheNextSamplingRound() throws Exception {
     ReplicationBacklogCache cache = cache();
     for (int sequence = 1; sequence <= 5; sequence++) {
       for (int source = 1; source <= 3; source++) {
         send(cache, source, v1(source, sequence, BACKLOG), sequence * 5 * SECOND);
       }
     }
-    assertEquals(Set.of(2), cache.eligibleCandidates(0).get(GROUP));
-    assertEquals(3, diagnostic(cache, 2).getLightStreak());
+    assertTrue(cache.eligibleCandidates(0).isEmpty());
+    assertEquals(0, diagnostic(cache, 2).getWarmupSamples());
+    cache.advanceSamplingRound(1);
+    assertEquals(1, diagnostic(cache, 2).getWarmupSamples());
+    assertEquals(5, diagnostic(cache, 2).getCounts()[0], 0);
+    assertEquals(0, diagnostic(cache, 2).getLightStreak());
   }
 
   @Test
@@ -204,6 +299,7 @@ public class ReplicationBacklogCacheTest {
       for (int source = 1; source <= 3; source++) {
         send(cache, source, v1(source, sequence, incoming), sequence * 5 * SECOND);
       }
+      cache.advanceSamplingRound(sequence);
     }
     assertTrue(diagnostic(cache, 1).isHeavy());
     assertEquals(2, diagnostic(cache, 1).getLightStreak());
@@ -240,7 +336,7 @@ public class ReplicationBacklogCacheTest {
   }
 
   @Test
-  public void missingReportsKeepEwmaButThreeSamplingRoundsRestoreHeavy() throws Exception {
+  public void missingInputsExpireWithoutForcingLightReplicasHeavy() throws Exception {
     ReplicationBacklogCache cache = warmedCache();
     double ewma = diagnostic(cache, 2).getSmoothedCounts()[0];
     for (int round = 6; round <= 8; round++) {
@@ -251,22 +347,29 @@ public class ReplicationBacklogCacheTest {
         cache.advanceSamplingRound(round);
       }
       assertEquals(round - 5, diagnostic(cache, 2).getMissingRounds());
-      assertEquals(round == 8, diagnostic(cache, 2).isHeavy());
+      assertFalse(diagnostic(cache, 2).isHeavy());
       assertEquals(ewma, diagnostic(cache, 2).getSmoothedCounts()[0], 0);
     }
-    assertTrue(cache.eligibleCandidates(0).isEmpty());
-    assertEquals(0, diagnostic(cache, 2).getLightStreak());
-    assertFalse(diagnostic(cache, 2).isKnown());
-    for (int sequence = 9; sequence <= 11; sequence++) {
-      sample(cache, sequence);
-      // Missing samples do not trigger another N-sample warmup.
-      assertEquals(3, diagnostic(cache, 2).getWarmupSamples());
-      assertEquals(sequence < 11, diagnostic(cache, 2).isHeavy());
+    assertEquals(Set.of(2), cache.eligibleCandidates(0).get(GROUP));
+    cache.advanceSamplingRound(9);
+    assertEquals(0, diagnostic(cache, 2).getCounts()[0], 0);
+    assertEquals(ewma / 2, diagnostic(cache, 2).getSmoothedCounts()[0], 0);
+    assertEquals(3, diagnostic(cache, 2).getLightStreak());
+    assertTrue(diagnostic(cache, 2).isKnown());
+    for (int round = 10; round <= 12; round++) {
+      cache.advanceSamplingRound(round);
     }
+    for (int target : MEMBERS) {
+      assertFalse(diagnostic(cache, target).isHeavy());
+    }
+    assertTrue(cache.eligibleCandidates(0).isEmpty());
+    sample(cache, 13);
+    assertEquals(3, diagnostic(cache, 2).getWarmupSamples());
+    assertFalse(diagnostic(cache, 2).isHeavy());
   }
 
   @Test
-  public void missingDoesNotSupplyALightVoteAndFreshValuesResumeConfirmation() throws Exception {
+  public void heldInputsSupplyOneLightVotePerSamplingRound() throws Exception {
     ReplicationBacklogCache cache = cache();
     for (int sequence = 1; sequence <= 3; sequence++) {
       sample(cache, sequence);
@@ -274,15 +377,16 @@ public class ReplicationBacklogCacheTest {
     cache.advanceSamplingRound(4);
     cache.advanceSamplingRound(5);
     cache.evaluate(RUNNING, 25 * SECOND);
-    assertEquals(1, diagnostic(cache, 2).getLightStreak());
+    assertEquals(3, diagnostic(cache, 2).getLightStreak());
+    assertFalse(diagnostic(cache, 2).isHeavy());
     sample(cache, 6);
-    assertEquals(2, diagnostic(cache, 2).getLightStreak());
+    assertEquals(3, diagnostic(cache, 2).getLightStreak());
     sample(cache, 7);
     assertFalse(diagnostic(cache, 2).isHeavy());
   }
 
   @Test
-  public void firstSamplingRoundIsOnlyABaseline() throws Exception {
+  public void samplingWithoutAnyHistoryCannotBootstrapAnObservation() throws Exception {
     ReplicationBacklogCache cache = cache();
     cache.advanceSamplingRound(10);
     assertEquals(0, diagnostic(cache, 1).getMissingRounds());
@@ -290,7 +394,9 @@ public class ReplicationBacklogCacheTest {
     cache.advanceSamplingRound(9);
     assertEquals(0, diagnostic(cache, 1).getMissingRounds());
     cache.advanceSamplingRound(11);
-    assertEquals(1, diagnostic(cache, 1).getMissingRounds());
+    assertEquals(0, diagnostic(cache, 1).getWarmupSamples());
+    assertFalse(diagnostic(cache, 1).isKnown());
+    assertTrue(diagnostic(cache, 1).isHeavy());
   }
 
   @Test
@@ -304,29 +410,36 @@ public class ReplicationBacklogCacheTest {
       cache.evaluate(RUNNING, now);
       cache.advanceSamplingRound(sequence);
     }
-    assertEquals(Set.of(2), cache.eligibleCandidates(0).get(GROUP));
-    assertFalse(diagnostic(cache, 1).isKnown());
-    assertFalse(diagnostic(cache, 3).isKnown());
+    assertEquals(Set.of(1, 2), cache.eligibleCandidates(0).get(GROUP));
+    assertTrue(diagnostic(cache, 1).isKnown());
+    assertTrue(diagnostic(cache, 3).isKnown());
     assertEquals(5, diagnostic(cache, 2).getCounts()[0], 0);
   }
 
   @Test
-  public void alternatingMissingSourcesCannotReuseOldEdgesAsNewObservations() throws Exception {
+  public void alternatingMissingSourcesReuseTheirInputsOncePerRound() throws Exception {
     ReplicationBacklogCache cache = cache();
     send(cache, 1, v1(1, 1, BACKLOG), 5 * SECOND);
     send(cache, 3, v1(3, 1, BACKLOG), 5 * SECOND);
+    cache.advanceSamplingRound(1);
     assertEquals(1, diagnostic(cache, 2).getWarmupSamples());
     send(cache, 1, v1(1, 2, BACKLOG), 10 * SECOND);
+    cache.advanceSamplingRound(2);
+    assertEquals(2, diagnostic(cache, 2).getWarmupSamples());
     send(cache, 1, v1(1, 3, BACKLOG), 15 * SECOND);
-    assertEquals(1, diagnostic(cache, 2).getWarmupSamples());
+    cache.advanceSamplingRound(3);
+    assertEquals(3, diagnostic(cache, 2).getWarmupSamples());
     send(cache, 3, v1(3, 2, BACKLOG), 20 * SECOND);
-    assertEquals(2, diagnostic(cache, 2).getWarmupSamples());
+    cache.advanceSamplingRound(4);
+    assertEquals(2, diagnostic(cache, 2).getLightStreak());
     send(cache, 3, v1(3, 3, BACKLOG), 25 * SECOND);
-    assertEquals(2, diagnostic(cache, 2).getWarmupSamples());
+    cache.advanceSamplingRound(5);
+    assertEquals(3, diagnostic(cache, 2).getLightStreak());
+    assertFalse(diagnostic(cache, 2).isHeavy());
   }
 
   @Test
-  public void unreadyAndLongMissingTargetsCannotActAsZeroLoadWitnesses() throws Exception {
+  public void absentInputsContributeZeroWithoutBlockingKnownSources() throws Exception {
     ReplicationBacklogCache cache = cache();
     long[] incoming = {1000, 1000, 1000};
     for (int sequence = 1; sequence <= 5; sequence++) {
@@ -336,8 +449,9 @@ public class ReplicationBacklogCacheTest {
       cache.evaluate(RUNNING, now);
       cache.advanceSamplingRound(sequence);
     }
-    assertFalse(diagnostic(cache, 2).isHeavy());
-    assertEquals(Set.of(2), cache.eligibleCandidates(0).get(GROUP));
+    assertFalse(diagnostic(cache, 1).isHeavy());
+    assertTrue(diagnostic(cache, 2).isHeavy());
+    assertEquals(Set.of(1), cache.eligibleCandidates(0).get(GROUP));
   }
 
   @Test
@@ -369,7 +483,7 @@ public class ReplicationBacklogCacheTest {
   }
 
   @Test
-  public void anExpiredMissingEstimateIsNoLongerALighterReference() throws Exception {
+  public void expiringAnAlreadyZeroSourceDoesNotChangeTheOtherLoads() throws Exception {
     ReplicationBacklogCache cache = warmedCache();
     for (int sequence = 6; sequence <= 11; sequence++) {
       long now = sequence * 5 * SECOND;
@@ -379,9 +493,9 @@ public class ReplicationBacklogCacheTest {
       cache.evaluate(RUNNING, now);
     }
     assertEquals(5, diagnostic(cache, 2).getSmoothedCounts()[0], 0);
-    assertTrue(diagnostic(cache, 2).isHeavy());
-    assertFalse(diagnostic(cache, 3).isHeavy());
-    assertEquals(Set.of(3), cache.eligibleCandidates(0).get(GROUP));
+    assertFalse(diagnostic(cache, 2).isHeavy());
+    assertTrue(diagnostic(cache, 3).isHeavy());
+    assertEquals(Set.of(2), cache.eligibleCandidates(0).get(GROUP));
   }
 
   @Test
@@ -451,6 +565,7 @@ public class ReplicationBacklogCacheTest {
       send(cache, source, v1(source, 6, BACKLOG).setSampleAgeNanos(5 * SECOND), 30 * SECOND);
     }
     cache.evaluate(RUNNING, 30 * SECOND);
+    cache.advanceSamplingRound(6);
     assertEquals(0, diagnostic(cache, 2).getWarmupSamples());
     sample(cache, 7);
     assertEquals(1, diagnostic(cache, 2).getWarmupSamples());
@@ -486,11 +601,12 @@ public class ReplicationBacklogCacheTest {
     assertEquals(0, diagnostic(cache, 2).getWarmupSamples());
     assertEquals(3, diagnostic(cache, 1).getWarmupSamples());
     assertEquals(3, diagnostic(cache, 3).getWarmupSamples());
-    // Only the recovered target can form a new incoming observation while this source is missing.
+    // The recovered target warms up; the others continue with zero for the replaced source.
     send(cache, 1, v1(1, 6, BACKLOG), 31 * SECOND);
     send(cache, 3, v1(3, 6, BACKLOG), 31 * SECOND);
+    cache.advanceSamplingRound(6);
     assertEquals(1, diagnostic(cache, 2).getWarmupSamples());
-    assertEquals(30, diagnostic(cache, 1).getCounts()[0], 0);
+    assertEquals(0, diagnostic(cache, 1).getCounts()[0], 0);
   }
 
   @Test
@@ -577,7 +693,10 @@ public class ReplicationBacklogCacheTest {
     cache.advanceSamplingRound(6);
     cache.advanceSamplingRound(7);
     cache.advanceSamplingRound(8);
-    assertTrue(diagnostic(cache, 2).isHeavy());
+    assertFalse(diagnostic(cache, 2).isHeavy());
+    assertEquals(5, diagnostic(cache, 2).getCounts()[0], 0);
+    cache.advanceSamplingRound(9);
+    assertEquals(0, diagnostic(cache, 2).getCounts()[0], 0);
   }
 
   @Test
@@ -593,7 +712,7 @@ public class ReplicationBacklogCacheTest {
   }
 
   @Test
-  public void ewmaUsesUniqueCompleteIncomingObservations() throws Exception {
+  public void ewmaUsesOneAggregatePerSamplingRound() throws Exception {
     ReplicationBacklogCache cache = cache("OBSERVE", 3);
     sample(cache, 1, new long[] {30, 100, 20}, RUNNING);
     sample(cache, 2, new long[] {30, 1000, 20}, RUNNING);
@@ -618,6 +737,7 @@ public class ReplicationBacklogCacheTest {
     cache.cacheReport(
         1, v1(1, 100, new long[] {30, 9999, 20}), 29 * SECOND, cache.getEpoch(), 31 * SECOND);
     send(cache, 3, v1(3, 1, BACKLOG), 31 * SECOND);
+    cache.advanceSamplingRound(1);
     assertEquals(5, diagnostic(cache, 2).getCounts()[0], 0);
   }
 
@@ -684,6 +804,11 @@ public class ReplicationBacklogCacheTest {
     cache.advanceSamplingRound(8);
     assertTrue(cache.isSelectionValid(snapshot, 1000 * SECOND));
     cache.advanceSamplingRound(9);
+    assertTrue(cache.isSelectionValid(snapshot, 1000 * SECOND));
+    cache.advanceSamplingRound(10);
+    cache.advanceSamplingRound(11);
+    assertTrue(cache.isSelectionValid(snapshot, 1000 * SECOND));
+    cache.advanceSamplingRound(12);
     assertFalse(cache.isSelectionValid(snapshot, 1000 * SECOND));
   }
 
