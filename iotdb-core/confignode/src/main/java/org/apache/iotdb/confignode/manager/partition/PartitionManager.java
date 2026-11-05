@@ -1603,6 +1603,24 @@ public class PartitionManager {
                     break;
                   }
 
+                  if (!consensusManager.isLeader()) {
+                    break;
+                  }
+
+                  // Persist completion before advancing to the next replica of a Region.
+                  // If the write fails, stop this round and reload the applied queue next round.
+                  try {
+                    TSStatus status =
+                        getConsensusManager()
+                            .write(new PollSpecificRegionMaintainTaskPlan(successfulTask));
+                    if (status.getCode() != TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
+                      throw new ConsensusException(status.toString());
+                    }
+                  } catch (ConsensusException e) {
+                    LOGGER.warn(CONSENSUS_WRITE_ERROR, e);
+                    break;
+                  }
+
                   for (TConsensusGroupId regionId : successfulTask) {
                     regionMaintainTaskMap.compute(
                         regionId,
@@ -1619,14 +1637,6 @@ public class PartitionManager {
                         });
                   }
 
-                  // Poll the head entry if success
-                  try {
-                    getConsensusManager()
-                        .write(new PollSpecificRegionMaintainTaskPlan(successfulTask));
-                  } catch (ConsensusException e) {
-                    LOGGER.warn(CONSENSUS_WRITE_ERROR, e);
-                  }
-
                   if (successfulTask.size() < selectedRegionMaintainTask.size()) {
                     // Here we just break and wait until next schedule task
                     // due to all the RegionMaintainEntry should be executed by
@@ -1640,12 +1650,7 @@ public class PartitionManager {
 
   static boolean isRegionMaintainTaskCompleted(
       RegionMaintainType regionMaintainType, TSStatus status) {
-    if (status.getCode() == TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
-      return true;
-    }
-    return regionMaintainType == RegionMaintainType.CREATE
-        ? status.getCode() == TSStatusCode.REGION_ALREADY_EXISTS.getStatusCode()
-        : status.getCode() == TSStatusCode.REGION_NOT_EXIST.getStatusCode();
+    return regionMaintainType.isCompleted(status);
   }
 
   public void startRegionCleaner() {

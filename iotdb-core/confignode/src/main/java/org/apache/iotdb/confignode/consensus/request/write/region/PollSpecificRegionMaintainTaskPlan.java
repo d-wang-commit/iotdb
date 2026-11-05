@@ -48,6 +48,12 @@ public class PollSpecificRegionMaintainTaskPlan extends ConfigPhysicalPlan {
   }
 
   @Override
+  public boolean isForwardable() {
+    // This poll is based on the local leader's selected queue heads.
+    return false;
+  }
+
+  @Override
   protected void serializeImpl(DataOutputStream stream) throws IOException {
     stream.writeShort(getType().getPlanType());
 

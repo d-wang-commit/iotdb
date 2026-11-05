@@ -19,7 +19,19 @@
 
 package org.apache.iotdb.confignode.persistence.partition.maintainer;
 
+import org.apache.iotdb.common.rpc.thrift.TSStatus;
+import org.apache.iotdb.rpc.TSStatusCode;
+
 public enum RegionMaintainType {
   CREATE,
-  DELETE
+  DELETE;
+
+  public boolean isCompleted(TSStatus status) {
+    if (status.getCode() == TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
+      return true;
+    }
+    return this == CREATE
+        ? status.getCode() == TSStatusCode.REGION_ALREADY_EXISTS.getStatusCode()
+        : status.getCode() == TSStatusCode.REGION_NOT_EXIST.getStatusCode();
+  }
 }

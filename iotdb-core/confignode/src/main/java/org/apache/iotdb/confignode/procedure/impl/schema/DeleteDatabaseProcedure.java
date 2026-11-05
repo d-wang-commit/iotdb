@@ -35,6 +35,7 @@ import org.apache.iotdb.confignode.consensus.request.write.region.OfferRegionMai
 import org.apache.iotdb.confignode.i18n.ProcedureMessages;
 import org.apache.iotdb.confignode.manager.partition.PartitionMetrics;
 import org.apache.iotdb.confignode.persistence.partition.maintainer.RegionDeleteTask;
+import org.apache.iotdb.confignode.persistence.partition.maintainer.RegionMaintainType;
 import org.apache.iotdb.confignode.procedure.env.ConfigNodeProcedureEnv;
 import org.apache.iotdb.confignode.procedure.exception.ProcedureException;
 import org.apache.iotdb.confignode.procedure.impl.StateMachineProcedure;
@@ -146,7 +147,11 @@ public class DeleteDatabaseProcedure
 
           if (!dataRegionDeleteTaskOfferPlan.getRegionMaintainTaskList().isEmpty()) {
             // submit async data region delete task
-            env.getConfigManager().getConsensusManager().write(dataRegionDeleteTaskOfferPlan);
+            final TSStatus offerStatus =
+                env.getConfigManager().getConsensusManager().write(dataRegionDeleteTaskOfferPlan);
+            if (offerStatus.getCode() != TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
+              throw new ConsensusException(offerStatus.toString());
+            }
           }
 
           // try sync delete schemaengine region
@@ -170,7 +175,7 @@ public class DeleteDatabaseProcedure
                 .sendAsyncRequestWithRetry(asyncClientHandler);
             for (final Map.Entry<Integer, TSStatus> entry :
                 asyncClientHandler.getResponseMap().entrySet()) {
-              if (entry.getValue().getCode() == TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
+              if (RegionMaintainType.DELETE.isCompleted(entry.getValue())) {
                 LOG.info(
                     ProcedureMessages
                         .LOG_DELETEDATABASEPROCEDURE_SUCCESSFULLY_DELETE_SCHEMAREGION_ARG_ARG_BA0535DA,
@@ -193,7 +198,13 @@ public class DeleteDatabaseProcedure
               schemaRegionDeleteTaskMap
                   .values()
                   .forEach(schemaRegionDeleteTaskOfferPlan::appendRegionMaintainTask);
-              env.getConfigManager().getConsensusManager().write(schemaRegionDeleteTaskOfferPlan);
+              final TSStatus offerStatus =
+                  env.getConfigManager()
+                      .getConsensusManager()
+                      .write(schemaRegionDeleteTaskOfferPlan);
+              if (offerStatus.getCode() != TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
+                throw new ConsensusException(offerStatus.toString());
+              }
             }
           }
 
@@ -225,6 +236,8 @@ public class DeleteDatabaseProcedure
             setFailure(
                 new ProcedureException(
                     ProcedureMessages.DELETEDATABASEPROCEDURE_DELETE_DATABASESCHEMA_FAILED));
+          } else {
+            setNextState(state);
           }
       }
     } catch (final ConsensusException | TException | IOException e) {
@@ -246,6 +259,8 @@ public class DeleteDatabaseProcedure
           setFailure(
               new ProcedureException(
                   ProcedureMessages.DELETEDATABASEPROCEDURE_STATE_STUCK_AT + state));
+        } else {
+          setNextState(state);
         }
       }
     }
