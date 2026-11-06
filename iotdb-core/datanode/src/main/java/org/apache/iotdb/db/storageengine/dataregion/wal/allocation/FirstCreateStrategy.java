@@ -26,6 +26,7 @@ import org.apache.iotdb.db.storageengine.dataregion.wal.WALManager;
 import org.apache.iotdb.db.storageengine.dataregion.wal.node.IWALNode;
 import org.apache.iotdb.db.storageengine.dataregion.wal.node.WALNode;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -91,20 +92,17 @@ public class FirstCreateStrategy extends AbstractNodeAllocationStrategy {
     }
   }
 
-  public void deleteWALNode(String applicantUniqueId) {
+  public void deleteWALNode(String applicantUniqueId) throws IOException {
     nodesLock.lock();
     try {
       WALNode walNode = identifier2Nodes.remove(applicantUniqueId);
       if (walNode != null) {
         walNode.setDeleted(true);
         walNode.close();
-        if (walNode.getLogDirectory().exists()) {
-          FileUtils.deleteFileOrDirectoryWithRateLimiter(
-              walNode.getLogDirectory(),
-              RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
-        }
         WALManager.getInstance().subtractTotalDiskUsage(walNode.getDiskUsage());
         WALManager.getInstance().subtractTotalFileNum(walNode.getFileNum());
+        FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(
+            walNode.getLogDirectory(), RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
       }
     } finally {
       nodesLock.unlock();

@@ -22,6 +22,7 @@ package org.apache.iotdb.db.pipe.consensus.deletion;
 import org.apache.iotdb.commons.consensus.index.ProgressIndex;
 import org.apache.iotdb.commons.consensus.index.impl.SimpleProgressIndex;
 import org.apache.iotdb.commons.utils.FileUtils;
+import org.apache.iotdb.commons.utils.RegionMigrationFileRemoveRateLimiter;
 import org.apache.iotdb.commons.utils.TestOnly;
 import org.apache.iotdb.consensus.pipe.IoTConsensusV2;
 import org.apache.iotdb.db.conf.IoTDBDescriptor;
@@ -73,11 +74,7 @@ public class DeletionResourceManager implements AutoCloseable {
 
   private DeletionResourceManager(int dataRegionId) throws IOException {
     this.dataRegionId = dataRegionId;
-    this.storageDir =
-        new File(
-            IoTDBDescriptor.getInstance().getConfig().getIotConsensusV2DeletionFileDir()
-                + File.separator
-                + dataRegionId);
+    this.storageDir = getStorageDir(dataRegionId);
     this.deletionBuffer = new PageCacheDeletionBuffer(dataRegionId, storageDir.getAbsolutePath());
     initAndRecover();
     // Only after initAndRecover can we start serialize and sync new deletions.
@@ -174,6 +171,25 @@ public class DeletionResourceManager implements AutoCloseable {
     } finally {
       recoverLock.unlock();
     }
+  }
+
+  private static File getStorageDir(int dataRegionId) {
+    return new File(
+        IoTDBDescriptor.getInstance().getConfig().getIotConsensusV2DeletionFileDir(),
+        Integer.toString(dataRegionId));
+  }
+
+  public static void deleteForRegion(int dataRegionId) throws IOException {
+    Map<Integer, DeletionResourceManager> managers =
+        DeletionResourceManagerHolder.CONSENSUS_GROUP_ID_2_INSTANCE_MAP;
+    if (managers != null) {
+      DeletionResourceManager manager = managers.get(dataRegionId);
+      if (manager != null) {
+        manager.close();
+      }
+    }
+    FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(
+        getStorageDir(dataRegionId), RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
   }
 
   public void removeDAL() {

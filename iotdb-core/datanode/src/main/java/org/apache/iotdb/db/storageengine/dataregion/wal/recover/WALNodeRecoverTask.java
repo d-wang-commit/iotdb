@@ -24,9 +24,11 @@ import org.apache.iotdb.commons.utils.FileUtils;
 import org.apache.iotdb.consensus.ConsensusFactory;
 import org.apache.iotdb.db.conf.IoTDBConfig;
 import org.apache.iotdb.db.conf.IoTDBDescriptor;
+import org.apache.iotdb.db.exception.runtime.StorageEngineFailureException;
 import org.apache.iotdb.db.i18n.StorageEngineMessages;
 import org.apache.iotdb.db.queryengine.plan.planner.plan.node.write.SearchNode;
 import org.apache.iotdb.db.service.metrics.DataNodeExceptionMetrics;
+import org.apache.iotdb.db.storageengine.StorageEngine;
 import org.apache.iotdb.db.storageengine.dataregion.memtable.AbstractMemTable;
 import org.apache.iotdb.db.storageengine.dataregion.wal.WALManager;
 import org.apache.iotdb.db.storageengine.dataregion.wal.buffer.WALEntry;
@@ -51,11 +53,16 @@ import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.nio.file.DirectoryIteratorException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
@@ -173,11 +180,21 @@ public class WALNodeRecoverTask implements Runnable {
               .STORAGE_LOG_SUCCESSFULLY_RECOVER_WAL_NODE_IN_THE_DIRECTORY_ADD_THIS_FA6ADE22,
           logDirectory);
     } else {
-      if (cleanupRecoveredDirectory(logDirectory)) {
-        logger.info(
-            StorageEngineMessages
-                .STORAGE_LOG_SUCCESSFULLY_RECOVER_WAL_NODE_IN_THE_DIRECTORY_SO_DELETE_A17892D9,
-            logDirectory);
+      try {
+        if (cleanupRecoveredDirectory(logDirectory)) {
+          logger.info(
+              StorageEngineMessages
+                  .STORAGE_LOG_SUCCESSFULLY_RECOVER_WAL_NODE_IN_THE_DIRECTORY_SO_DELETE_A17892D9,
+              logDirectory);
+        }
+      } catch (IOException e) {
+        // After a restart an Elastic WAL no longer records which Regions shared it.
+        if (ConsensusFactory.SIMPLE_CONSENSUS.equals(config.getDataRegionConsensusProtocolClass())
+            && config.getMaxWalNodesNum() == 0
+            && StorageEngine.hasPendingDataRegionDeletions()) {
+          throw new StorageEngineFailureException(StorageEngineMessages.FAIL_TO_RECOVER_WAL, e);
+        }
+        logger.warn(StorageEngineMessages.FAILED_TO_CLEANUP_DIRECTORY, logDirectory, e);
       }
     }
 
@@ -256,25 +273,30 @@ public class WALNodeRecoverTask implements Runnable {
   }
 
   /** Clears recovered logs but retains quarantined files for diagnosis across restarts. */
-  static boolean cleanupRecoveredDirectory(File directory) {
-    File[] quarantined =
-        directory.listFiles((dir, name) -> name.matches(".*\\.wal\\.broken(?:\\.\\d+)?"));
-    if (quarantined == null) {
-      return false;
+  static boolean cleanupRecoveredDirectory(File directory) throws IOException {
+    boolean hasQuarantinedFiles = false;
+    List<Path> recoveredLogs = new ArrayList<>();
+    try (DirectoryStream<Path> entries = Files.newDirectoryStream(directory.toPath())) {
+      for (Path entry : entries) {
+        String name = entry.getFileName().toString();
+        if (name.matches(".*\\.wal\\.broken(?:\\.\\d+)?")) {
+          hasQuarantinedFiles = true;
+        } else if (WALFileUtils.walFilenameFilter(directory, name)
+            || CheckpointFileUtils.checkpointFilenameFilter(directory, name)) {
+          recoveredLogs.add(entry);
+        }
+      }
+    } catch (NoSuchFileException e) {
+      return true;
+    } catch (DirectoryIteratorException e) {
+      throw e.getCause();
     }
-    if (quarantined.length == 0) {
-      FileUtils.deleteFileOrDirectory(directory);
+    if (!hasQuarantinedFiles) {
+      FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(directory, null);
       return true;
     }
-    File[] logs =
-        directory.listFiles(
-            (dir, name) ->
-                WALFileUtils.walFilenameFilter(dir, name)
-                    || CheckpointFileUtils.checkpointFilenameFilter(dir, name));
-    if (logs != null) {
-      for (File log : logs) {
-        FileUtils.deleteFileOrDirectory(log);
-      }
+    for (Path log : recoveredLogs) {
+      FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(log.toFile(), null);
     }
     return false;
   }

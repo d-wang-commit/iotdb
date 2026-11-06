@@ -91,6 +91,7 @@ import org.apache.iotdb.mpp.rpc.thrift.TDropTableModProgress;
 import org.apache.iotdb.rpc.RpcUtils;
 import org.apache.iotdb.rpc.TSStatusCode;
 
+import com.sun.nio.file.ExtendedOpenOption;
 import org.apache.tsfile.enums.TSDataType;
 import org.apache.tsfile.file.metadata.IDeviceID;
 import org.apache.tsfile.file.metadata.enums.CompressionType;
@@ -110,6 +111,7 @@ import org.apache.tsfile.write.record.datapoint.DataPoint;
 import org.apache.tsfile.write.schema.MeasurementSchema;
 import org.junit.After;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -120,6 +122,9 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -640,6 +645,55 @@ public class DataRegionTest {
     for (TsFileResource resource : queryDataSource.getSeqResources()) {
       assertTrue(resource.isClosed());
     }
+  }
+
+  @Test
+  public void testDeleteDataRegionRetriesLockedTsFile() throws Exception {
+    Assume.assumeTrue(System.getProperty("os.name").startsWith("Windows"));
+    final DataRegionId id = new DataRegionId(0);
+    insertMemoryAdmissionTestRow(1, 42);
+    dataRegion.syncCloseAllWorkingTsFileProcessors();
+    File tsFile = dataRegion.getTsFileManager().getTsFileList(true).get(0).getTsFile();
+    try (FileChannel lock =
+        FileChannel.open(
+            tsFile.toPath(), StandardOpenOption.READ, ExtendedOpenOption.NOSHARE_DELETE)) {
+      assertTrue(lock.isOpen());
+      for (int attempt = 0; attempt < 2; attempt++) {
+        Assert.assertEquals(
+            TSStatusCode.DELETE_REGION_ERROR.getStatusCode(),
+            StorageEngine.getInstance().deleteDataRegion(id).getCode());
+        assertTrue(tsFile.exists());
+        assertTrue(StorageEngine.isDataRegionDeletionPending(id));
+      }
+    }
+    Assert.assertEquals(
+        TSStatusCode.SUCCESS_STATUS.getStatusCode(),
+        StorageEngine.getInstance().deleteDataRegion(id).getCode());
+    Assert.assertFalse(tsFile.exists());
+    Assert.assertEquals(
+        TSStatusCode.REGION_NOT_EXIST.getStatusCode(),
+        StorageEngine.getInstance().deleteDataRegion(id).getCode());
+  }
+
+  @Test
+  public void testDeleteDataRegionRetriesFailedWriterClose() throws Exception {
+    Assume.assumeTrue(System.getProperty("os.name").startsWith("Windows"));
+    final DataRegionId id = new DataRegionId(0);
+    insertMemoryAdmissionTestRow(1, 42);
+    File tsFile = dataRegion.getTsFileManager().getTsFileList(true).get(0).getTsFile();
+    try (FileChannel channel = FileChannel.open(tsFile.toPath(), StandardOpenOption.WRITE);
+        FileLock lock = channel.lock(0, 1024 * 1024, false)) {
+      assertTrue(lock.isValid());
+      Assert.assertEquals(
+          TSStatusCode.DELETE_REGION_ERROR.getStatusCode(),
+          StorageEngine.getInstance().deleteDataRegion(id).getCode());
+      assertTrue(StorageEngine.isDataRegionDeletionPending(id));
+    }
+    Assert.assertEquals(
+        TSStatusCode.SUCCESS_STATUS.getStatusCode(),
+        StorageEngine.getInstance().deleteDataRegion(id).getCode());
+    Assert.assertFalse(tsFile.exists());
+    Assert.assertFalse(StorageEngine.isDataRegionDeletionPending(id));
   }
 
   @Test

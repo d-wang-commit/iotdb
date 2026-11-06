@@ -3020,16 +3020,7 @@ public class DataNodeInternalRPCServiceImpl implements IDataNodeRPCService.Iface
         ConsensusGroupId.Factory.createFromTConsensusGroupId(tconsensusGroupId);
     boolean consensusGroupDeleted = true;
     if (consensusGroupId instanceof DataRegionId) {
-      try {
-        DataRegionConsensusImpl.getInstance().deleteLocalPeer(consensusGroupId);
-      } catch (ConsensusException e) {
-        if (!(e instanceof ConsensusGroupNotExistException)) {
-          return RpcUtils.getStatus(TSStatusCode.DELETE_REGION_ERROR, e.getMessage());
-        }
-        consensusGroupDeleted = false;
-      }
-      return getDeleteRegionStatus(
-          regionManager.deleteDataRegion((DataRegionId) consensusGroupId), consensusGroupDeleted);
+      return regionManager.deleteDataRegionWithPeer((DataRegionId) consensusGroupId);
     } else {
       try {
         SchemaRegionConsensusImpl.getInstance().deleteLocalPeer(consensusGroupId);
@@ -3154,11 +3145,12 @@ public class DataNodeInternalRPCServiceImpl implements IDataNodeRPCService.Iface
                         location.getDataNodeId(),
                         getConsensusEndPoint(location, regionId)))
             .collect(Collectors.toList());
-    TSStatus status = createNewRegion(regionId, req.getStorageGroup());
-    if (!isSucceed(status)) {
-      return status;
+    if (regionId instanceof DataRegionId) {
+      synchronized (storageEngine.getDataRegionLifecycleMonitor((DataRegionId) regionId)) {
+        return createNewRegionAndPeer(regionId, req.getStorageGroup(), peers);
+      }
     }
-    return createNewRegionPeer(regionId, peers);
+    return createNewRegionAndPeer(regionId, req.getStorageGroup(), peers);
   }
 
   @Override
@@ -3256,8 +3248,10 @@ public class DataNodeInternalRPCServiceImpl implements IDataNodeRPCService.Iface
     return new TSStatus(TSStatusCode.SUCCESS_STATUS.getStatusCode());
   }
 
-  private TSStatus createNewRegion(ConsensusGroupId regionId, String database) {
-    return regionManager.createNewRegion(regionId, database);
+  private TSStatus createNewRegionAndPeer(
+      ConsensusGroupId regionId, String database, List<Peer> peers) {
+    TSStatus status = regionManager.createNewRegion(regionId, database);
+    return isSucceed(status) ? createNewRegionPeer(regionId, peers) : status;
   }
 
   @Override

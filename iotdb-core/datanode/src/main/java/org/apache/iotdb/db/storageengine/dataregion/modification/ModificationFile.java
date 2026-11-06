@@ -195,9 +195,12 @@ public class ModificationFile implements AutoCloseable {
       }
 
       fileOutputStream.close();
+      if (channel != null && channel.isOpen()) {
+        channel.force(true);
+        channel.close();
+      }
+      // Keep both handles until the channel has closed: a failed force can then be retried.
       fileOutputStream = null;
-      channel.force(true);
-      channel.close();
       channel = null;
     } finally {
       lock.writeLock().unlock();

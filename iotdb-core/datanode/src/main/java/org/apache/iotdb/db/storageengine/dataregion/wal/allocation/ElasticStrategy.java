@@ -25,6 +25,7 @@ import org.apache.iotdb.db.storageengine.dataregion.wal.WALManager;
 import org.apache.iotdb.db.storageengine.dataregion.wal.node.IWALNode;
 import org.apache.iotdb.db.storageengine.dataregion.wal.node.WALNode;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -49,6 +50,8 @@ public class ElasticStrategy extends AbstractNodeAllocationStrategy {
   private final Map<String, WALNode> uniqueId2Nodes = new HashMap<>();
   // each wal node has a unique long value identifier
   private int nodeIdCounter = -1;
+  // Closed nodes still owned by the last applicant until their directory is removed.
+  private final Map<String, WALNode> pendingDeletes = new HashMap<>();
 
   // endregion
 
@@ -81,25 +84,26 @@ public class ElasticStrategy extends AbstractNodeAllocationStrategy {
     }
   }
 
-  public void deleteUniqueIdAndMayDeleteWALNode(String applicantUniqueId) {
+  public void deleteUniqueIdAndMayDeleteWALNode(String applicantUniqueId) throws IOException {
     nodesLock.lock();
     try {
-      WALNode walNode = uniqueId2Nodes.remove(applicantUniqueId);
-      if (!uniqueId2Nodes.containsValue(walNode)) {
-        if (walNode != null) {
-          walNode.close();
-          if (walNode.getLogDirectory().exists()) {
-            FileUtils.deleteFileOrDirectoryWithRateLimiter(
-                walNode.getLogDirectory(),
-                RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
-          }
-          WALManager.getInstance().subtractTotalDiskUsage(walNode.getDiskUsage());
-          WALManager.getInstance().subtractTotalFileNum(walNode.getFileNum());
+      WALNode walNode = pendingDeletes.get(applicantUniqueId);
+      if (walNode == null) {
+        walNode = uniqueId2Nodes.remove(applicantUniqueId);
+        if (walNode == null || uniqueId2Nodes.containsValue(walNode)) {
+          return;
         }
         walNodes.remove(walNode);
-        if (walNodes.isEmpty()) {
-          nodeIdCounter = -1;
-        }
+        pendingDeletes.put(applicantUniqueId, walNode);
+        walNode.close();
+      }
+      FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(
+          walNode.getLogDirectory(), RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
+      WALManager.getInstance().subtractTotalDiskUsage(walNode.getDiskUsage());
+      WALManager.getInstance().subtractTotalFileNum(walNode.getFileNum());
+      pendingDeletes.remove(applicantUniqueId);
+      if (walNodes.isEmpty() && pendingDeletes.isEmpty()) {
+        nodeIdCounter = -1;
       }
     } finally {
       nodesLock.unlock();
@@ -129,6 +133,7 @@ public class ElasticStrategy extends AbstractNodeAllocationStrategy {
     try {
       nodeIdCounter = -1;
       uniqueId2Nodes.clear();
+      pendingDeletes.clear();
       for (WALNode walNode : walNodes) {
         walNode.close();
       }

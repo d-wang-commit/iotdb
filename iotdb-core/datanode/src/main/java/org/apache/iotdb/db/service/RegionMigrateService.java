@@ -19,6 +19,7 @@
 package org.apache.iotdb.db.service;
 
 import org.apache.iotdb.common.rpc.thrift.TConsensusGroupId;
+import org.apache.iotdb.common.rpc.thrift.TConsensusGroupType;
 import org.apache.iotdb.common.rpc.thrift.TDataNodeLocation;
 import org.apache.iotdb.common.rpc.thrift.TEndPoint;
 import org.apache.iotdb.common.rpc.thrift.TRegionMaintainTaskStatus;
@@ -218,7 +219,7 @@ public class RegionMigrateService implements IService {
   public synchronized boolean submitDeleteOldRegionPeerTask(TMaintainPeerReq req) {
     boolean submitSucceed = true;
     try {
-      if (!addToTaskResultMap(req.getTaskId())) {
+      if (!beginDeleteOldRegionPeer(req)) {
         LOGGER.warn(
             DataNodeMiscMessages
                 .MISC_LOG_THE_DELETEOLDREGIONPEERTASK_HAS_ALREADY_BEEN_SUBMITTED_AND_75815D37,
@@ -229,6 +230,9 @@ public class RegionMigrateService implements IService {
       regionMigratePool.submit(
           new DeleteOldRegionPeerTask(req.getTaskId(), req.getRegionId(), req.getDestNode()));
     } catch (Exception e) {
+      if (req.getRegionId().getType() == TConsensusGroupType.DataRegion) {
+        taskResultMap.remove(req.getTaskId(), unfinishedResult);
+      }
       LOGGER.error(
           DataNodeMiscMessages.MISC_LOG_SUBMIT_DELETEOLDREGIONPEERTASK_ERROR_FOR_REGION_460C308A,
           REGION_MIGRATE_PROCESS,
@@ -237,6 +241,21 @@ public class RegionMigrateService implements IService {
       submitSucceed = false;
     }
     return submitSucceed;
+  }
+
+  private boolean beginDeleteOldRegionPeer(TMaintainPeerReq req) {
+    TRegionMigrateResult previous = taskResultMap.putIfAbsent(req.getTaskId(), unfinishedResult);
+    if (previous == null) {
+      return true;
+    }
+    // A ConfigNode retries the same procedure ID after observing a failed deletion.
+    return req.getRegionId().getType() == TConsensusGroupType.DataRegion
+        && previous.getTaskStatus() == TRegionMaintainTaskStatus.FAIL
+        && req.getRegionId().equals(previous.getRegionId())
+        && previous.isSetFailedNodeAndReason()
+        && previous.getFailedNodeAndReason().get(req.getDestNode())
+            == TRegionMigrateFailedType.DeleteRegionFailed
+        && taskResultMap.replace(req.getTaskId(), previous, unfinishedResult);
   }
 
   public synchronized TSStatus resetPeerList(TResetPeerListReq req) {
@@ -508,6 +527,24 @@ public class RegionMigrateService implements IService {
 
     @Override
     public void run() {
+      if (tRegionId.getType() == TConsensusGroupType.DataRegion) {
+        TSStatus status =
+            DataNodeRegionManager.getInstance()
+                .deleteDataRegionWithPeer(new DataRegionId(tRegionId.getId()));
+        if (isSucceed(status)
+            || status.getCode() == TSStatusCode.REGION_NOT_EXIST.getStatusCode()) {
+          taskSucceed(taskId, tRegionId, "DeletePeer");
+        } else {
+          taskFail(
+              taskId,
+              tRegionId,
+              originalDataNode,
+              TRegionMigrateFailedType.DeleteRegionFailed,
+              status);
+        }
+        return;
+      }
+
       // deletePeer: remove the peer from the consensus group
       TSStatus runResult = deletePeer();
       if (isFailed(runResult)) {
@@ -543,11 +580,7 @@ public class RegionMigrateService implements IService {
       ConsensusGroupId regionId = ConsensusGroupId.Factory.createFromTConsensusGroupId(tRegionId);
       TSStatus status = new TSStatus(TSStatusCode.SUCCESS_STATUS.getStatusCode());
       try {
-        if (regionId instanceof DataRegionId) {
-          DataRegionConsensusImpl.getInstance().deleteLocalPeer(regionId);
-        } else {
-          SchemaRegionConsensusImpl.getInstance().deleteLocalPeer(regionId);
-        }
+        SchemaRegionConsensusImpl.getInstance().deleteLocalPeer(regionId);
       } catch (ConsensusException e) {
         String errorMsg =
             String.format(
@@ -590,11 +623,7 @@ public class RegionMigrateService implements IService {
       TSStatus status = new TSStatus(TSStatusCode.SUCCESS_STATUS.getStatusCode());
       ConsensusGroupId regionId = ConsensusGroupId.Factory.createFromTConsensusGroupId(tRegionId);
       try {
-        if (regionId instanceof DataRegionId) {
-          DataNodeRegionManager.getInstance().deleteDataRegion((DataRegionId) regionId);
-        } else {
-          DataNodeRegionManager.getInstance().deleteSchemaRegion((SchemaRegionId) regionId);
-        }
+        DataNodeRegionManager.getInstance().deleteSchemaRegion((SchemaRegionId) regionId);
       } catch (Exception e) {
         taskLogger.error(
             DataNodeMiscMessages.DELETE_REGION_ERROR_LOG, REGION_MIGRATE_PROCESS, regionId, e);
@@ -644,15 +673,13 @@ public class RegionMigrateService implements IService {
   }
 
   public TRegionMigrateResult getRegionMaintainResult(Long taskId) {
-    TRegionMigrateResult result = new TRegionMigrateResult();
-    if (!taskResultMap.containsKey(taskId)) {
-      result.setTaskStatus(TRegionMaintainTaskStatus.TASK_NOT_EXIST);
-    } else if (taskResultMap.get(taskId) == unfinishedResult) {
-      result.setTaskStatus(TRegionMaintainTaskStatus.PROCESSING);
-    } else {
-      result = taskResultMap.get(taskId);
+    TRegionMigrateResult result = taskResultMap.get(taskId);
+    if (result == null) {
+      return new TRegionMigrateResult(TRegionMaintainTaskStatus.TASK_NOT_EXIST);
     }
-    return result;
+    return result == unfinishedResult
+        ? new TRegionMigrateResult(TRegionMaintainTaskStatus.PROCESSING)
+        : result;
   }
 
   public static boolean isSucceed(TSStatus status) {

@@ -27,15 +27,19 @@ import org.apache.iotdb.db.storageengine.dataregion.modification.TagPredicate.De
 import org.apache.iotdb.db.storageengine.dataregion.modification.TagPredicate.FullExactMatch;
 import org.apache.iotdb.db.storageengine.dataregion.modification.TagPredicate.NOP;
 import org.apache.iotdb.db.storageengine.dataregion.modification.TagPredicate.SegmentExactMatch;
+import org.apache.iotdb.db.storageengine.dataregion.tsfile.TsFileResource;
 import org.apache.iotdb.db.utils.constant.TestConstant;
 
 import org.apache.tsfile.file.metadata.IDeviceID.Factory;
 import org.apache.tsfile.read.common.TimeRange;
 import org.junit.Assert;
 import org.junit.Test;
+import org.mockito.Mockito;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -51,6 +55,43 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 public class ModificationFileTest {
+
+  @Test
+  public void testRetryLastSharedModFileReleaseAfterForceFailure() throws Exception {
+    File file = new File(TestConstant.BASE_OUTPUT_PATH, "mod.shared.retry.temp");
+    PartitionLevelModFileManager manager = new PartitionLevelModFileManager();
+    TsFileResource first = Mockito.mock(TsFileResource.class);
+    TsFileResource last = Mockito.mock(TsFileResource.class);
+    try (ModificationFile shared = new ModificationFile(file, false);
+        FileChannel channel =
+            Mockito.mock(FileChannel.class, Mockito.withSettings().useConstructor())) {
+      shared.write(
+          new TreeDeletionEntry(new MeasurementPath(new String[] {"root", "sg", "d", "s"}), 1));
+      Field channelField = ModificationFile.class.getDeclaredField("channel");
+      channelField.setAccessible(true);
+      ((FileChannel) channelField.get(shared)).close();
+      channelField.set(shared, channel);
+      Mockito.doThrow(new IOException()).doNothing().when(channel).force(true);
+
+      manager.addReference(first, shared);
+      manager.addReference(last, shared);
+      manager.releaseFor(first, shared);
+      manager.releaseFor(first, shared);
+      assertTrue(file.exists());
+      Mockito.verify(channel, Mockito.never()).force(true);
+
+      Assert.assertThrows(IOException.class, () -> manager.releaseFor(last, shared));
+      assertTrue(file.exists());
+      assertTrue(channel.isOpen());
+      manager.releaseFor(last, shared);
+      Assert.assertFalse(channel.isOpen());
+      Assert.assertFalse(file.exists());
+      manager.releaseFor(last, shared);
+      Mockito.verify(channel, Mockito.times(2)).force(true);
+    } finally {
+      Files.deleteIfExists(file.toPath());
+    }
+  }
 
   @Test
   public void testRemoveUpdatesMetrics() throws IOException {

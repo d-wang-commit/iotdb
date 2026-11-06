@@ -24,12 +24,17 @@ import org.apache.iotdb.commons.concurrent.IoTDBThreadPoolFactory;
 import org.apache.iotdb.commons.concurrent.ThreadName;
 import org.apache.iotdb.commons.conf.CommonConfig;
 import org.apache.iotdb.commons.conf.CommonDescriptor;
+import org.apache.iotdb.commons.conf.IoTDBConstant;
+import org.apache.iotdb.commons.consensus.DataRegionId;
 import org.apache.iotdb.commons.exception.StartupException;
 import org.apache.iotdb.commons.file.SystemFileFactory;
 import org.apache.iotdb.commons.utils.TestOnly;
+import org.apache.iotdb.consensus.ConsensusFactory;
+import org.apache.iotdb.db.conf.IoTDBDescriptor;
 import org.apache.iotdb.db.exception.DataRegionException;
 import org.apache.iotdb.db.exception.runtime.StorageEngineFailureException;
 import org.apache.iotdb.db.i18n.StorageEngineMessages;
+import org.apache.iotdb.db.storageengine.StorageEngine;
 import org.apache.iotdb.db.storageengine.dataregion.wal.exception.WALRecoverException;
 import org.apache.iotdb.db.storageengine.dataregion.wal.io.WALFormatException;
 import org.apache.iotdb.db.storageengine.dataregion.wal.io.WALFormats;
@@ -85,7 +90,7 @@ public class WALRecoverManager {
           continue;
         }
         for (File nodeDir : nodeDirs) {
-          if (nodeDir.isDirectory()) {
+          if (!isPendingDedicatedWALNode(nodeDir.getName())) {
             walNodeDirs.add(nodeDir);
           }
         }
@@ -123,6 +128,9 @@ public class WALRecoverManager {
             try {
               recovery.get();
             } catch (ExecutionException e) {
+              if (e.getCause() instanceof StorageEngineFailureException) {
+                throw new StartupException(e.getCause());
+              }
               if (failure == null) {
                 failure = e;
               } else if (WALFormatException.isFatal(e) && !WALFormatException.isFatal(failure)) {
@@ -150,6 +158,9 @@ public class WALRecoverManager {
           absolutePath2RecoverPerformer.values()) {
         recoverPerformer.getRecoverListener().fail(e);
       }
+      if (e instanceof StartupException) {
+        throw (StartupException) e;
+      }
       if (WALFormatException.isFatal(e)) {
         WALFormats.onRecoveryFailure(e);
         throw new WALRecoverException(StorageEngineMessages.FAIL_TO_RECOVER_WAL, e);
@@ -168,6 +179,27 @@ public class WALRecoverManager {
       stop();
     }
     logger.info(StorageEngineMessages.SUCCESSFULLY_RECOVER_ALL_WAL_NODES);
+  }
+
+  private static boolean isPendingDedicatedWALNode(String name) {
+    String protocol =
+        IoTDBDescriptor.getInstance().getConfig().getDataRegionConsensusProtocolClass();
+    if (!ConsensusFactory.IOT_CONSENSUS.equals(protocol)
+        && !ConsensusFactory.IOT_CONSENSUS_V2.equals(protocol)) {
+      return false;
+    }
+    // Dedicated nodes are named <database>-<regionId>; a database name can contain '-'.
+    int separator = name.lastIndexOf(IoTDBConstant.FILE_NAME_SEPARATOR);
+    if (separator <= 0) {
+      return false;
+    }
+    try {
+      int regionId =
+          Integer.parseInt(name.substring(separator + IoTDBConstant.FILE_NAME_SEPARATOR.length()));
+      return StorageEngine.isDataRegionDeletionPending(new DataRegionId(regionId));
+    } catch (NumberFormatException ignored) {
+      return false;
+    }
   }
 
   private void asyncRecoverLeftTsFiles() {

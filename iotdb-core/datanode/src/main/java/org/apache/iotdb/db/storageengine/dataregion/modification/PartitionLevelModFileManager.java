@@ -143,10 +143,13 @@ public class PartitionLevelModFileManager implements ModFileManagement {
   public synchronized void releaseFor(
       TsFileResource tsFileResource, ModificationFile modificationFile) throws IOException {
     Set<TsFileResource> references = modFileReferences.get(modificationFile);
+    if (references == null) {
+      return;
+    }
     references.remove(tsFileResource);
     if (references.isEmpty()) {
-      modFileReferences.remove(modificationFile);
       modificationFile.remove();
+      modFileReferences.remove(modificationFile);
     }
   }
 

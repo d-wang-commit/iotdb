@@ -30,6 +30,7 @@ import org.apache.iotdb.db.queryengine.plan.planner.plan.node.write.InsertRowNod
 import org.apache.iotdb.db.storageengine.dataregion.wal.allocation.ElasticStrategy;
 import org.apache.iotdb.db.storageengine.dataregion.wal.node.WALNode;
 import org.apache.iotdb.db.storageengine.dataregion.wal.utils.WALFileUtils;
+import org.apache.iotdb.db.storageengine.dataregion.wal.utils.WALMode;
 import org.apache.iotdb.db.utils.EnvironmentUtils;
 import org.apache.iotdb.db.utils.constant.TestConstant;
 
@@ -42,8 +43,11 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
@@ -115,6 +119,36 @@ public class WALManagerTest {
         assertTrue(nodeDir.exists());
         assertEquals(1, WALFileUtils.listAllWALFiles(nodeDir).length);
       }
+    }
+  }
+
+  @Test
+  public void testDeleteUnregisteredDedicatedWALWithWalDisabled() throws Exception {
+    WALMode previousMode = config.getWalMode();
+    try {
+      config.setWalMode(WALMode.DISABLE);
+      for (String protocol :
+          new String[] {ConsensusFactory.IOT_CONSENSUS, ConsensusFactory.IOT_CONSENSUS_V2}) {
+        config.setDataRegionConsensusProtocolClass(protocol);
+        String nodeName = "root.deleted-17";
+        for (String walDir : commonConfig.getWalDirs()) {
+          Files.createDirectories(new File(walDir, nodeName).toPath());
+          Files.write(new File(walDir, nodeName + "/_0-0-1.wal").toPath(), new byte[] {1});
+          Path other = new File(walDir, "root.retained-18").toPath();
+          Files.createDirectories(other);
+          Files.write(other.resolve("_0-0-1.wal"), new byte[] {2});
+        }
+
+        WALManager.getInstance().deleteWALNode(nodeName);
+        WALManager.getInstance().deleteWALNode(nodeName);
+
+        for (String walDir : commonConfig.getWalDirs()) {
+          assertFalse(Files.exists(new File(walDir, nodeName).toPath()));
+          assertTrue(Files.exists(new File(walDir, "root.retained-18/_0-0-1.wal").toPath()));
+        }
+      }
+    } finally {
+      config.setWalMode(previousMode);
     }
   }
 

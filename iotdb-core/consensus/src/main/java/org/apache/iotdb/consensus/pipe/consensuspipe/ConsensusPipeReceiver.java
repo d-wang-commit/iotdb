@@ -23,8 +23,10 @@ import org.apache.iotdb.commons.consensus.DataRegionId;
 import org.apache.iotdb.consensus.iotconsensusv2.thrift.TIoTConsensusV2TransferReq;
 import org.apache.iotdb.consensus.iotconsensusv2.thrift.TIoTConsensusV2TransferResp;
 
+import java.io.IOException;
+
 public interface ConsensusPipeReceiver {
   TIoTConsensusV2TransferResp receive(TIoTConsensusV2TransferReq req);
 
-  void releaseReceiverResource(DataRegionId regionId);
+  void releaseReceiverResource(DataRegionId regionId) throws IOException;
 }

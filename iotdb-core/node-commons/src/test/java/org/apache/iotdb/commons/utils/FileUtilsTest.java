@@ -26,12 +26,17 @@ import org.apache.tsfile.write.record.Tablet;
 import org.apache.tsfile.write.schema.MeasurementSchema;
 import org.junit.After;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Before;
 import org.junit.Test;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.DirectoryNotEmptyException;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Collections;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -120,6 +125,70 @@ public class FileUtilsTest {
         3 * FileUtils.estimateFileOrDirectoryRemoveCost(new File("file"))
             + 2 * FileUtils.estimateFileOrDirectoryRemoveCost(tmpDir),
         acquiredBytes.get());
+  }
+
+  @Test
+  public void testStrictDeleteTreeAndRetryMissingTarget() throws IOException {
+    Path root = Files.createDirectory(tmpDir.toPath().resolve("strict"));
+    Path nested = Files.createDirectory(root.resolve("nested"));
+    Files.write(root.resolve("file"), new byte[] {1});
+    Files.write(nested.resolve("file"), new byte[] {2});
+    AtomicInteger permits = new AtomicInteger();
+    AtomicLong costs = new AtomicLong();
+
+    FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(
+        root.toFile(),
+        cost -> {
+          permits.incrementAndGet();
+          costs.addAndGet(cost);
+        });
+    Assert.assertFalse(Files.exists(root));
+    Assert.assertEquals(4, permits.get());
+    Assert.assertEquals(
+        2 * FileUtils.estimateFileOrDirectoryRemoveCost(new File("file"))
+            + 2 * FileUtils.estimateFileOrDirectoryRemoveCost(tmpDir),
+        costs.get());
+
+    FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(
+        root.toFile(), cost -> permits.incrementAndGet());
+    Assert.assertEquals(4, permits.get());
+  }
+
+  @Test
+  public void testStrictDeletePropagatesFailureAndCanRetry() throws IOException {
+    Path root = Files.createDirectory(tmpDir.toPath().resolve("strict-failure"));
+    Path retained = root.resolve("retained");
+    Assert.assertThrows(
+        DirectoryNotEmptyException.class,
+        () ->
+            FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(
+                root.toFile(),
+                cost -> {
+                  try {
+                    Files.write(retained, new byte[] {1});
+                  } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                  }
+                }));
+    Assert.assertArrayEquals(new byte[] {1}, Files.readAllBytes(retained));
+
+    FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(root.toFile(), null);
+    Assert.assertFalse(Files.exists(root));
+  }
+
+  @Test
+  public void testStrictDeleteDoesNotFollowSymbolicLinks() throws IOException {
+    Path root = Files.createDirectory(tmpDir.toPath().resolve("strict-links"));
+    Path retained = Files.write(targetDir.toPath().resolve("retained"), new byte[] {1});
+    try {
+      Files.createSymbolicLink(root.resolve("external"), targetDir.toPath());
+    } catch (UnsupportedOperationException | FileSystemException e) {
+      Assume.assumeNoException(e);
+    }
+
+    FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(root.toFile(), null);
+    Assert.assertFalse(Files.exists(root));
+    Assert.assertArrayEquals(new byte[] {1}, Files.readAllBytes(retained));
   }
 
   @Test

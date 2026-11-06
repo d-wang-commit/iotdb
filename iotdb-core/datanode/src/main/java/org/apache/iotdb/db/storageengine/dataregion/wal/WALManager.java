@@ -22,10 +22,13 @@ package org.apache.iotdb.db.storageengine.dataregion.wal;
 import org.apache.iotdb.commons.concurrent.IoTDBThreadPoolFactory;
 import org.apache.iotdb.commons.concurrent.ThreadName;
 import org.apache.iotdb.commons.concurrent.threadpool.ScheduledExecutorUtil;
+import org.apache.iotdb.commons.conf.CommonDescriptor;
 import org.apache.iotdb.commons.conf.IoTDBConstant;
 import org.apache.iotdb.commons.exception.StartupException;
 import org.apache.iotdb.commons.service.IService;
 import org.apache.iotdb.commons.service.ServiceType;
+import org.apache.iotdb.commons.utils.FileUtils;
+import org.apache.iotdb.commons.utils.RegionMigrationFileRemoveRateLimiter;
 import org.apache.iotdb.consensus.ConsensusFactory;
 import org.apache.iotdb.db.conf.IoTDBConfig;
 import org.apache.iotdb.db.conf.IoTDBDescriptor;
@@ -44,6 +47,8 @@ import org.apache.iotdb.db.storageengine.dataregion.wal.utils.WALMode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.File;
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -142,21 +147,30 @@ public class WALManager implements IService {
   }
 
   /** WAL node will be deleted only when using iot series consensus protocol. */
-  public void deleteWALNode(String applicantUniqueId) {
-    if (config.getWalMode() == WALMode.DISABLE
-        || (!config.getDataRegionConsensusProtocolClass().equals(ConsensusFactory.IOT_CONSENSUS)
-            && !config
-                .getDataRegionConsensusProtocolClass()
-                .equals(ConsensusFactory.IOT_CONSENSUS_V2))) {
+  public void deleteWALNode(String applicantUniqueId) throws IOException {
+    if (!config.getDataRegionConsensusProtocolClass().equals(ConsensusFactory.IOT_CONSENSUS)
+        && !config
+            .getDataRegionConsensusProtocolClass()
+            .equals(ConsensusFactory.IOT_CONSENSUS_V2)) {
       return;
     }
 
-    ((FirstCreateStrategy) walNodesManager).deleteWALNode(applicantUniqueId);
+    if (walNodesManager instanceof FirstCreateStrategy) {
+      ((FirstCreateStrategy) walNodesManager).deleteWALNode(applicantUniqueId);
+    }
+    // A failed delete or a restart can leave files without a registered WALNode.
+    for (String walDir : CommonDescriptor.getInstance().getConfig().getWalDirs()) {
+      FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(
+          new File(walDir, applicantUniqueId),
+          RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
+    }
+    failedRecoveryNodes.remove(applicantUniqueId);
     WritingMetrics.getInstance().removeWALNodeInfoMetrics(applicantUniqueId);
   }
 
   /** Region information and WAL node will be removed when using ElasticStrategy. */
-  public void deleteRegionAndMayDeleteWALNode(String databaseName, String dataRegionId) {
+  public void deleteRegionAndMayDeleteWALNode(String databaseName, String dataRegionId)
+      throws IOException {
     if (config.getWalMode() == WALMode.DISABLE || !(walNodesManager instanceof ElasticStrategy)) {
       return;
     }

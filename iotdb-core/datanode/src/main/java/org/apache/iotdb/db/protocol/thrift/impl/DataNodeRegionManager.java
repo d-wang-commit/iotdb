@@ -30,9 +30,13 @@ import org.apache.iotdb.commons.consensus.SchemaRegionId;
 import org.apache.iotdb.commons.exception.IllegalPathException;
 import org.apache.iotdb.commons.exception.MetadataException;
 import org.apache.iotdb.commons.log.LoggerPeriodicalLogReducer;
+import org.apache.iotdb.commons.utils.FileUtils;
+import org.apache.iotdb.commons.utils.RegionMigrationFileRemoveRateLimiter;
+import org.apache.iotdb.consensus.IConsensus;
 import org.apache.iotdb.consensus.common.Peer;
 import org.apache.iotdb.consensus.exception.ConsensusException;
 import org.apache.iotdb.consensus.exception.ConsensusGroupAlreadyExistException;
+import org.apache.iotdb.consensus.exception.ConsensusGroupNotExistException;
 import org.apache.iotdb.db.consensus.DataRegionConsensusImpl;
 import org.apache.iotdb.db.consensus.SchemaRegionConsensusImpl;
 import org.apache.iotdb.db.exception.DataRegionException;
@@ -46,6 +50,9 @@ import org.apache.iotdb.rpc.TSStatusCode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -153,17 +160,19 @@ public class DataNodeRegionManager {
     TSStatus tsStatus;
     DataRegionId dataRegionId = new DataRegionId(regionReplicaSet.getRegionId().getId());
     try {
-      storageEngine.createDataRegion(dataRegionId, storageGroup);
-      dataRegionLockMap.put(dataRegionId, new ReentrantReadWriteLock(false));
-      List<Peer> peers = new ArrayList<>();
-      for (TDataNodeLocation dataNodeLocation : regionReplicaSet.getDataNodeLocations()) {
-        TEndPoint endpoint =
-            new TEndPoint(
-                dataNodeLocation.getDataRegionConsensusEndPoint().getIp(),
-                dataNodeLocation.getDataRegionConsensusEndPoint().getPort());
-        peers.add(new Peer(dataRegionId, dataNodeLocation.getDataNodeId(), endpoint));
+      synchronized (storageEngine.getDataRegionLifecycleMonitor(dataRegionId)) {
+        storageEngine.createDataRegion(dataRegionId, storageGroup);
+        dataRegionLockMap.put(dataRegionId, new ReentrantReadWriteLock(false));
+        List<Peer> peers = new ArrayList<>();
+        for (TDataNodeLocation dataNodeLocation : regionReplicaSet.getDataNodeLocations()) {
+          TEndPoint endpoint =
+              new TEndPoint(
+                  dataNodeLocation.getDataRegionConsensusEndPoint().getIp(),
+                  dataNodeLocation.getDataRegionConsensusEndPoint().getPort());
+          peers.add(new Peer(dataRegionId, dataNodeLocation.getDataNodeId(), endpoint));
+        }
+        DataRegionConsensusImpl.getInstance().createLocalPeer(dataRegionId, peers);
       }
-      DataRegionConsensusImpl.getInstance().createLocalPeer(dataRegionId, peers);
       tsStatus = new TSStatus(TSStatusCode.SUCCESS_STATUS.getStatusCode());
     } catch (DataRegionException e) {
       LOGGER.error(DataNodeMiscMessages.CREATE_DATA_REGION_FAILED, storageGroup, e.getMessage());
@@ -187,8 +196,10 @@ public class DataNodeRegionManager {
     try {
       if (regionId instanceof DataRegionId) {
         final DataRegionId dataRegionId = (DataRegionId) regionId;
-        storageEngine.createDataRegion(dataRegionId, storageGroup);
-        dataRegionLockMap.putIfAbsent(dataRegionId, new ReentrantReadWriteLock(false));
+        synchronized (storageEngine.getDataRegionLifecycleMonitor(dataRegionId)) {
+          storageEngine.createDataRegion(dataRegionId, storageGroup);
+          dataRegionLockMap.putIfAbsent(dataRegionId, new ReentrantReadWriteLock(false));
+        }
       } else {
         SchemaRegionId schemaRegionId = (SchemaRegionId) regionId;
         schemaEngine.createSchemaRegion(storageGroup, schemaRegionId);
@@ -207,12 +218,47 @@ public class DataNodeRegionManager {
     return status;
   }
 
-  public TSStatus deleteDataRegion(DataRegionId dataRegionId) {
-    TSStatus status = storageEngine.deleteDataRegion(dataRegionId);
-    if (status.getCode() == TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
-      dataRegionLockMap.remove(dataRegionId);
+  public TSStatus deleteDataRegionWithPeer(DataRegionId dataRegionId) {
+    synchronized (storageEngine.getDataRegionLifecycleMonitor(dataRegionId)) {
+      try {
+        storageEngine.prepareDataRegionDeletion(dataRegionId);
+        IConsensus consensus = DataRegionConsensusImpl.getInstance();
+        boolean consensusGroupDeleted = true;
+        try {
+          consensus.deleteLocalPeer(dataRegionId);
+        } catch (ConsensusGroupNotExistException e) {
+          consensusGroupDeleted = false;
+        }
+        // Ratis may return early when its wait for peer shutdown is interrupted.
+        if (Thread.currentThread().isInterrupted()) {
+          return RpcUtils.getStatus(TSStatusCode.DELETE_REGION_ERROR);
+        }
+        File peerDirectory = new File(consensus.getRegionDirFromConsensusGroupId(dataRegionId));
+        boolean peerCleanupPerformed =
+            consensusGroupDeleted
+                || !Files.notExists(peerDirectory.toPath(), LinkOption.NOFOLLOW_LINKS);
+        FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(
+            peerDirectory, RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
+        TSStatus status = deleteDataRegion(dataRegionId);
+        return peerCleanupPerformed
+                && status.getCode() == TSStatusCode.REGION_NOT_EXIST.getStatusCode()
+            ? RpcUtils.getStatus(TSStatusCode.SUCCESS_STATUS)
+            : status;
+      } catch (Exception e) {
+        return RpcUtils.getStatus(TSStatusCode.DELETE_REGION_ERROR, e.getMessage());
+      }
     }
-    return status;
+  }
+
+  public TSStatus deleteDataRegion(DataRegionId dataRegionId) {
+    synchronized (storageEngine.getDataRegionLifecycleMonitor(dataRegionId)) {
+      TSStatus status = storageEngine.deleteDataRegion(dataRegionId);
+      if (status.getCode() == TSStatusCode.SUCCESS_STATUS.getStatusCode()
+          || status.getCode() == TSStatusCode.REGION_NOT_EXIST.getStatusCode()) {
+        dataRegionLockMap.remove(dataRegionId);
+      }
+      return status;
+    }
   }
 
   public TSStatus deleteSchemaRegion(SchemaRegionId schemaRegionId) {

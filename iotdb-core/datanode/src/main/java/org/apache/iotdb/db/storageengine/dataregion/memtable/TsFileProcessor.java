@@ -2784,6 +2784,9 @@ public class TsFileProcessor {
 
   /** Release resource of a memtable */
   public void putMemTableBackAndClose() throws TsFileProcessorException {
+    if (writer == null) {
+      return;
+    }
     if (workMemTable != null) {
       workMemTable.release();
       workMemTable = null;
@@ -2796,6 +2799,7 @@ public class TsFileProcessor {
     }
     tsFileProcessorInfo.clear();
     dataRegionInfo.closeTsFileProcessorAndReportToSystem(this);
+    writer = null;
   }
 
   public void setTsFileProcessorInfo(TsFileProcessorInfo tsFileProcessorInfo) {

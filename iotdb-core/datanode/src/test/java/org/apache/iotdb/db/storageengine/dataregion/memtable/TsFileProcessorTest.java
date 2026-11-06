@@ -90,10 +90,12 @@ import org.apache.tsfile.utils.Pair;
 import org.apache.tsfile.write.record.TSRecord;
 import org.apache.tsfile.write.record.datapoint.DataPoint;
 import org.apache.tsfile.write.schema.MeasurementSchema;
+import org.apache.tsfile.write.writer.RestorableTsFileIOWriter;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import org.mockito.Mockito;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -1919,6 +1921,34 @@ public class TsFileProcessorTest {
       processor.putMemTableBackAndClose();
     }
     assertEquals(0, sgInfo.getMemCost());
+  }
+
+  @Test
+  public void testDeletionCloseCanRetryAfterWriterFailure() throws Exception {
+    processor = newTestProcessor(filePath);
+    TSRecord record = new TSRecord(deviceId, 1);
+    record.addTuple(DataPoint.getDataPoint(TSDataType.INT64, "s1", "1"));
+    processor.insert(buildInsertRowNodeByTSRecord(record), new long[5]);
+    RestorableTsFileIOWriter writer = Mockito.spy(processor.getWriter());
+    Field writerField = TsFileProcessor.class.getDeclaredField("writer");
+    writerField.setAccessible(true);
+    writerField.set(processor, writer);
+    Mockito.doThrow(new IOException()).doCallRealMethod().when(writer).close();
+
+    try {
+      Assert.assertThrows(TsFileProcessorException.class, processor::putMemTableBackAndClose);
+      Assert.assertSame(writer, processor.getWriter());
+      Assert.assertNull(processor.getWorkMemTable());
+
+      processor.putMemTableBackAndClose();
+      Assert.assertNull(processor.getWriter());
+      Assert.assertEquals(0, sgInfo.getMemCost());
+      processor.putMemTableBackAndClose();
+      Mockito.verify(writer, Mockito.times(2)).close();
+      Assert.assertEquals(0, sgInfo.getMemCost());
+    } finally {
+      processor.putMemTableBackAndClose();
+    }
   }
 
   private void assertMemoryUnchanged(long regionBytes, long ramBytes, long logicalBytes) {

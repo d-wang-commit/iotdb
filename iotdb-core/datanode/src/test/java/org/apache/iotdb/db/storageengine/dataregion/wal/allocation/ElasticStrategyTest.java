@@ -25,6 +25,7 @@ import org.apache.iotdb.commons.path.PartialPath;
 import org.apache.iotdb.commons.queryengine.plan.planner.plan.node.PlanNodeId;
 import org.apache.iotdb.db.queryengine.plan.planner.plan.node.write.InsertRowNode;
 import org.apache.iotdb.db.storageengine.dataregion.wal.node.IWALNode;
+import org.apache.iotdb.db.storageengine.dataregion.wal.node.WALNode;
 import org.apache.iotdb.db.storageengine.dataregion.wal.utils.WALFileUtils;
 import org.apache.iotdb.db.utils.EnvironmentUtils;
 import org.apache.iotdb.db.utils.constant.TestConstant;
@@ -38,11 +39,26 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.FileSystem;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.spi.FileSystemProvider;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 public class ElasticStrategyTest {
   private static final CommonConfig commonConfig = CommonDescriptor.getInstance().getConfig();
@@ -71,7 +87,7 @@ public class ElasticStrategyTest {
   }
 
   @Test
-  public void testAllocateWALNode() throws IllegalPathException {
+  public void testAllocateWALNode() throws Exception {
     ElasticStrategy elasticStrategy = new ElasticStrategy();
     IWALNode[] walNodes = new IWALNode[3];
     try {
@@ -112,6 +128,51 @@ public class ElasticStrategyTest {
           walNode.close();
         }
       }
+    }
+  }
+
+  @Test
+  public void testLastApplicantRetriesFailedDirectoryDeletion() throws Exception {
+    Path directory = new File(walDirs[0], "0").toPath();
+    Files.createDirectories(directory);
+    Path walFile = Files.write(directory.resolve("_0-0-1.wal"), new byte[] {1});
+    File failingFile = mock(File.class);
+    Path failingPath = mock(Path.class);
+    FileSystem fileSystem = mock(FileSystem.class);
+    FileSystemProvider provider = mock(FileSystemProvider.class);
+    when(failingFile.toPath()).thenReturn(failingPath);
+    when(failingPath.getFileSystem()).thenReturn(fileSystem);
+    when(fileSystem.provider()).thenReturn(provider);
+    when(provider.readAttributes(failingPath, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS))
+        .thenThrow(new IOException("injected directory read failure"));
+
+    WALNode node = mock(WALNode.class);
+    when(node.getLogDirectory()).thenReturn(failingFile, directory.toFile());
+    ElasticStrategy strategy =
+        new ElasticStrategy() {
+          @Override
+          protected IWALNode createWALNode(String identifier) {
+            return node;
+          }
+        };
+    try {
+      assertSame(node, strategy.applyForWALNode("region-a"));
+      assertSame(node, strategy.applyForWALNode("region-b"));
+      strategy.deleteUniqueIdAndMayDeleteWALNode("region-a");
+      assertTrue(Files.exists(walFile));
+      verify(node, never()).close();
+
+      assertThrows(IOException.class, () -> strategy.deleteUniqueIdAndMayDeleteWALNode("region-b"));
+      assertTrue(Files.exists(walFile));
+      assertEquals(0, strategy.getNodesNum());
+      verify(node).close();
+
+      strategy.deleteUniqueIdAndMayDeleteWALNode("region-b");
+      assertFalse(Files.exists(directory));
+      verify(node, times(1)).close();
+      strategy.deleteUniqueIdAndMayDeleteWALNode("region-b");
+    } finally {
+      strategy.clear();
     }
   }
 

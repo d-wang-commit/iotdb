@@ -161,7 +161,8 @@ public class DataRegionStateMachine extends BaseStateMachine {
     DataRegionId regionId = new DataRegionId(Integer.parseInt(dataRegionIdString));
     try {
       DataRegion newRegion =
-          StorageEngine.getInstance().setDataRegionForSnapshotLoad(regionId, snapshotLoader);
+          StorageEngine.getInstance()
+              .setDataRegionForSnapshotLoad(regionId, region, snapshotLoader);
       if (newRegion == null) {
         logger.error(DataNodeMiscMessages.FAIL_LOAD_SNAPSHOT, snapshotRootForLog);
         return false;

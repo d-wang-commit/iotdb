@@ -209,9 +209,14 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileSystemException;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
@@ -2410,11 +2415,7 @@ public class DataRegion implements IDataRegionForQuery {
         StorageEngineMessages.STORAGE_LOG_WILL_CLOSE_ALL_FILES_FOR_DELETING_DATA_FOLDER_93A5B15E,
         databaseName + "-" + dataRegionIdString,
         systemDir);
-    int regionId = dataRegionId.getId();
-    if (isTableModel) {
-      TableDiskUsageIndex.getInstance().remove(databaseName, regionId);
-    }
-    FileTimeIndexCacheRecorder.getInstance().removeFileTimeIndexCache(regionId);
+    closeRegionSystemFiles();
     writeLock("deleteFolder");
     try {
       File dataRegionSystemFolder =
@@ -2425,6 +2426,15 @@ public class DataRegion implements IDataRegionForQuery {
     } finally {
       writeUnlock();
     }
+  }
+
+  /** Releases the runtime system-file owners before the DROP cleanup deletes the directory. */
+  public void closeRegionSystemFiles() {
+    int regionId = dataRegionId.getId();
+    if (isTableModel) {
+      TableDiskUsageIndex.getInstance().remove(databaseName, regionId);
+    }
+    FileTimeIndexCacheRecorder.getInstance().removeFileTimeIndexCache(regionId);
   }
 
   public void shutdownUpgradeModFileThreadPool() {
@@ -2467,27 +2477,21 @@ public class DataRegion implements IDataRegionForQuery {
         databaseName + "-" + dataRegionIdString);
     writeLock("syncDeleteDataFiles");
     try {
-      forceCloseAllWorkingTsFileProcessors();
+      if (!workSequenceTsFileProcessors.isEmpty() || !workUnsequenceTsFileProcessors.isEmpty()) {
+        forceCloseAllWorkingTsFileProcessors();
+        workSequenceTsFileProcessors.clear();
+        workUnsequenceTsFileProcessors.clear();
+      }
       waitClosingTsFileProcessorFinished();
 
-      // normally, mergingModification is just need to be closed by after a merge task is finished.
-      // we close it here just for IT test.
-      closeAllResources();
       List<TsFileResource> tsFileResourceList = tsFileManager.getTsFileList(true);
       tsFileResourceList.addAll(tsFileManager.getTsFileList(false));
-      tsFileResourceList.forEach(
-          x -> {
-            FileMetrics.getInstance().deleteTsFile(Collections.singletonList(x));
-            try {
-              x.removeModFile();
-            } catch (IOException e) {
-              logger.warn(StorageEngineMessages.CANNOT_REMOVE_MOD_FILE, x, e);
-            }
-          });
-      deleteAllSGFolders(TierManager.getInstance().getAllFilesFolders());
-      deleteAllObjectFiles(TierManager.getInstance().getAllObjectFileFolders());
-      this.workSequenceTsFileProcessors.clear();
-      this.workUnsequenceTsFileProcessors.clear();
+      for (TsFileResource resource : tsFileResourceList) {
+        resource.close();
+        resource.removeModFile();
+      }
+      FileMetrics.getInstance().deleteTsFile(tsFileResourceList);
+      deleteRegionDataFiles(databaseName, dataRegionId);
       this.tsFileManager.clear();
       lastFlushTimeMap.clearFlushedTime();
       TimePartitionManager.getInstance()
@@ -2499,72 +2503,89 @@ public class DataRegion implements IDataRegionForQuery {
           databaseName + "-" + dataRegionIdString,
           e);
       Thread.currentThread().interrupt();
+      throw new TsFileProcessorException(e);
+    } catch (IOException e) {
+      throw new TsFileProcessorException(e);
     } finally {
       writeUnlock();
     }
   }
 
-  private void deleteAllSGFolders(List<String> folder) {
-    for (String tsfilePath : folder) {
-      File dataRegionDataFolder =
-          fsFactory.getFile(tsfilePath, databaseName + File.separator + dataRegionIdString);
-      if (FSUtils.getFSType(dataRegionDataFolder) != FSType.LOCAL) {
-        try {
-          fsFactory.deleteDirectory(dataRegionDataFolder.getPath());
-        } catch (IOException e) {
-          logger.error(
-              StorageEngineMessages.FAIL_TO_DELETE_DATA_REGION_FOLDER, dataRegionDataFolder);
-        }
-      } else {
-        if (dataRegionDataFolder.exists()) {
-          org.apache.iotdb.commons.utils.FileUtils.deleteDirectoryAndEmptyParentWithRateLimiter(
-              dataRegionDataFolder, RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
-        }
+  /** Deletes a retired Region's files, including when no in-memory DataRegion was recovered. */
+  public static void deleteRegionDataFiles(String databaseName, DataRegionId regionId)
+      throws IOException {
+    FSFactory factory = FSFactoryProducer.getFSFactory();
+    String regionIdString = Integer.toString(regionId.getId());
+    for (String folder : TierManager.getInstance().getAllFilesFolders()) {
+      deleteRegionDirectory(
+          factory.getFile(folder, databaseName + File.separator + regionIdString), factory);
+    }
+    for (String folder : TierManager.getInstance().getAllObjectFileFolders()) {
+      File objectDirectory = factory.getFile(folder, regionIdString);
+      if (FSUtils.getFSType(objectDirectory) == FSType.LOCAL) {
+        // Update each object's counters only after that file was deleted, including partial rounds.
+        Files.walkFileTree(
+            objectDirectory.toPath(),
+            new SimpleFileVisitor<Path>() {
+              @Override
+              public FileVisitResult visitFile(Path path, BasicFileAttributes attributes)
+                  throws IOException {
+                if (attributes.isRegularFile() && path.getFileName().toString().endsWith(".bin")) {
+                  RegionMigrationFileRemoveRateLimiter.getInstance()
+                      .acquire(
+                          org.apache.iotdb.commons.utils.FileUtils
+                              .estimateFileOrDirectoryRemoveCost(path.toFile()));
+                  if (Files.deleteIfExists(path)) {
+                    FileMetrics.getInstance().decreaseObjectFileNum(1);
+                    FileMetrics.getInstance().decreaseObjectFileSize(attributes.size());
+                  }
+                }
+                return FileVisitResult.CONTINUE;
+              }
+
+              @Override
+              public FileVisitResult visitFileFailed(Path path, IOException exception)
+                  throws IOException {
+                if (exception instanceof NoSuchFileException) {
+                  return FileVisitResult.CONTINUE;
+                }
+                throw exception;
+              }
+            });
       }
+      deleteRegionDirectory(objectDirectory, factory);
     }
   }
 
-  private void deleteAllObjectFiles(List<String> folders) {
-    for (String objectFolder : folders) {
-      File dataRegionObjectFolder = fsFactory.getFile(objectFolder, dataRegionIdString);
-      if (!dataRegionObjectFolder.exists()) {
-        continue;
-      }
-
-      AtomicLong totalSize = new AtomicLong(0);
-      AtomicInteger count = new AtomicInteger(0);
-      try (Stream<Path> paths = Files.walk(dataRegionObjectFolder.toPath())) {
-        paths
-            .filter(Files::isRegularFile)
-            .filter(
-                path -> {
-                  String name = path.getFileName().toString();
-                  return name.endsWith(".bin");
-                })
-            .forEach(
-                path -> {
-                  count.incrementAndGet();
-                  totalSize.addAndGet(path.toFile().length());
-                });
-      } catch (IOException e) {
-        logger.error(StorageEngineMessages.FAILED_TO_CHECK_OBJECT_FILES, e.getMessage());
-      }
-      FileMetrics.getInstance().decreaseObjectFileNum(count.get());
-      FileMetrics.getInstance().decreaseObjectFileSize(totalSize.get());
-      if (FSUtils.getFSType(dataRegionObjectFolder) != FSType.LOCAL) {
-        try {
-          fsFactory.deleteDirectory(dataRegionObjectFolder.getPath());
-        } catch (IOException e) {
-          logger.error(
-              StorageEngineMessages.FAIL_TO_DELETE_DATA_REGION_OBJECT_FOLDER,
-              dataRegionObjectFolder);
+  private static void deleteRegionDirectory(File directory, FSFactory factory) throws IOException {
+    FSType type = FSUtils.getFSType(directory);
+    if (type == FSType.LOCAL) {
+      org.apache.iotdb.commons.utils.FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(
+          directory, RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
+    } else if (type == FSType.OBJECT_STORAGE) {
+      // The object-store provider deletes the complete directory prefix and propagates failures.
+      factory.deleteDirectory(directory.getPath());
+    } else {
+      // The HDFS provider discards the delete result. Verify absence using an ancestor listing.
+      factory.deleteDirectory(directory.getPath());
+      File child = directory;
+      while (child.getParent() != null) {
+        File parent = factory.getFile(child.getParent());
+        if (parent.getPath().equals(child.getPath())) {
+          break;
         }
-      } else {
-        if (dataRegionObjectFolder.exists()) {
-          org.apache.iotdb.commons.utils.FileUtils.deleteFileOrDirectoryWithRateLimiter(
-              dataRegionObjectFolder, RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
+        File[] siblings = parent.listFiles();
+        if (siblings != null) {
+          for (File sibling : siblings) {
+            if (sibling.getName().equals(child.getName())) {
+              throw new FileSystemException(directory.getPath());
+            }
+          }
+          return;
         }
+        child = parent;
       }
+      throw new FileSystemException(directory.getPath());
     }
   }
 

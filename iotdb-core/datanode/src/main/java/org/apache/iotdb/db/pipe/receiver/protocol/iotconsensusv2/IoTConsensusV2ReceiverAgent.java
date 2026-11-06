@@ -24,6 +24,8 @@ import org.apache.iotdb.common.rpc.thrift.TSStatus;
 import org.apache.iotdb.commons.consensus.ConsensusGroupId;
 import org.apache.iotdb.commons.consensus.DataRegionId;
 import org.apache.iotdb.commons.pipe.sink.payload.iotconsensusv2.request.IoTConsensusV2RequestVersion;
+import org.apache.iotdb.commons.utils.FileUtils;
+import org.apache.iotdb.commons.utils.RegionMigrationFileRemoveRateLimiter;
 import org.apache.iotdb.consensus.IConsensus;
 import org.apache.iotdb.consensus.iotconsensusv2.thrift.TCommitId;
 import org.apache.iotdb.consensus.iotconsensusv2.thrift.TIoTConsensusV2TransferReq;
@@ -41,6 +43,13 @@ import org.apache.tsfile.external.commons.lang3.function.TriFunction;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.nio.file.DirectoryIteratorException;
+import java.nio.file.DirectoryStream;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
@@ -227,7 +236,7 @@ public class IoTConsensusV2ReceiverAgent implements ConsensusPipeReceiver {
 
   /** Release all receivers of given data region when this region is deleted */
   @Override
-  public final void releaseReceiverResource(DataRegionId dataRegionId) {
+  public final void releaseReceiverResource(DataRegionId dataRegionId) throws IOException {
     receiverLifeCircleLock.writeLock().lock();
     try {
       // Mark this region as stale first, indicating that this region can not create new receivers
@@ -256,9 +265,39 @@ public class IoTConsensusV2ReceiverAgent implements ConsensusPipeReceiver {
       this.replicaReceiverMap.remove(dataRegionId);
       // 4. GC receiver map
       consensusPipe2ReciverMap.clear();
+      // Receiver registration may already be gone after a failed cleanup or restart.
+      for (String receiverRoot :
+          IoTDBDescriptor.getInstance().getConfig().getIotConsensusV2ReceiverFileDirs()) {
+        try (DirectoryStream<Path> receiverDirs =
+            Files.newDirectoryStream(Paths.get(receiverRoot))) {
+          for (Path receiverDir : receiverDirs) {
+            if (belongsToDataRegion(receiverDir, dataRegionId)) {
+              FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(
+                  receiverDir.toFile(),
+                  RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
+            }
+          }
+        } catch (NoSuchFileException e) {
+          // A missing configured receiver root has nothing left to delete.
+        } catch (DirectoryIteratorException e) {
+          throw e.getCause();
+        }
+      }
       LOGGER.info(DataNodePipeMessages.ALL_RECEIVERS_RELATED_TO_ARE_RELEASED, dataRegionId);
     } finally {
       receiverLifeCircleLock.writeLock().unlock();
+    }
+  }
+
+  private boolean belongsToDataRegion(Path receiverDir, DataRegionId dataRegionId) {
+    String directoryName = receiverDir.getFileName().toString();
+    try {
+      ConsensusPipeName pipeName = new ConsensusPipeName(directoryName);
+      return dataRegionId.equals(pipeName.getConsensusGroupId())
+          && pipeName.getReceiverDataNodeId() == thisNodeId
+          && directoryName.equals(pipeName.toString());
+    } catch (IllegalArgumentException | IndexOutOfBoundsException e) {
+      return false;
     }
   }
 

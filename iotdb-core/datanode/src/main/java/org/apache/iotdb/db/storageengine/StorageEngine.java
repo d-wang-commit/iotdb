@@ -48,6 +48,7 @@ import org.apache.iotdb.commons.utils.TimePartitionUtils;
 import org.apache.iotdb.consensus.ConsensusFactory;
 import org.apache.iotdb.db.conf.IoTDBConfig;
 import org.apache.iotdb.db.conf.IoTDBDescriptor;
+import org.apache.iotdb.db.consensus.DataRegionConsensusImpl;
 import org.apache.iotdb.db.exception.DataRegionException;
 import org.apache.iotdb.db.exception.DirectBufferMemoryAllocationException;
 import org.apache.iotdb.db.exception.StorageEngineException;
@@ -57,6 +58,7 @@ import org.apache.iotdb.db.exception.load.LoadReadOnlyException;
 import org.apache.iotdb.db.exception.runtime.StorageEngineFailureException;
 import org.apache.iotdb.db.i18n.StorageEngineMessages;
 import org.apache.iotdb.db.pipe.agent.PipeDataNodeAgent;
+import org.apache.iotdb.db.pipe.consensus.deletion.DeletionResourceManager;
 import org.apache.iotdb.db.pipe.source.dataregion.realtime.assigner.PipeDataRegionAssigner.CompletionToken;
 import org.apache.iotdb.db.pipe.source.dataregion.realtime.listener.PipeInsertionDataNodeListener;
 import org.apache.iotdb.db.queryengine.plan.analyze.cache.schema.DataNodeTTLCache;
@@ -88,6 +90,9 @@ import org.apache.iotdb.db.utils.ThreadUtils;
 import org.apache.iotdb.rpc.RpcUtils;
 import org.apache.iotdb.rpc.TSStatusCode;
 
+import com.google.common.collect.Interner;
+import com.google.common.collect.Interners;
+import com.google.common.collect.MapMaker;
 import org.apache.tsfile.exception.write.PageException;
 import org.apache.tsfile.external.commons.io.FileUtils;
 import org.apache.tsfile.fileSystem.FSFactoryProducer;
@@ -96,12 +101,21 @@ import org.apache.tsfile.utils.FilePathUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.URL;
 import java.nio.ByteBuffer;
+import java.nio.file.DirectoryIteratorException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -113,6 +127,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
@@ -144,6 +159,9 @@ public class StorageEngine implements IService {
   private static final String systemDir =
       FilePathUtils.regularizePath(CONFIG.getSystemDir()) + "databases";
 
+  private static final Path PENDING_DATA_REGION_DELETIONS =
+      new File(CONFIG.getSystemDir(), "pending-region-deletions").toPath();
+
   /** DataRegionId -> DataRegion */
   private final ConcurrentHashMap<DataRegionId, DataRegion> dataRegionMap =
       new ConcurrentHashMap<>();
@@ -151,6 +169,12 @@ public class StorageEngine implements IService {
   /** DataRegionId -> DataRegion which is being deleted */
   private final ConcurrentHashMap<DataRegionId, DataRegion> deletingDataRegionMap =
       new ConcurrentHashMap<>();
+
+  private final Interner<DataRegionId> dataRegionLifecycleMonitors = Interners.newWeakInterner();
+  // Stopping consensus can wait for snapshot loading. Hold this separate monitor only while
+  // replacing the Region or publishing its deletion marker, never while stopping the peer.
+  private final ConcurrentMap<DataRegionId, Object> snapshotLoadMonitors =
+      new MapMaker().weakValues().makeMap();
 
   /** number of ready data region */
   private AtomicInteger readyDataRegionNum;
@@ -324,7 +348,10 @@ public class StorageEngine implements IService {
         if (!dataRegionDir.isDirectory()) {
           continue;
         }
-        dataRegionIdList.add(new DataRegionId(Integer.parseInt(dataRegionDir.getName())));
+        DataRegionId regionId = new DataRegionId(Integer.parseInt(dataRegionDir.getName()));
+        if (!isDataRegionDeletionPending(regionId)) {
+          dataRegionIdList.add(regionId);
+        }
       }
       localDataRegionInfo.put(sgName, dataRegionIdList);
     }
@@ -339,6 +366,7 @@ public class StorageEngine implements IService {
     // create systemDir
     try {
       FileUtils.forceMkdir(SystemFileFactory.INSTANCE.getFile(systemDir));
+      recoverDataRegionDeletions();
     } catch (IOException e) {
       throw new StorageEngineFailureException(e);
     }
@@ -851,103 +879,217 @@ public class StorageEngine implements IService {
     customCloseFileListeners.add(listener);
   }
 
-  private void makeSureNoOldRegion(DataRegionId regionId) {
-    while (deletingDataRegionMap.containsKey(regionId)) {
-      DataRegion oldRegion = deletingDataRegionMap.get(regionId);
-      if (oldRegion != null) {
-        oldRegion.waitForDeleted();
+  /** Serializes creation and deletion of the same local replica. */
+  public Object getDataRegionLifecycleMonitor(DataRegionId regionId) {
+    return dataRegionLifecycleMonitors.intern(regionId);
+  }
+
+  private Object snapshotLoadMonitor(DataRegionId regionId) {
+    return snapshotLoadMonitors.computeIfAbsent(regionId, ignored -> new Object());
+  }
+
+  private static Path dataRegionDeletionFile(DataRegionId regionId) {
+    return PENDING_DATA_REGION_DELETIONS.resolve(Integer.toString(regionId.getId()));
+  }
+
+  public static boolean isDataRegionDeletionPending(DataRegionId regionId) {
+    // An inaccessible marker must not be mistaken for a completed deletion.
+    return !Files.notExists(dataRegionDeletionFile(regionId), LinkOption.NOFOLLOW_LINKS);
+  }
+
+  /** Used only if recovery of a shared WAL cannot finish its cleanup. */
+  public static boolean hasPendingDataRegionDeletions() {
+    try (DirectoryStream<Path> markers =
+        Files.newDirectoryStream(
+            PENDING_DATA_REGION_DELETIONS,
+            path -> !path.getFileName().toString().endsWith(".tmp"))) {
+      return markers.iterator().hasNext();
+    } catch (NoSuchFileException e) {
+      return false;
+    } catch (IOException | DirectoryIteratorException e) {
+      return true;
+    }
+  }
+
+  /** Persist the database name before removing the peer or any storage resources. */
+  public String prepareDataRegionDeletion(DataRegionId regionId) throws IOException {
+    synchronized (snapshotLoadMonitor(regionId)) {
+      String pendingDatabase = readDataRegionDeletion(regionId);
+      if (pendingDatabase != null) {
+        return pendingDatabase;
+      }
+      DataRegion region = dataRegionMap.get(regionId);
+      if (region == null) {
+        region = deletingDataRegionMap.get(regionId);
+      }
+      String database =
+          region == null ? findDataRegionDatabase(regionId) : region.getDatabaseName();
+      if (database == null) {
+        return null;
+      }
+      Path marker = dataRegionDeletionFile(regionId);
+      Files.createDirectories(marker.getParent());
+      Path temporary = marker.resolveSibling(marker.getFileName() + ".tmp");
+      try (FileOutputStream file = new FileOutputStream(temporary.toFile());
+          DataOutputStream output = new DataOutputStream(file)) {
+        output.writeUTF(database);
+        output.flush();
+        file.getFD().sync();
+      }
+      Files.move(temporary, marker, StandardCopyOption.ATOMIC_MOVE);
+      return database;
+    }
+  }
+
+  private static String readDataRegionDeletion(DataRegionId regionId) throws IOException {
+    try (DataInputStream input =
+        new DataInputStream(
+            Files.newInputStream(dataRegionDeletionFile(regionId), LinkOption.NOFOLLOW_LINKS))) {
+      return input.readUTF();
+    } catch (NoSuchFileException e) {
+      return null;
+    }
+  }
+
+  private String findDataRegionDatabase(DataRegionId regionId) throws IOException {
+    Path databases = new File(systemDir).toPath();
+    if (Files.notExists(databases)) {
+      return null;
+    }
+    try (DirectoryStream<Path> entries = Files.newDirectoryStream(databases)) {
+      for (Path database : entries) {
+        try {
+          if (Files.readAttributes(
+                  database.resolve(Integer.toString(regionId.getId())), BasicFileAttributes.class)
+              .isDirectory()) {
+            return database.getFileName().toString();
+          }
+        } catch (NoSuchFileException ignored) {
+          // Only a missing entry rules out this database; an inaccessible one must be retried.
+        }
+      }
+    }
+    return null;
+  }
+
+  /** Called before consensus starts, so pending replicas cannot be recovered as active peers. */
+  void recoverDataRegionDeletions() throws IOException {
+    Path directory = PENDING_DATA_REGION_DELETIONS;
+    if (Files.notExists(directory)) {
+      return;
+    }
+    try (DirectoryStream<Path> entries = Files.newDirectoryStream(directory)) {
+      for (Path entry : entries) {
+        if (entry.getFileName().toString().endsWith(".tmp")) {
+          continue;
+        }
+        DataRegionId regionId = new DataRegionId(Integer.parseInt(entry.getFileName().toString()));
+        if (readDataRegionDeletion(regionId) == null) {
+          continue;
+        }
+        org.apache.iotdb.commons.utils.FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(
+            new File(
+                DataRegionConsensusImpl.getInstance().getRegionDirFromConsensusGroupId(regionId)),
+            RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
       }
     }
   }
 
-  // When registering a new region, the coordinator needs to register the corresponding region with
-  // the local storage before adding the corresponding consensusGroup to the consensus layer
+  // Storage must be registered before the corresponding consensus peer is created.
   public void createDataRegion(DataRegionId regionId, String databaseName)
       throws DataRegionException {
-    makeSureNoOldRegion(regionId);
-    AtomicReference<DataRegionException> exceptionAtomicReference = new AtomicReference<>(null);
-    dataRegionMap.computeIfAbsent(
-        regionId,
-        region -> {
-          try {
-            return buildNewDataRegion(databaseName, region);
-          } catch (DataRegionException e) {
-            exceptionAtomicReference.set(e);
-          }
-          return null;
-        });
+    synchronized (getDataRegionLifecycleMonitor(regionId)) {
+      if (isDataRegionDeletionPending(regionId) || deletingDataRegionMap.containsKey(regionId)) {
+        throw new DataRegionException(
+            String.format(
+                StorageEngineMessages.EXCEPTION_DATAREGION_ARG_IS_BEING_DELETED_9F1B6DDC,
+                regionId));
+      }
+      AtomicReference<DataRegionException> exceptionAtomicReference = new AtomicReference<>(null);
+      dataRegionMap.computeIfAbsent(
+          regionId,
+          region -> {
+            try {
+              return buildNewDataRegion(databaseName, region);
+            } catch (DataRegionException e) {
+              exceptionAtomicReference.set(e);
+            }
+            return null;
+          });
 
-    if (exceptionAtomicReference.get() != null) {
-      throw exceptionAtomicReference.get();
+      if (exceptionAtomicReference.get() != null) {
+        throw exceptionAtomicReference.get();
+      }
     }
   }
 
   public TSStatus deleteDataRegion(DataRegionId regionId) {
-    if (!dataRegionMap.containsKey(regionId) || deletingDataRegionMap.containsKey(regionId)) {
-      return RpcUtils.getStatus(TSStatusCode.REGION_NOT_EXIST);
-    }
-    DataRegion region =
-        deletingDataRegionMap.computeIfAbsent(regionId, k -> dataRegionMap.remove(regionId));
-    if (region != null) {
-      LOGGER.info(StorageEngineMessages.REMOVING_DATA_REGION, regionId);
-      region.markDeleted();
+    synchronized (getDataRegionLifecycleMonitor(regionId)) {
+      String database = null;
       try {
-        region.abortCompaction();
-        region.syncDeleteDataFiles();
-        region.deleteFolder(systemDir);
-        region.deleteDALFolderAndClose();
-        PipeDataNodeAgent.receiver().iotConsensusV2().releaseReceiverResource(regionId);
-        switch (CONFIG.getDataRegionConsensusProtocolClass()) {
+        database = prepareDataRegionDeletion(regionId);
+        if (database == null) {
+          return RpcUtils.getStatus(TSStatusCode.REGION_NOT_EXIST);
+        }
+        DataRegion region =
+            deletingDataRegionMap.computeIfAbsent(regionId, k -> dataRegionMap.remove(regionId));
+        LOGGER.info(StorageEngineMessages.REMOVING_DATA_REGION, regionId);
+        if (region != null) {
+          region.markDeleted();
+          region.abortCompaction();
+          region.syncDeleteDataFiles();
+          region.closeRegionSystemFiles();
+        } else {
+          // After restart the marker supplies the context without loading a deleted Region.
+          DataRegion.deleteRegionDataFiles(database, regionId);
+        }
+        String protocol = CONFIG.getDataRegionConsensusProtocolClass();
+        if (ConsensusFactory.IOT_CONSENSUS_V2.equals(protocol)) {
+          DeletionResourceManager.deleteForRegion(regionId.getId());
+          PipeDataNodeAgent.receiver().iotConsensusV2().releaseReceiverResource(regionId);
+        }
+        switch (protocol) {
           case ConsensusFactory.IOT_CONSENSUS:
           case ConsensusFactory.IOT_CONSENSUS_V2:
-            // delete wal
             WALManager.getInstance()
-                .deleteWALNode(
-                    region.getDatabaseName()
-                        + FILE_NAME_SEPARATOR
-                        + region.getDataRegionIdString());
-            // delete snapshot
+                .deleteWALNode(database + FILE_NAME_SEPARATOR + regionId.getId());
             for (String dataDir : CONFIG.getLocalDataDirs()) {
-              File regionSnapshotDir =
+              File snapshot =
                   new File(
                       dataDir + File.separator + IoTDBConstant.SNAPSHOT_FOLDER_NAME,
-                      region.getDatabaseName() + FILE_NAME_SEPARATOR + regionId.getId());
-              if (regionSnapshotDir.exists()) {
-                org.apache.iotdb.commons.utils.FileUtils.deleteFileOrDirectoryWithRateLimiter(
-                    regionSnapshotDir, RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
-              }
+                      database + FILE_NAME_SEPARATOR + regionId.getId());
+              org.apache.iotdb.commons.utils.FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(
+                  snapshot, RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
             }
             break;
           case ConsensusFactory.SIMPLE_CONSENSUS:
-            // delete region information in wal and may delete wal
             WALManager.getInstance()
-                .deleteRegionAndMayDeleteWALNode(
-                    region.getDatabaseName(), region.getDataRegionIdString());
+                .deleteRegionAndMayDeleteWALNode(database, Integer.toString(regionId.getId()));
             break;
-          case ConsensusFactory.RATIS_CONSENSUS:
           default:
             break;
         }
+        org.apache.iotdb.commons.utils.FileUtils.deleteFileOrDirectoryWithRateLimiterStrict(
+            new File(new File(systemDir, database), Integer.toString(regionId.getId())),
+            RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
         WRITING_METRICS.removeDataRegionMemoryCostMetrics(regionId);
         WRITING_METRICS.removeFlushingMemTableStatusMetrics(regionId);
         WRITING_METRICS.removeActiveMemtableCounterMetrics(regionId);
-        FileMetrics.getInstance()
-            .deleteRegion(region.getDatabaseName(), region.getDataRegionIdString());
+        FileMetrics.getInstance().deleteRegion(database, Integer.toString(regionId.getId()));
         CompressionRatio.getInstance().removeDataRegionRatio(String.valueOf(regionId.getId()));
+        Files.delete(dataRegionDeletionFile(regionId));
+        deletingDataRegionMap.remove(regionId);
         LOGGER.info(StorageEngineMessages.REMOVED_DATA_REGION, regionId);
+        return RpcUtils.getStatus(TSStatusCode.SUCCESS_STATUS);
       } catch (Exception e) {
         LOGGER.error(
             StorageEngineMessages.STORAGE_LOG_ERROR_OCCURS_WHEN_DELETING_DATA_REGION_8C07B7A0,
-            region.getDatabaseName(),
-            region.getDataRegionIdString(),
+            database,
+            regionId.getId(),
             e);
         return RpcUtils.getStatus(TSStatusCode.DELETE_REGION_ERROR, e.getMessage());
-      } finally {
-        deletingDataRegionMap.remove(regionId);
       }
-      return RpcUtils.getStatus(TSStatusCode.SUCCESS_STATUS);
     }
-    return RpcUtils.getStatus(TSStatusCode.REGION_NOT_EXIST);
   }
 
   /**
@@ -1006,30 +1148,32 @@ public class StorageEngine implements IService {
     return dataRegionMap.size();
   }
 
-  /** This method is not thread-safe */
+  /** Replace only the replica for which the snapshot was requested. */
   public DataRegion setDataRegionForSnapshotLoad(
-      DataRegionId regionId, Supplier<DataRegion> newRegionSupplier) {
-    if (dataRegionMap.containsKey(regionId)) {
-      DataRegion oldRegion = dataRegionMap.get(regionId);
-      oldRegion.markDeleted();
-      oldRegion.abortCompaction();
-      oldRegion.syncCloseAllWorkingTsFileProcessors();
-      oldRegion.deleteFolder(systemDir);
+      DataRegionId regionId, DataRegion expectedRegion, Supplier<DataRegion> newRegionSupplier) {
+    synchronized (snapshotLoadMonitor(regionId)) {
+      if (dataRegionMap.get(regionId) != expectedRegion || isDataRegionDeletionPending(regionId)) {
+        return null;
+      }
+      expectedRegion.markDeleted();
+      expectedRegion.abortCompaction();
+      expectedRegion.syncCloseAllWorkingTsFileProcessors();
+      expectedRegion.deleteFolder(systemDir);
       WRITING_METRICS.removeDataRegionMemoryCostMetrics(regionId);
       WRITING_METRICS.removeFlushingMemTableStatusMetrics(regionId);
       WRITING_METRICS.removeActiveMemtableCounterMetrics(regionId);
       FileMetrics.getInstance()
-          .deleteRegion(oldRegion.getDatabaseName(), oldRegion.getDataRegionIdString());
-    }
+          .deleteRegion(expectedRegion.getDatabaseName(), expectedRegion.getDataRegionIdString());
 
-    DataRegion newRegion = newRegionSupplier.get();
-    if (newRegion != null) {
-      WRITING_METRICS.createFlushingMemTableStatusMetrics(regionId);
-      WRITING_METRICS.createDataRegionMemoryCostMetrics(newRegion);
-      WRITING_METRICS.createActiveMemtableCounterMetrics(regionId);
-      dataRegionMap.put(regionId, newRegion);
+      DataRegion newRegion = newRegionSupplier.get();
+      if (newRegion != null) {
+        WRITING_METRICS.createFlushingMemTableStatusMetrics(regionId);
+        WRITING_METRICS.createDataRegionMemoryCostMetrics(newRegion);
+        WRITING_METRICS.createActiveMemtableCounterMetrics(regionId);
+        dataRegionMap.put(regionId, newRegion);
+      }
+      return newRegion;
     }
-    return newRegion;
   }
 
   /** This method is not thread-safe */
