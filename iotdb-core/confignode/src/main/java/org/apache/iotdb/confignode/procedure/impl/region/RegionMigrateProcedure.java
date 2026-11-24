@@ -51,6 +51,7 @@ public class RegionMigrateProcedure extends RegionOperationProcedure<RegionTrans
   private TDataNodeLocation destDataNode;
   private TDataNodeLocation coordinatorForAddPeer;
   private TDataNodeLocation coordinatorForRemovePeer;
+  private boolean verifiedHandoff;
 
   public RegionMigrateProcedure() {
     super();
@@ -75,6 +76,7 @@ public class RegionMigrateProcedure extends RegionOperationProcedure<RegionTrans
       return Flow.NO_MORE_STATE;
     }
     RegionMaintainHandler handler = env.getRegionMaintainHandler();
+    boolean requiresHandoff = verifiedHandoff || handler.isIoTConsensusV1DataRegion(regionId);
     try {
       switch (state) {
         case REGION_MIGRATE_PREPARE:
@@ -88,14 +90,33 @@ public class RegionMigrateProcedure extends RegionOperationProcedure<RegionTrans
           setNextState(RegionTransitionState.ADD_REGION_PEER);
           break;
         case ADD_REGION_PEER:
-          addChildProcedure(
-              new AddRegionPeerProcedure(regionId, coordinatorForAddPeer, destDataNode));
+          if (requiresHandoff) {
+            if (handler.isDataNodeOffline(originalDataNode.getDataNodeId())) {
+              throw new ProcedureException(
+                  String.format(
+                      ProcedureMessages
+                          .EXCEPTION_CANNOT_MIGRATE_ARG_FROM_OFFLINE_DATANODE_ARG_93E90367,
+                      regionId,
+                      originalDataNode.getDataNodeId()));
+            }
+            // Only the original replica can supply the final index of its own writes.
+            verifiedHandoff = true;
+            addChildProcedure(
+                new AddRegionPeerProcedure(regionId, originalDataNode, destDataNode, getProcId()));
+          } else {
+            addChildProcedure(
+                new AddRegionPeerProcedure(regionId, coordinatorForAddPeer, destDataNode));
+          }
           setNextState(RegionTransitionState.CHECK_ADD_REGION_PEER);
           break;
         case CHECK_ADD_REGION_PEER:
+          requireVerifiedHandoff(requiresHandoff);
           if (!env.getConfigManager()
               .getPartitionManager()
               .isDataNodeContainsRegion(destDataNode.getDataNodeId(), regionId)) {
+            if (verifiedHandoff) {
+              throw membershipCheckFailure(state);
+            }
             LOGGER.warn(
                 ProcedureMessages.PID_MIGRATEREGION_SUB_PROCEDURE_ADDREGIONPEERPROCEDURE,
                 getProcId());
@@ -104,15 +125,24 @@ public class RegionMigrateProcedure extends RegionOperationProcedure<RegionTrans
           setNextState(RegionTransitionState.REMOVE_REGION_PEER);
           break;
         case REMOVE_REGION_PEER:
+          requireVerifiedHandoff(requiresHandoff);
           addChildProcedure(
-              new RemoveRegionPeerProcedure(regionId, coordinatorForRemovePeer, originalDataNode));
+              verifiedHandoff
+                  ? new RemoveRegionPeerProcedure(
+                      regionId, destDataNode, originalDataNode, getProcId())
+                  : new RemoveRegionPeerProcedure(
+                      regionId, coordinatorForRemovePeer, originalDataNode));
           setNextState(RegionTransitionState.CHECK_REMOVE_REGION_PEER);
           break;
         case CHECK_REMOVE_REGION_PEER:
+          requireVerifiedHandoff(requiresHandoff);
           String cleanHint = "";
           if (env.getConfigManager()
               .getPartitionManager()
               .isDataNodeContainsRegion(originalDataNode.getDataNodeId(), regionId)) {
+            if (verifiedHandoff) {
+              throw membershipCheckFailure(state);
+            }
             cleanHint =
                 ProcedureMessages
                     .EXCEPTION_BUT_YOU_MAY_NEED_TO_RESTART_THE_RELATED_DATANODE_TO_MAKE_SURE_EVERYTHING_IS_CLEANED_UP_12A12383;
@@ -135,11 +165,34 @@ public class RegionMigrateProcedure extends RegionOperationProcedure<RegionTrans
       }
     } catch (Exception e) {
       LOGGER.error(ProcedureMessages.PID_MIGRATEREGION_STATE_FAIL, getProcId(), state, e);
+      if (requiresHandoff) {
+        setFailure(new ProcedureException(e));
+      }
       // meets exception in region migrate process terminate the process
       return Flow.NO_MORE_STATE;
     }
     LOGGER.info(ProcedureMessages.PID_MIGRATEREGION_STATE_COMPLETE, getProcId(), state);
     return Flow.HAS_MORE_STATE;
+  }
+
+  private void requireVerifiedHandoff(boolean required) throws ProcedureException {
+    if (required && !verifiedHandoff) {
+      throw new ProcedureException(
+          String.format(
+              ProcedureMessages
+                  .EXCEPTION_CANNOT_CONTINUE_LEGACY_MIGRATION_OF_ARG_WITHOUT_A_VERIFIED_HANDOFF_34FDA439,
+              regionId));
+    }
+  }
+
+  private ProcedureException membershipCheckFailure(RegionTransitionState state) {
+    return new ProcedureException(
+        String.format(
+            ProcedureMessages
+                .EXCEPTION_MIGRATION_ARG_FAILED_ITS_MEMBERSHIP_CHECK_FOR_ARG_AT_ARG_33CF2029,
+            getProcId(),
+            regionId,
+            state));
   }
 
   @Override
@@ -170,6 +223,9 @@ public class RegionMigrateProcedure extends RegionOperationProcedure<RegionTrans
     ThriftCommonsSerDeUtils.serializeTConsensusGroupId(regionId, stream);
     ThriftCommonsSerDeUtils.serializeTDataNodeLocation(coordinatorForAddPeer, stream);
     ThriftCommonsSerDeUtils.serializeTDataNodeLocation(coordinatorForRemovePeer, stream);
+    if (verifiedHandoff) {
+      stream.writeBoolean(true);
+    }
   }
 
   @Override
@@ -181,6 +237,7 @@ public class RegionMigrateProcedure extends RegionOperationProcedure<RegionTrans
       regionId = ThriftCommonsSerDeUtils.deserializeTConsensusGroupId(byteBuffer);
       coordinatorForAddPeer = ThriftCommonsSerDeUtils.deserializeTDataNodeLocation(byteBuffer);
       coordinatorForRemovePeer = ThriftCommonsSerDeUtils.deserializeTDataNodeLocation(byteBuffer);
+      verifiedHandoff = byteBuffer.hasRemaining() && byteBuffer.get() != 0;
     } catch (ThriftSerDeException e) {
       LOGGER.warn(
           ProcedureMessages.ERROR_IN_DESERIALIZE_PROCID_THIS_PROCEDURE_WILL_BE_IGNORED_IT,
@@ -199,6 +256,7 @@ public class RegionMigrateProcedure extends RegionOperationProcedure<RegionTrans
           && thatProc.getState() == this.getState()
           && thatProc.originalDataNode.equals(this.originalDataNode)
           && thatProc.destDataNode.equals(this.destDataNode)
+          && thatProc.verifiedHandoff == verifiedHandoff
           && thatProc.regionId.equals(this.regionId);
     }
     return false;
@@ -206,7 +264,7 @@ public class RegionMigrateProcedure extends RegionOperationProcedure<RegionTrans
 
   @Override
   public int hashCode() {
-    return Objects.hash(this.originalDataNode, this.destDataNode, this.regionId);
+    return Objects.hash(this.originalDataNode, this.destDataNode, this.regionId, verifiedHandoff);
   }
 
   public TDataNodeLocation getDestDataNode() {

@@ -20,6 +20,11 @@
 package org.apache.iotdb.confignode.i18n;
 
 public final class ProcedureMessages {
+  public static final String EXCEPTION_MIGRATION_ARG_FOR_ARG_COULD_NOT_VERIFY_ARG_ARG_AAF21262 = "迁移 %s 无法确认 %s 在 %s 阶段的结果：%s";
+  public static final String EXCEPTION_CANNOT_MIGRATE_ARG_FROM_OFFLINE_DATANODE_ARG_93E90367 = "无法迁移 %s，源 DataNode %s 已离线";
+  public static final String EXCEPTION_CANNOT_CONTINUE_LEGACY_MIGRATION_OF_ARG_WITHOUT_A_VERIFIED_HANDOFF_34FDA439 = "旧版迁移缺少交接确认，无法继续迁移 %s";
+  public static final String EXCEPTION_MIGRATION_ARG_FAILED_ITS_MEMBERSHIP_CHECK_FOR_ARG_AT_ARG_33CF2029 = "迁移 %s 对 %s 的成员校验在 %s 阶段失败";
+
 
   public static final String NEVER_FINISH_PROCEDURE_RAN_AGAIN =
       "AddNeverFinishSubProcedureProcedure 再次运行，这种情况不应发生";

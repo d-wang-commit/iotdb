@@ -20,6 +20,11 @@
 package org.apache.iotdb.confignode.i18n;
 
 public final class ProcedureMessages {
+  public static final String EXCEPTION_MIGRATION_ARG_FOR_ARG_COULD_NOT_VERIFY_ARG_ARG_AAF21262 = "Migration %s for %s could not verify %s: %s";
+  public static final String EXCEPTION_CANNOT_MIGRATE_ARG_FROM_OFFLINE_DATANODE_ARG_93E90367 = "Cannot migrate %s from offline DataNode %s";
+  public static final String EXCEPTION_CANNOT_CONTINUE_LEGACY_MIGRATION_OF_ARG_WITHOUT_A_VERIFIED_HANDOFF_34FDA439 = "Cannot continue legacy migration of %s without a verified handoff";
+  public static final String EXCEPTION_MIGRATION_ARG_FAILED_ITS_MEMBERSHIP_CHECK_FOR_ARG_AT_ARG_33CF2029 = "Migration %s failed its membership check for %s at %s";
+
 
   public static final String NEVER_FINISH_PROCEDURE_RAN_AGAIN =
       "AddNeverFinishSubProcedureProcedure run again, which should never happen";

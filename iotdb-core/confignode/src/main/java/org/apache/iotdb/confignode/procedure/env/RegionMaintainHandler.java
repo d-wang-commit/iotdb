@@ -237,11 +237,23 @@ public class RegionMaintainHandler {
       TDataNodeLocation destDataNode,
       TConsensusGroupId regionId,
       TDataNodeLocation coordinator) {
+    return submitAddRegionPeerTask(procedureId, destDataNode, regionId, coordinator, null);
+  }
+
+  public TSStatus submitAddRegionPeerTask(
+      long procedureId,
+      TDataNodeLocation destDataNode,
+      TConsensusGroupId regionId,
+      TDataNodeLocation coordinator,
+      Long migrationId) {
     TSStatus status;
 
     // Send addRegionPeer request to the selected DataNode,
     // destDataNode is where the new RegionReplica is created
     TMaintainPeerReq maintainPeerReq = new TMaintainPeerReq(regionId, destDataNode, procedureId);
+    if (migrationId != null) {
+      maintainPeerReq.setMigrationId(migrationId);
+    }
     status =
         (TSStatus)
             SyncDataNodeClientPool.getInstance()
@@ -275,11 +287,23 @@ public class RegionMaintainHandler {
       TDataNodeLocation originalDataNode,
       TConsensusGroupId regionId,
       TDataNodeLocation coordinator) {
+    return submitRemoveRegionPeerTask(procedureId, originalDataNode, regionId, coordinator, null);
+  }
+
+  public TSStatus submitRemoveRegionPeerTask(
+      long procedureId,
+      TDataNodeLocation originalDataNode,
+      TConsensusGroupId regionId,
+      TDataNodeLocation coordinator,
+      Long migrationId) {
     TSStatus status;
 
     // Send removeRegionPeer request to the rpcClientDataNode
     TMaintainPeerReq maintainPeerReq =
         new TMaintainPeerReq(regionId, originalDataNode, procedureId);
+    if (migrationId != null) {
+      maintainPeerReq.setMigrationId(migrationId);
+    }
     status =
         (TSStatus)
             SyncDataNodeClientPool.getInstance()
@@ -307,10 +331,20 @@ public class RegionMaintainHandler {
    */
   public TSStatus submitDeleteOldRegionPeerTask(
       long procedureId, TDataNodeLocation originalDataNode, TConsensusGroupId regionId) {
+    return submitDeleteOldRegionPeerTask(procedureId, originalDataNode, regionId, null);
+  }
 
+  public TSStatus submitDeleteOldRegionPeerTask(
+      long procedureId,
+      TDataNodeLocation originalDataNode,
+      TConsensusGroupId regionId,
+      Long migrationId) {
     TSStatus status;
     TMaintainPeerReq maintainPeerReq =
         new TMaintainPeerReq(regionId, originalDataNode, procedureId);
+    if (migrationId != null) {
+      maintainPeerReq.setMigrationId(migrationId);
+    }
 
     final NodeStatus nodeStatus = getDataNodeStatus(originalDataNode.getDataNodeId());
     final boolean useFullRetry = !nodeStatus.isOffline();
@@ -338,6 +372,10 @@ public class RegionMaintainHandler {
 
   protected NodeStatus getDataNodeStatus(int dataNodeId) {
     return configManager.getLoadManager().getNodeStatus(dataNodeId);
+  }
+
+  public boolean isDataNodeOffline(int dataNodeId) {
+    return getDataNodeStatus(dataNodeId).isOffline();
   }
 
   protected TSStatus submitDataNodeSyncRequest(

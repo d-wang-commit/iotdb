@@ -54,7 +54,7 @@ import static org.apache.iotdb.confignode.procedure.state.RemoveRegionPeerState.
 import static org.apache.iotdb.confignode.procedure.state.RemoveRegionPeerState.RESET_IOT_CONSENSUS_V1_PEER_LIST;
 import static org.apache.iotdb.rpc.TSStatusCode.SUCCESS_STATUS;
 
-public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRegionPeerState> {
+public class RemoveRegionPeerProcedure extends RegionPeerProcedure<RemoveRegionPeerState> {
   private static final Logger LOGGER = LoggerFactory.getLogger(RemoveRegionPeerProcedure.class);
   private static final int MAX_DELETE_OLD_REGION_PEER_RETRY = 3;
   private static final long DELETE_OLD_REGION_PEER_RETRY_INTERVAL_MS = 5_000;
@@ -77,6 +77,15 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
     this.targetDataNode = targetDataNode;
   }
 
+  RemoveRegionPeerProcedure(
+      TConsensusGroupId regionId,
+      TDataNodeLocation coordinator,
+      TDataNodeLocation target,
+      long migrationId) {
+    this(regionId, coordinator, target);
+    this.migrationId = migrationId;
+  }
+
   private void handleTransferLeader(RegionMaintainHandler handler)
       throws ProcedureException, InterruptedException {
     LOGGER.info(
@@ -97,6 +106,9 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
     TSStatus tsStatus;
     RegionMaintainHandler handler = env.getRegionMaintainHandler();
     try {
+      if (isLegacyMigration(env)) {
+        return failLegacyMigration();
+      }
       switch (state) {
         case TRANSFER_REGION_LEADER:
           handleTransferLeader(handler);
@@ -105,6 +117,17 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
           break;
         case REMOVE_REGION_PEER:
           handler.forceUpdateRegionCache(regionId, targetDataNode, RegionStatus.Removing);
+          if (migrationId != null) {
+            return runVerifiedTask(
+                handler,
+                state,
+                DELETE_OLD_REGION_PEER,
+                coordinator,
+                () ->
+                    handler.submitRemoveRegionPeerTask(
+                        getProcId(), targetDataNode, regionId, coordinator, migrationId),
+                null);
+          }
           tsStatus =
               handler.submitRemoveRegionPeerTask(
                   this.getProcId(), targetDataNode, regionId, coordinator);
@@ -137,6 +160,17 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
           break;
         case DELETE_OLD_REGION_PEER:
           handler.forceUpdateRegionCache(regionId, targetDataNode, RegionStatus.Removing);
+          if (migrationId != null) {
+            return runVerifiedTask(
+                handler,
+                state,
+                DROP_CONSENSUS_PIPES,
+                targetDataNode,
+                () ->
+                    handler.submitDeleteOldRegionPeerTask(
+                        getProcId(), targetDataNode, regionId, migrationId),
+                null);
+          }
           tsStatus =
               handler.submitDeleteOldRegionPeerTask(this.getProcId(), targetDataNode, regionId);
           setKillPoint(state);
@@ -233,6 +267,9 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
       if (state == RESET_IOT_CONSENSUS_V1_PEER_LIST) {
         return retryStep(state, null);
       }
+      if (migrationId != null) {
+        setFailure(new ProcedureException(e));
+      }
       return Flow.NO_MORE_STATE;
     }
     LOGGER.info(ProcedureMessages.PID_REMOVEREGION_STATE_SUCCESS, getProcId(), state);
@@ -297,6 +334,7 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
     ThriftCommonsSerDeUtils.serializeTConsensusGroupId(regionId, stream);
     ThriftCommonsSerDeUtils.serializeTDataNodeLocation(targetDataNode, stream);
     ThriftCommonsSerDeUtils.serializeTDataNodeLocation(coordinator, stream);
+    writeMigrationId(stream);
   }
 
   @Override
@@ -306,6 +344,7 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
       regionId = ThriftCommonsSerDeUtils.deserializeTConsensusGroupId(byteBuffer);
       targetDataNode = ThriftCommonsSerDeUtils.deserializeTDataNodeLocation(byteBuffer);
       coordinator = ThriftCommonsSerDeUtils.deserializeTDataNodeLocation(byteBuffer);
+      readMigrationId(byteBuffer);
     } catch (ThriftSerDeException e) {
       LOGGER.error(ProcedureMessages.ERROR_IN_DESERIALIZE, this.getClass(), e);
     }
@@ -327,11 +366,12 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
     RemoveRegionPeerProcedure procedure = (RemoveRegionPeerProcedure) obj;
     return this.regionId.equals(procedure.regionId)
         && this.targetDataNode.equals(procedure.targetDataNode)
-        && this.coordinator.equals(procedure.coordinator);
+        && this.coordinator.equals(procedure.coordinator)
+        && Objects.equals(migrationId, procedure.migrationId);
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(regionId, targetDataNode, coordinator);
+    return Objects.hash(regionId, targetDataNode, coordinator, migrationId);
   }
 }

@@ -53,7 +53,7 @@ import static org.apache.iotdb.confignode.procedure.env.RegionMaintainHandler.si
 import static org.apache.iotdb.confignode.procedure.state.AddRegionPeerState.UPDATE_REGION_LOCATION_CACHE;
 import static org.apache.iotdb.rpc.TSStatusCode.SUCCESS_STATUS;
 
-public class AddRegionPeerProcedure extends RegionOperationProcedure<AddRegionPeerState> {
+public class AddRegionPeerProcedure extends RegionPeerProcedure<AddRegionPeerState> {
   private static final Logger LOGGER = LoggerFactory.getLogger(AddRegionPeerProcedure.class);
   private static final int MAX_RESET_PEER_LIST_RETRY = 3;
   private static final long RESET_PEER_LIST_RETRY_INTERVAL_MS = 5_000;
@@ -75,6 +75,15 @@ public class AddRegionPeerProcedure extends RegionOperationProcedure<AddRegionPe
     this.targetDataNode = targetDataNode;
   }
 
+  AddRegionPeerProcedure(
+      TConsensusGroupId regionId,
+      TDataNodeLocation coordinator,
+      TDataNodeLocation target,
+      long migrationId) {
+    this(regionId, coordinator, target);
+    this.migrationId = migrationId;
+  }
+
   @Override
   protected Flow executeFromState(ConfigNodeProcedureEnv env, AddRegionPeerState state)
       throws InterruptedException {
@@ -83,6 +92,9 @@ public class AddRegionPeerProcedure extends RegionOperationProcedure<AddRegionPe
     }
     RegionMaintainHandler handler = env.getRegionMaintainHandler();
     try {
+      if (isLegacyMigration(env)) {
+        return failLegacyMigration();
+      }
       outerSwitch:
       switch (state) {
         case CREATE_NEW_REGION_PEER:
@@ -108,6 +120,17 @@ public class AddRegionPeerProcedure extends RegionOperationProcedure<AddRegionPe
           break;
         case DO_ADD_REGION_PEER:
           handler.forceUpdateRegionCache(regionId, targetDataNode, RegionStatus.Adding);
+          if (migrationId != null) {
+            return runVerifiedTask(
+                handler,
+                state,
+                UPDATE_REGION_LOCATION_CACHE,
+                coordinator,
+                () ->
+                    handler.submitAddRegionPeerTask(
+                        getProcId(), targetDataNode, regionId, coordinator, migrationId),
+                RegionMaintainKillPoints.WAIT_TASK_FINISH_POLLING);
+          }
           // Only submit the AddRegionPeerTask on the very first entry of this state. We must NOT
           // re-submit when:
           //   - the state was restored from disk after a leader change / ConfigNode reboot
@@ -189,6 +212,9 @@ public class AddRegionPeerProcedure extends RegionOperationProcedure<AddRegionPe
       }
     } catch (Exception e) {
       LOGGER.error(ProcedureMessages.PID_ADDREGION_STATE_FAILED, getProcId(), state, e);
+      if (migrationId != null) {
+        setFailure(new ProcedureException(e));
+      }
       return Flow.NO_MORE_STATE;
     }
     LOGGER.info(ProcedureMessages.PID_ADDREGION_STATE_COMPLETE, getProcId(), state);
@@ -209,6 +235,11 @@ public class AddRegionPeerProcedure extends RegionOperationProcedure<AddRegionPe
           ProcedureMessages.PID_ADDREGION_START_TO_ROLL_BACK_BECAUSE, getProcId(), reason, e);
     } else {
       LOGGER.warn(ProcedureMessages.PID_ADDREGION_START_TO_ROLL_BACK_BECAUSE, getProcId(), reason);
+    }
+    if (migrationId != null) {
+      // The target may already have accepted writes. A peer-list reset could delete its data.
+      setFailure(new ProcedureException(reason, e));
+      return Flow.NO_MORE_STATE;
     }
     handler.removeRegionLocation(regionId, targetDataNode);
 
@@ -319,6 +350,7 @@ public class AddRegionPeerProcedure extends RegionOperationProcedure<AddRegionPe
     ThriftCommonsSerDeUtils.serializeTConsensusGroupId(regionId, stream);
     ThriftCommonsSerDeUtils.serializeTDataNodeLocation(targetDataNode, stream);
     ThriftCommonsSerDeUtils.serializeTDataNodeLocation(coordinator, stream);
+    writeMigrationId(stream);
   }
 
   @Override
@@ -328,6 +360,7 @@ public class AddRegionPeerProcedure extends RegionOperationProcedure<AddRegionPe
       regionId = ThriftCommonsSerDeUtils.deserializeTConsensusGroupId(byteBuffer);
       targetDataNode = ThriftCommonsSerDeUtils.deserializeTDataNodeLocation(byteBuffer);
       coordinator = ThriftCommonsSerDeUtils.deserializeTDataNodeLocation(byteBuffer);
+      readMigrationId(byteBuffer);
     } catch (ThriftSerDeException e) {
       LOGGER.error(ProcedureMessages.ERROR_IN_DESERIALIZE, this.getClass(), e);
     }
@@ -345,12 +378,13 @@ public class AddRegionPeerProcedure extends RegionOperationProcedure<AddRegionPe
     AddRegionPeerProcedure procedure = (AddRegionPeerProcedure) obj;
     return this.regionId.equals(procedure.regionId)
         && this.targetDataNode.equals(procedure.targetDataNode)
-        && this.coordinator.equals(procedure.coordinator);
+        && this.coordinator.equals(procedure.coordinator)
+        && Objects.equals(migrationId, procedure.migrationId);
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(regionId, targetDataNode, coordinator);
+    return Objects.hash(regionId, targetDataNode, coordinator, migrationId);
   }
 
   @Override
