@@ -36,6 +36,7 @@ import org.apache.iotdb.consensus.exception.ConsensusGroupModifyPeerException;
 import org.apache.iotdb.consensus.i18n.ConsensusMessages;
 import org.apache.iotdb.consensus.iot.log.ConsensusReqReader;
 import org.apache.iotdb.consensus.iot.logdispatcher.LogDispatcher;
+import org.apache.iotdb.consensus.iot.thrift.TTriggerSnapshotLoadReq;
 import org.apache.iotdb.consensus.iot.util.FakeConsensusReqReader;
 import org.apache.iotdb.consensus.iot.util.TestEntry;
 import org.apache.iotdb.consensus.iot.util.TestStateMachine;
@@ -45,7 +46,12 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import java.io.File;
+import java.io.IOException;
 import java.lang.reflect.Field;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -61,6 +67,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
@@ -77,6 +84,124 @@ public class IoTConsensusServerImplTest {
   private static final int PEERS_PER_WRITER = 1_000;
 
   @Rule public final TemporaryFolder temporaryFolder = new TemporaryFolder();
+
+  @Test
+  public void testCorruptSourceFencePreventsRecovery() throws Exception {
+    Path file = temporaryFolder.getRoot().toPath().resolve("migration.source");
+    new MigrationSourceState(9, 1, 27).persist(file);
+    byte[] record = Files.readAllBytes(file);
+    record[record.length - 1] ^= 1;
+    Files.write(file, record);
+    assertThrows(IOException.class, () -> MigrationSourceState.load(file));
+  }
+
+  @Test
+  public void testSourceRestartBeforeFreezeCannotSealShorterRecoveredWal() throws Exception {
+    FakeConsensusReqReader reader = mock(FakeConsensusReqReader.class);
+    when(reader.getCurrentSearchIndex()).thenReturn(1L);
+    Peer self = new Peer(new DataRegionId(11), 10, new TEndPoint("127.0.0.1", 6667));
+    Peer peer = new Peer(new DataRegionId(11), 9, new TEndPoint("127.0.0.1", 6668));
+    ScheduledExecutorService background = Executors.newSingleThreadScheduledExecutor();
+    try {
+      IoTConsensusServerImpl source = newRetentionTestServer(self, reader, background);
+      try {
+        // Keep the target in the peer list while preventing outbound delivery of the tail.
+        source.getLogDispatcher().stop();
+        source.buildSyncLogChannel(peer, 1, false);
+        source.prepareMigration(71, peer.getNodeId());
+        assertTrue(source.hasPreparedMigration(71, peer.getNodeId()));
+        assertFalse(Files.exists(temporaryFolder.getRoot().toPath().resolve("migration.source")));
+        for (int value = 404; value <= 409; value++) {
+          assertEquals(
+              TSStatusCode.SUCCESS_STATUS.getStatusCode(),
+              source.write(new TestEntry(value, self)).getCode());
+        }
+        assertEquals(7L, source.getSearchIndex());
+      } finally {
+        source.stop();
+      }
+      // The recovered WAL and the target contain only the baseline. The old preparation
+      // cannot turn that coincidental agreement into a completed handoff.
+      IoTConsensusServerImpl recovered = newRetentionTestServer(self, reader, background);
+      try {
+        recovered.getLogDispatcher().stop();
+        recovered.buildSyncLogChannel(peer, 1, false);
+        assertEquals(1L, recovered.getSearchIndex());
+        assertFalse(recovered.hasPreparedMigration(71, peer.getNodeId()));
+        assertThrows(
+            ConsensusGroupModifyPeerException.class,
+            () -> recovered.freezeForMigration(71, peer.getNodeId()));
+        assertFalse(recovered.hasMigrationFence(71));
+        assertTrue(recovered.isActive());
+        assertEquals(
+            TSStatusCode.SUCCESS_STATUS.getStatusCode(),
+            recovered.write(new TestEntry(410, self)).getCode());
+      } finally {
+        recovered.stop();
+      }
+    } finally {
+      background.shutdownNow();
+    }
+  }
+
+  @Test
+  public void testMigrationFenceDrainsThrottledWriterAndSurvivesRestart() throws Exception {
+    FakeConsensusReqReader reader = mock(FakeConsensusReqReader.class);
+    CountDownLatch writerReachedThrottle = new CountDownLatch(1);
+    when(reader.getTotalSize())
+        .thenAnswer(
+            invocation -> {
+              writerReachedThrottle.countDown();
+              return Long.MAX_VALUE;
+            });
+    ScheduledExecutorService background = Executors.newSingleThreadScheduledExecutor();
+    ExecutorService writers = Executors.newSingleThreadExecutor();
+    Peer self = new Peer(new DataRegionId(1), 0, new TEndPoint("127.0.0.1", 6667));
+    Peer peer = new Peer(new DataRegionId(1), 1, new TEndPoint("127.0.0.1", 6668));
+    IoTConsensusServerImpl server = newRetentionTestServer(self, reader, background);
+    try {
+      server.getIndexObject().set(27);
+      server.getLogDispatcher().stop();
+      server.buildSyncLogChannel(peer, 27, false);
+      server.prepareMigration(9, peer.getNodeId());
+      assertFalse(server.hasMigrationFence(9));
+      assertThrows(
+          ConsensusGroupModifyPeerException.class,
+          () -> server.freezeForMigration(10, peer.getNodeId()));
+      assertThrows(
+          ConsensusGroupModifyPeerException.class,
+          () -> server.freezeForMigration(9, self.getNodeId()));
+      Future<TSStatus> write = writers.submit(() -> server.write(new TestEntry(1, self)));
+      assertTrue(writerReachedThrottle.await(5, TimeUnit.SECONDS));
+      assertEquals(27, server.freezeForMigration(9, peer.getNodeId()));
+      assertEquals(
+          TSStatusCode.WRITE_PROCESS_REJECT.getStatusCode(),
+          write.get(5, TimeUnit.SECONDS).getCode());
+      assertTrue(server.getConfiguration().contains(peer));
+      assertEquals(27, server.getSearchIndex());
+    } finally {
+      server.stop();
+      writers.shutdownNow();
+      background.shutdownNow();
+    }
+
+    ScheduledExecutorService afterRestart = Executors.newSingleThreadScheduledExecutor();
+    IoTConsensusServerImpl recovered = newRetentionTestServer(self, reader, afterRestart);
+    try {
+      recovered.setActive(true);
+      assertFalse(recovered.isActive());
+      assertTrue(recovered.hasMigrationFence(9));
+      assertTrue(recovered.hasPreparedMigration(9, peer.getNodeId()));
+      assertFalse(recovered.hasMigrationFence(10));
+      assertEquals(27, recovered.freezeForMigration(9, peer.getNodeId()));
+      assertThrows(
+          ConsensusGroupModifyPeerException.class,
+          () -> recovered.prepareMigration(11, peer.getNodeId()));
+    } finally {
+      recovered.stop();
+      afterRestart.shutdownNow();
+    }
+  }
 
   @Test
   public void testNewPeerImmediatelyProtectsWALAndCatchupTimesOut() throws Exception {
@@ -160,6 +285,69 @@ public class IoTConsensusServerImplTest {
         null,
         null,
         IoTConsensusConfig.newBuilder().build());
+  }
+
+  @Test
+  public void testMigrationBaselineRequiresCompleteSnapshotAndSuccessfulLoad() throws Exception {
+    ScheduledExecutorService background = Executors.newSingleThreadScheduledExecutor();
+    Peer self = new Peer(new DataRegionId(1), 1, new TEndPoint("127.0.0.1", 6668));
+    AtomicBoolean allowLoad = new AtomicBoolean();
+    AtomicLong loads = new AtomicLong();
+    IoTConsensusServerImpl server =
+        new IoTConsensusServerImpl(
+            temporaryFolder.getRoot().getAbsolutePath(),
+            null,
+            DirectoryStrategyType.SEQUENCE_STRATEGY,
+            self,
+            Collections.singletonList(self),
+            new TestStateMachine() {
+              @Override
+              public boolean loadSnapshot(File dir) {
+                loads.incrementAndGet();
+                return allowLoad.get();
+              }
+
+              @Override
+              public boolean flushForMigration() {
+                return true;
+              }
+            },
+            background,
+            null,
+            null,
+            IoTConsensusConfig.newBuilder().build());
+    try {
+      server.setActive(false);
+      String snapshot = "snapshot_1_test";
+      TTriggerSnapshotLoadReq request =
+          new TTriggerSnapshotLoadReq(self.getGroupId().convertToTConsensusGroupId(), snapshot)
+              .setMigrationId(1)
+              .setSourceNodeId(0)
+              .setSnapshotIndex(5)
+              .setSnapshotFileCount(1);
+      assertFalse(server.loadMigrationSnapshot(request));
+      assertEquals(0, loads.get());
+      String path = snapshot + "/test.tsfile";
+      server.receiveSnapshotFragment(snapshot, path, ByteBuffer.wrap(new byte[] {1, 2}), 0);
+      server.receiveSnapshotFragment(snapshot, path, ByteBuffer.wrap(new byte[] {3}), 2);
+      assertArrayEquals(
+          new byte[] {1, 2, 3},
+          Files.readAllBytes(temporaryFolder.getRoot().toPath().resolve(path)));
+      request.setMigrationId(2);
+      assertFalse(server.loadMigrationSnapshot(request));
+      assertEquals(1, loads.get());
+      assertFalse(server.confirmMigrationCatchUp(2, 0, 5));
+      allowLoad.set(true);
+      request.setMigrationId(3);
+      assertTrue(server.loadMigrationSnapshot(request));
+      server.setActive(true);
+      assertTrue(server.loadMigrationSnapshot(request));
+      assertEquals(2, loads.get());
+      assertTrue(server.confirmMigrationCatchUp(3, 0, 5));
+    } finally {
+      server.stop();
+      background.shutdownNow();
+    }
   }
 
   @Test
