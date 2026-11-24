@@ -135,7 +135,8 @@ public class IoTConsensusRPCServiceProcessor implements IoTConsensusIService.Ifa
         impl.getStateMachine().deserializeRequest(logEntriesInThisBatch);
     impl.getIoTConsensusServerMetrics().recordDeserializeCost(System.nanoTime() - buildRequestTime);
     TSStatus writeStatus =
-        impl.syncLog(logEntriesInThisBatch.getSourcePeerId(), deserializedRequest);
+        impl.syncLog(
+            logEntriesInThisBatch.getSourcePeerId(), deserializedRequest, req.getLogEntries());
     LOGGER.debug(
         IoTConsensusMessages.EXECUTE_SYNC_LOG_ENTRIES, req.consensusGroupId, writeStatus.subStatus);
     return new TSyncLogEntriesRes(writeStatus.subStatus)
@@ -185,11 +186,31 @@ public class IoTConsensusRPCServiceProcessor implements IoTConsensusIService.Ifa
       status.setMessage(message);
       return new TInactivatePeerRes(status);
     }
-    impl.setActive(false);
+    Long finalSearchIndex = null;
+    if (req.isSetMigrationId() || req.isSetTargetNodeId()) {
+      if (!req.isForDeletionPurpose() || !req.isSetMigrationId() || !req.isSetTargetNodeId()) {
+        return new TInactivatePeerRes(
+            new TSStatus(TSStatusCode.MIGRATE_REGION_ERROR.getStatusCode()));
+      }
+      try {
+        finalSearchIndex = impl.freezeForMigration(req.getMigrationId(), req.getTargetNodeId());
+      } catch (ConsensusGroupModifyPeerException e) {
+        return new TInactivatePeerRes(
+            new TSStatus(TSStatusCode.MIGRATE_REGION_ERROR.getStatusCode())
+                .setMessage(e.getMessage()));
+      }
+    } else {
+      impl.setActive(false);
+    }
     if (req.isForDeletionPurpose()) {
       KillPoint.setKillPoint(IoTConsensusInactivatePeerKillPoints.AFTER_INACTIVATE);
     }
-    return new TInactivatePeerRes(new TSStatus(TSStatusCode.SUCCESS_STATUS.getStatusCode()));
+    TInactivatePeerRes result =
+        new TInactivatePeerRes(new TSStatus(TSStatusCode.SUCCESS_STATUS.getStatusCode()));
+    if (finalSearchIndex != null) {
+      result.setFinalSearchIndex(finalSearchIndex);
+    }
+    return result;
   }
 
   @Override
@@ -343,7 +364,20 @@ public class IoTConsensusRPCServiceProcessor implements IoTConsensusIService.Ifa
       status.setMessage(message);
       return new TTriggerSnapshotLoadRes(status);
     }
-    if (!impl.loadSnapshot(req.snapshotId)) {
+    boolean migrationSnapshot =
+        req.isSetMigrationId()
+            || req.isSetSourceNodeId()
+            || req.isSetSnapshotIndex()
+            || req.isSetSnapshotFileCount();
+    boolean loaded =
+        migrationSnapshot
+            ? req.isSetMigrationId()
+                && req.isSetSourceNodeId()
+                && req.isSetSnapshotIndex()
+                && req.isSetSnapshotFileCount()
+                && impl.loadMigrationSnapshot(req)
+            : impl.loadSnapshot(req.snapshotId);
+    if (!loaded) {
       String message =
           String.format(
               IoTConsensusMessages
@@ -358,7 +392,12 @@ public class IoTConsensusRPCServiceProcessor implements IoTConsensusIService.Ifa
       return new TTriggerSnapshotLoadRes(status);
     }
     KillPoint.setKillPoint(DataNodeKillPoints.DESTINATION_ADD_PEER_TRANSITION);
-    return new TTriggerSnapshotLoadRes(new TSStatus(TSStatusCode.SUCCESS_STATUS.getStatusCode()));
+    TTriggerSnapshotLoadRes result =
+        new TTriggerSnapshotLoadRes(new TSStatus(TSStatusCode.SUCCESS_STATUS.getStatusCode()));
+    if (migrationSnapshot) {
+      result.setVerifiedMigrationId(req.getMigrationId());
+    }
+    return result;
   }
 
   @Override

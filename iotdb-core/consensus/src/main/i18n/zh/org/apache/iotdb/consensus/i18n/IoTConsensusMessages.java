@@ -26,6 +26,9 @@ public final class IoTConsensusMessages {
 
   private IoTConsensusMessages() {}
 
+  public static final String LOG_FAILED_TO_READ_OR_WRITE_MIGRATION_RECEIPT_FOR_REGION_ARG_24C67DE7 =
+      "读写 Region {} 的迁移确认记录失败";
+
   // ===================== IoTConsensus 生命周期 =====================
 
   public static final String INACTIVATE_NEW_PEER =
@@ -352,6 +355,20 @@ public final class IoTConsensusMessages {
 
   public static final String EXCEPTION_NO_REPLICATION_CHANNEL_TO_ARG_F99CF90B =
       "不存在到 %s 的复制通道";
+  public static final String EXCEPTION_MIGRATION_ARG_CANNOT_VERIFY_THE_SNAPSHOT_ON_ARG_4FB0EEC8 =
+      "迁移 %d 无法确认 %s 已安装快照";
+  public static final String EXCEPTION_MIGRATION_ARG_CONFLICTS_WITH_THE_PERSISTED_SOURCE_FENCE_0EA10BE1 =
+      "迁移 %d 与源副本持久化的写入隔离状态冲突";
+  public static final String EXCEPTION_INVALID_MIGRATION_FENCE_AT_ARG_03FF1559 =
+      "%s 处的迁移写入隔离记录无效";
+  public static final String EXCEPTION_MIGRATION_ARG_CANNOT_VERIFY_THE_SOURCE_FENCE_ON_ARG_FF6BFF8D =
+      "迁移 %d 无法确认源副本 %s 已停止写入";
+  public static final String EXCEPTION_MIGRATION_ARG_CANNOT_VERIFY_THE_EXISTING_PEER_ARG_EA694D35 =
+      "迁移 %d 无法验证已存在的副本 %s";
+  public static final String EXCEPTION_SOURCE_MIGRATION_FENCE_DOES_NOT_MATCH_MIGRATION_ARG_5AE240E7 =
+      "源副本的写入隔离记录与迁移 %d 不匹配";
+  public static final String EXCEPTION_MIGRATION_ARG_CANNOT_VERIFY_SNAPSHOT_COVERAGE_THROUGH_INDEX_ARG_99DE0F71 =
+      "迁移 %d 无法确认快照和后续复制已覆盖至索引 %d";
   public static final String EXCEPTION_REPLICATION_CHANNEL_TO_ARG_FAILED_402B2EC5 =
       "到 %s 的复制通道失败";
   public static final String EXCEPTION_TIMED_OUT_WAITING_FOR_ARG_TO_APPLY_INDEX_ARG_ECAC0A5A =

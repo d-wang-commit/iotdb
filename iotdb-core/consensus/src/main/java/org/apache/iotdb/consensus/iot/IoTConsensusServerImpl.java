@@ -55,6 +55,7 @@ import org.apache.iotdb.consensus.iot.log.ConsensusReqReader;
 import org.apache.iotdb.consensus.iot.log.GetConsensusReqReaderPlan;
 import org.apache.iotdb.consensus.iot.logdispatcher.LogDispatcher;
 import org.apache.iotdb.consensus.iot.snapshot.IoTConsensusRateLimiter;
+import org.apache.iotdb.consensus.iot.snapshot.SnapshotFragment;
 import org.apache.iotdb.consensus.iot.snapshot.SnapshotFragmentReader;
 import org.apache.iotdb.consensus.iot.subscription.SubscriptionQueueRegistry;
 import org.apache.iotdb.consensus.iot.subscription.SubscriptionWalRetentionCalculator;
@@ -67,6 +68,7 @@ import org.apache.iotdb.consensus.iot.thrift.TCleanupTransferredSnapshotReq;
 import org.apache.iotdb.consensus.iot.thrift.TCleanupTransferredSnapshotRes;
 import org.apache.iotdb.consensus.iot.thrift.TInactivatePeerReq;
 import org.apache.iotdb.consensus.iot.thrift.TInactivatePeerRes;
+import org.apache.iotdb.consensus.iot.thrift.TLogEntry;
 import org.apache.iotdb.consensus.iot.thrift.TRemoveSyncLogChannelReq;
 import org.apache.iotdb.consensus.iot.thrift.TRemoveSyncLogChannelRes;
 import org.apache.iotdb.consensus.iot.thrift.TSendSnapshotFragmentReq;
@@ -90,6 +92,7 @@ import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -99,6 +102,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Objects;
@@ -116,6 +120,7 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.LongSupplier;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import static org.apache.iotdb.commons.utils.FileUtils.humanReadableByteCountSI;
 
@@ -156,6 +161,8 @@ public class IoTConsensusServerImpl {
   private IoTConsensusConfig config;
   private final ConsensusReqReader consensusReqReader;
   private volatile boolean active;
+  private final Path migrationSourcePath;
+  private volatile MigrationSourceState migrationSource;
   private String newSnapshotDirName;
   private final IClientManager<TEndPoint, SyncIoTConsensusServiceClient> syncClientManager;
   private final IoTConsensusServerMetrics ioTConsensusServerMetrics;
@@ -184,6 +191,8 @@ public class IoTConsensusServerImpl {
   private final WriterSafeFrontierTracker writerSafeFrontierTracker =
       new WriterSafeFrontierTracker();
 
+  private final MigrationTargetProgress migrationTarget;
+
   private final Path writerMetaPath;
   private final Object writerMetaPersistLock = new Object();
   private volatile WriterMeta latestWriterMeta;
@@ -202,7 +211,7 @@ public class IoTConsensusServerImpl {
       IClientManager<TEndPoint, AsyncIoTConsensusServiceClient> clientManager,
       IClientManager<TEndPoint, SyncIoTConsensusServiceClient> syncClientManager,
       IoTConsensusConfig config)
-      throws DiskSpaceInsufficientException {
+      throws DiskSpaceInsufficientException, IOException {
     this(
         storageDir,
         recvSnapshotDirs,
@@ -231,9 +240,11 @@ public class IoTConsensusServerImpl {
       IoTConsensusConfig config,
       UserDataTransferAuditHandler userDataTransferAuditHandler,
       UserDataTransferAuditClassifier userDataTransferAuditClassifier)
-      throws DiskSpaceInsufficientException {
+      throws DiskSpaceInsufficientException, IOException {
     this.active = true;
     this.storageDir = storageDir;
+    this.migrationSourcePath = Paths.get(storageDir, "migration.source");
+    this.migrationSource = MigrationSourceState.load(migrationSourcePath);
     List<String> snapshotDirs = new ArrayList<>();
     if (recvSnapshotDirs != null) {
       for (String dir : recvSnapshotDirs) {
@@ -254,6 +265,14 @@ public class IoTConsensusServerImpl {
     this.userDataTransferAuditHandler = userDataTransferAuditHandler;
     this.userDataTransferAuditClassifier = userDataTransferAuditClassifier;
     this.consensusGroupId = thisNode.getGroupId().toString();
+    MigrationTargetProgress recovered;
+    try {
+      recovered = new MigrationTargetProgress(Paths.get(storageDir, "migration-target.receipt"));
+    } catch (IOException e) {
+      logMigrationReceiptFailure(e);
+      recovered = null;
+    }
+    migrationTarget = recovered;
     this.consensusReqReader =
         (ConsensusReqReader) stateMachine.read(new GetConsensusReqReaderPlan());
     this.searchIndex = new AtomicLong(consensusReqReader.getCurrentSearchIndex());
@@ -314,6 +333,15 @@ public class IoTConsensusServerImpl {
           logger.error(IoTConsensusMessages.FAILED_TO_THROTTLE_DOWN, e);
           Thread.currentThread().interrupt();
         }
+      }
+      // A writer may have entered before the handoff and released this lock while throttled.
+      if (isMigrationFrozen()) {
+        return RpcUtils.getStatus(
+            TSStatusCode.WRITE_PROCESS_REJECT,
+            String.format(
+                ConsensusMessages.PEER_INACTIVE_NOT_READY_WRITE,
+                thisNode.getGroupId(),
+                thisNode.getNodeId()));
       }
       long writeToStateMachineStartTime = System.nanoTime();
       // statistic the time of checking write block
@@ -402,6 +430,82 @@ public class IoTConsensusServerImpl {
     return stateMachine.read(request);
   }
 
+  long takeMigrationSnapshot() throws ConsensusGroupModifyPeerException {
+    stateMachineLock.lock();
+    try {
+      long baseIndex = getSearchIndex();
+      takeSnapshot();
+      return baseIndex;
+    } finally {
+      stateMachineLock.unlock();
+    }
+  }
+
+  void prepareMigration(long migrationId, int targetNodeId)
+      throws ConsensusGroupModifyPeerException {
+    stateMachineLock.lock();
+    try {
+      if (migrationId < 0 || targetNodeId < 0 || isMigrationFrozen()) {
+        throw migrationConflict(migrationId);
+      }
+      // A restart can recover an asynchronous WAL prefix shorter than the accepted writes.
+      // Only this writer lifetime may seal the final index for this preparation.
+      migrationSource =
+          new MigrationSourceState(migrationId, targetNodeId, MigrationSourceState.PREPARED);
+    } finally {
+      stateMachineLock.unlock();
+    }
+  }
+
+  public long freezeForMigration(long migrationId, int targetNodeId)
+      throws ConsensusGroupModifyPeerException {
+    stateMachineLock.lock();
+    try {
+      if (migrationSource == null
+          || migrationSource.migrationId != migrationId
+          || migrationSource.targetNodeId != targetNodeId) {
+        throw migrationConflict(migrationId);
+      }
+      if (!isMigrationFrozen()) {
+        if (configuration.stream().noneMatch(p -> p.getNodeId() == targetNodeId)) {
+          throw migrationConflict(migrationId);
+        }
+        migrationSource = new MigrationSourceState(migrationId, targetNodeId, getSearchIndex());
+        stateMachineCondition.signalAll();
+      }
+      // Repeat the durable publication if the previous attempt failed after the rename.
+      migrationSource.persist(migrationSourcePath);
+      return migrationSource.finalIndex;
+    } catch (IOException e) {
+      throw new ConsensusGroupModifyPeerException(e);
+    } finally {
+      stateMachineLock.unlock();
+    }
+  }
+
+  private boolean isMigrationFrozen() {
+    MigrationSourceState state = migrationSource;
+    return state != null && state.finalIndex >= 0;
+  }
+
+  boolean hasMigrationFence(long migrationId) throws IOException {
+    MigrationSourceState state = MigrationSourceState.load(migrationSourcePath);
+    return state != null && state.migrationId == migrationId && state.finalIndex >= 0;
+  }
+
+  boolean hasPreparedMigration(long migrationId, int targetNodeId) {
+    MigrationSourceState state = migrationSource;
+    return state != null && state.migrationId == migrationId && state.targetNodeId == targetNodeId;
+  }
+
+  private static ConsensusGroupModifyPeerException migrationConflict(long migrationId) {
+    return new ConsensusGroupModifyPeerException(
+        String.format(
+            IoTConsensusMessages
+                .EXCEPTION_MIGRATION_ARG_CONFLICTS_WITH_THE_PERSISTED_SOURCE_FENCE_0EA10BE1,
+            migrationId));
+  }
+
   public void takeSnapshot() throws ConsensusGroupModifyPeerException {
     try {
       newSnapshotDirName =
@@ -430,6 +534,11 @@ public class IoTConsensusServerImpl {
   }
 
   public void transmitSnapshot(Peer targetPeer) throws ConsensusGroupModifyPeerException {
+    transmitSnapshot(targetPeer, false);
+  }
+
+  int transmitSnapshot(Peer targetPeer, boolean includeEmptyFiles)
+      throws ConsensusGroupModifyPeerException {
     File snapshotDir = new File(storageDir, newSnapshotDirName);
     List<File> snapshotPaths = stateMachine.getSnapshotFiles(snapshotDir);
     final boolean auditSnapshotTransfer =
@@ -472,9 +581,15 @@ public class IoTConsensusServerImpl {
         SnapshotFragmentReader reader =
             new SnapshotFragmentReader(newSnapshotDirName, file.toPath(), fragmentBuffer);
         try {
-          while (reader.hasNext()) {
-            // TODO: zero copy ?
-            TSendSnapshotFragmentReq req = reader.next().toTSendSnapshotFragmentReq();
+          boolean sendEmpty = includeEmptyFiles && Files.size(file.toPath()) == 0;
+          while (sendEmpty || reader.hasNext()) {
+            SnapshotFragment fragment =
+                sendEmpty
+                    ? new SnapshotFragment(
+                        newSnapshotDirName, file.getAbsolutePath(), 0, 0, 0, ByteBuffer.allocate(0))
+                    : reader.next();
+            sendEmpty = false;
+            TSendSnapshotFragmentReq req = fragment.toTSendSnapshotFragmentReq();
             req.setConsensusGroupId(targetPeer.getGroupId().convertToTConsensusGroupId());
             ioTConsensusRateLimiter.acquireTransitDataSizeWithRateLimiter(req.getChunkLength());
             final TSendSnapshotFragmentRes res;
@@ -524,6 +639,7 @@ public class IoTConsensusServerImpl {
         CommonDateTimeUtils.convertMillisecondToDurationStr(
             (System.nanoTime() - startTime) / 1_000_000),
         snapshotDir);
+    return snapshotPaths.size();
   }
 
   private void recordSnapshotTransferAttempt(
@@ -626,7 +742,14 @@ public class IoTConsensusServerImpl {
     try (FileChannel channel =
         FileChannel.open(
             targetFile.toPath(), StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
-      channel.write(fileChunk.slice(), fileOffset);
+      ByteBuffer bytes = fileChunk.slice();
+      while (bytes.hasRemaining()) {
+        int written = channel.write(bytes, fileOffset);
+        if (written == 0) {
+          throw new IOException();
+        }
+        fileOffset += written;
+      }
     }
   }
 
@@ -666,6 +789,63 @@ public class IoTConsensusServerImpl {
   }
 
   public boolean loadSnapshot(String snapshotId) {
+    if (migrationTarget == null) {
+      return false;
+    }
+    synchronized (migrationTarget) {
+      try {
+        migrationTarget.invalidate();
+        return loadSnapshot(snapshotId, -1);
+      } catch (IOException e) {
+        logMigrationReceiptFailure(e);
+        return false;
+      }
+    }
+  }
+
+  public boolean loadMigrationSnapshot(TTriggerSnapshotLoadReq req) {
+    if (migrationTarget == null || req.getSnapshotFileCount() < 0) {
+      return false;
+    }
+    try {
+      return migrationTarget.install(
+          req.getMigrationId(),
+          req.getSourceNodeId(),
+          req.getSnapshotIndex(),
+          req.getSnapshotId(),
+          !isActive(),
+          () -> loadSnapshot(req.getSnapshotId(), req.getSnapshotFileCount()));
+    } catch (IOException e) {
+      logMigrationReceiptFailure(e);
+      return false;
+    }
+  }
+
+  boolean hasTargetMigrationBaseline(long migrationId, int sourceNodeId) {
+    return migrationTarget != null && migrationTarget.hasBaseline(migrationId, sourceNodeId);
+  }
+
+  public boolean confirmMigrationCatchUp(long migrationId, int sourceNodeId, long finalIndex) {
+    if (migrationTarget == null) {
+      return false;
+    }
+    try {
+      return migrationTarget.confirm(
+          migrationId, sourceNodeId, finalIndex, stateMachine::flushForMigration);
+    } catch (IOException e) {
+      logMigrationReceiptFailure(e);
+      return false;
+    }
+  }
+
+  private void logMigrationReceiptFailure(IOException e) {
+    logger.error(
+        IoTConsensusMessages.LOG_FAILED_TO_READ_OR_WRITE_MIGRATION_RECEIPT_FOR_REGION_ARG_24C67DE7,
+        consensusGroupId,
+        e);
+  }
+
+  private boolean loadSnapshot(String snapshotId, int expectedFileCount) {
     // Snapshot fragments are spread across the receive folders by the FolderManager (a DataRegion,
     // for example, uses one receive folder per local data dir), so a given snapshot only exists
     // under the folders that actually received fragments. Collect exactly those folders and hand
@@ -686,6 +866,28 @@ public class IoTConsensusServerImpl {
         File snapshotDir = getSnapshotPath(dir, snapshotId);
         if (snapshotDir.exists()) {
           snapshotDirs.add(snapshotDir);
+        }
+      }
+      if (expectedFileCount >= 0) {
+        long count = 0;
+        for (File dir : snapshotDirs) {
+          try (Stream<Path> files = Files.walk(dir.toPath())) {
+            Iterator<Path> fragments = files.filter(Files::isRegularFile).iterator();
+            while (fragments.hasNext()) {
+              // DataRegion loads these files by hard link. Flushing later working TsFiles alone
+              // cannot make the received snapshot's existing contents durable.
+              try (FileChannel file =
+                  FileChannel.open(fragments.next(), StandardOpenOption.WRITE)) {
+                file.force(true);
+              }
+              count++;
+            }
+          } catch (IOException | UncheckedIOException e) {
+            return false;
+          }
+        }
+        if (count != expectedFileCount) {
+          return false;
         }
       }
       if (snapshotDirs.isEmpty()) {
@@ -755,17 +957,62 @@ public class IoTConsensusServerImpl {
     throw lastException;
   }
 
+  long freezeRemoteSource(Peer source, long migrationId) throws ConsensusGroupModifyPeerException {
+    try (SyncIoTConsensusServiceClient client =
+        syncClientManager.borrowClient(source.getEndpoint())) {
+      TInactivatePeerRes result =
+          client.inactivatePeer(
+              new TInactivatePeerReq(thisNode.getGroupId().convertToTConsensusGroupId())
+                  .setForDeletionPurpose(true)
+                  .setMigrationId(migrationId)
+                  .setTargetNodeId(thisNode.getNodeId()));
+      if (!isSuccess(result.status)
+          || !result.isSetFinalSearchIndex()
+          || result.getFinalSearchIndex() < 0) {
+        throw new ConsensusGroupModifyPeerException(
+            String.format(
+                IoTConsensusMessages
+                    .EXCEPTION_MIGRATION_ARG_CANNOT_VERIFY_THE_SOURCE_FENCE_ON_ARG_FF6BFF8D,
+                migrationId,
+                source));
+      }
+      return result.getFinalSearchIndex();
+    } catch (ClientManagerException | TException e) {
+      throw new ConsensusGroupModifyPeerException(e);
+    }
+  }
+
   public void triggerSnapshotLoad(Peer peer) throws ConsensusGroupModifyPeerException {
+    triggerSnapshotLoad(peer, null, -1, 0);
+  }
+
+  void triggerSnapshotLoad(Peer peer, Long migrationId, long snapshotIndex, int fileCount)
+      throws ConsensusGroupModifyPeerException {
     try (SyncIoTConsensusServiceClient client =
         syncClientManager.borrowClient(peer.getEndpoint())) {
-      TTriggerSnapshotLoadRes res =
-          client.triggerSnapshotLoad(
-              new TTriggerSnapshotLoadReq(
-                  thisNode.getGroupId().convertToTConsensusGroupId(), newSnapshotDirName));
+      TTriggerSnapshotLoadReq req =
+          new TTriggerSnapshotLoadReq(
+              thisNode.getGroupId().convertToTConsensusGroupId(), newSnapshotDirName);
+      if (migrationId != null) {
+        req.setMigrationId(migrationId)
+            .setSourceNodeId(thisNode.getNodeId())
+            .setSnapshotIndex(snapshotIndex)
+            .setSnapshotFileCount(fileCount);
+      }
+      TTriggerSnapshotLoadRes res = client.triggerSnapshotLoad(req);
       if (!isSuccess(res.status)) {
         throw new ConsensusGroupModifyPeerException(
             String.format(
                 IoTConsensusMessages.ERROR_TRIGGERING_SNAPSHOT_LOAD, peer, res.getStatus()));
+      }
+      if (migrationId != null
+          && (!res.isSetVerifiedMigrationId() || res.getVerifiedMigrationId() != migrationId)) {
+        throw new ConsensusGroupModifyPeerException(
+            String.format(
+                IoTConsensusMessages
+                    .EXCEPTION_MIGRATION_ARG_CANNOT_VERIFY_THE_SNAPSHOT_ON_ARG_4FB0EEC8,
+                migrationId,
+                peer));
       }
     } catch (Exception e) {
       throw new ConsensusGroupModifyPeerException(
@@ -867,7 +1114,13 @@ public class IoTConsensusServerImpl {
 
   public void waitTargetPeerUntilSyncLogCompleted(Peer targetPeer)
       throws ConsensusGroupModifyPeerException {
+    waitTargetPeerUntilSyncLogCompleted(targetPeer, false);
+  }
+
+  void waitTargetPeerUntilSyncLogCompleted(Peer targetPeer, boolean boundedMigrationWait)
+      throws ConsensusGroupModifyPeerException {
     long checkIntervalInMs = 10_000L;
+    long started = System.nanoTime();
     try (SyncIoTConsensusServiceClient client =
         syncClientManager.borrowClient(targetPeer.getEndpoint())) {
       while (true) {
@@ -881,6 +1134,14 @@ public class IoTConsensusServerImpl {
               res.searchIndex,
               res.safeIndex);
           return;
+        }
+        if (boundedMigrationWait && System.nanoTime() - started >= TimeUnit.MINUTES.toNanos(10)) {
+          throw new ConsensusGroupModifyPeerException(
+              String.format(
+                  IoTConsensusMessages
+                      .EXCEPTION_TIMED_OUT_WAITING_FOR_ARG_TO_APPLY_INDEX_ARG_ECAC0A5A,
+                  targetPeer,
+                  res.searchIndex));
         }
         logger.info(
             IoTConsensusMessages.WAIT_SYNC_LOG_IN_PROGRESS,
@@ -1412,7 +1673,7 @@ public class IoTConsensusServerImpl {
   }
 
   public boolean isActive() {
-    return active;
+    return active && !isMigrationFrozen();
   }
 
   public void setActive(boolean active) {
@@ -1532,6 +1793,35 @@ public class IoTConsensusServerImpl {
     return cacheQueueMap
         .computeIfAbsent(sourcePeerId, SyncLogCacheQueue::new)
         .cacheAndInsertLatestNode((DeserializedBatchIndexedConsensusRequest) request);
+  }
+
+  public TSStatus syncLog(int sourcePeerId, IConsensusRequest request, List<TLogEntry> entries) {
+    if (migrationTarget != null && migrationTarget.tracks(sourcePeerId)) {
+      DeserializedBatchIndexedConsensusRequest batch =
+          (DeserializedBatchIndexedConsensusRequest) request;
+      TSStatus result =
+          migrationTarget.apply(
+              sourcePeerId,
+              entries,
+              i -> {
+                IConsensusRequest node = batch.getInsertNodes().get(i);
+                node.markAsGeneratedByRemoteConsensusLeader();
+                return isReadOnly()
+                    ? RpcUtils.getStatus(
+                        TSStatusCode.SYSTEM_READ_ONLY, ConsensusMessages.SYNC_LOG_SYSTEM_READ_ONLY)
+                    : stateMachine.write(node);
+              });
+      if (result != null) {
+        if (!entries.isEmpty()
+            && result.getSubStatus().stream()
+                .allMatch(s -> s.getCode() == TSStatusCode.SUCCESS_STATUS.getStatusCode())) {
+          recordRemoteAppliedWriterProgress(
+              batch.getEndPhysicalTime(), sourcePeerId, batch.getEndSyncIndex());
+        }
+        return result;
+      }
+    }
+    return syncLog(sourcePeerId, request);
   }
 
   public String getConsensusGroupId() {

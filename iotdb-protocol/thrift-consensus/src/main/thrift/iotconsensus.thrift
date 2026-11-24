@@ -57,10 +57,13 @@ struct TSyncWriterSafeTimeBarrierRes {
 struct TInactivatePeerReq {
   1: required common.TConsensusGroupId consensusGroupId
   2: optional bool forDeletionPurpose
+  3: optional i64 migrationId
+  4: optional i32 targetNodeId
 }
 
 struct TInactivatePeerRes {
   1: required common.TSStatus status
+  2: optional i64 finalSearchIndex
 }
 
 struct TActivatePeerReq {
@@ -125,10 +128,15 @@ struct TSendSnapshotFragmentRes {
 struct TTriggerSnapshotLoadReq {
   1: required common.TConsensusGroupId consensusGroupId
   2: required string snapshotId
+  3: optional i64 migrationId
+  4: optional i32 sourceNodeId
+  5: optional i64 snapshotIndex
+  6: optional i32 snapshotFileCount
 }
 
 struct TTriggerSnapshotLoadRes {
   1: required common.TSStatus status
+  2: optional i64 verifiedMigrationId
 }
 
 struct TCleanupTransferredSnapshotReq {

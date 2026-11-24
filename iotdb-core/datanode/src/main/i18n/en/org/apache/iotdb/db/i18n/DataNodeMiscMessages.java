@@ -208,6 +208,9 @@ public final class DataNodeMiscMessages {
   public static final String CREATE_NEW_REGION_ERROR_FMT = "create new region %s error,  exception:%s";
   public static final String CREATE_NEW_REGION_SUCCEED_FMT = "create new region %s succeed";
   public static final String LOG_USER_ARG_ROLE_ARG_422D48D3 = "user: %s, role: %s";
+  public static final String EXCEPTION_VERIFIED_REGION_MIGRATION_REQUIRES_AN_IOTCONSENSUS_V1_DATAREGION_830F28B9 =
+      "Verified region migration requires an IoTConsensus v1 DataRegion.";
+
   private DataNodeMiscMessages() {}
 
   // ---------------------------------------------------------------------------

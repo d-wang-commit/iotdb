@@ -27,6 +27,9 @@ public final class IoTConsensusMessages {
 
   private IoTConsensusMessages() {}
 
+  public static final String LOG_FAILED_TO_READ_OR_WRITE_MIGRATION_RECEIPT_FOR_REGION_ARG_24C67DE7 =
+      "Failed to read or write migration receipt for region {}";
+
   // ===================== IoTConsensus lifecycle =====================
 
   public static final String INACTIVATE_NEW_PEER =
@@ -357,6 +360,20 @@ public final class IoTConsensusMessages {
 
   public static final String EXCEPTION_NO_REPLICATION_CHANNEL_TO_ARG_F99CF90B =
       "No replication channel to %s";
+  public static final String EXCEPTION_MIGRATION_ARG_CANNOT_VERIFY_THE_SNAPSHOT_ON_ARG_4FB0EEC8 =
+      "Migration %d cannot verify the snapshot on %s";
+  public static final String EXCEPTION_MIGRATION_ARG_CONFLICTS_WITH_THE_PERSISTED_SOURCE_FENCE_0EA10BE1 =
+      "Migration %d conflicts with the persisted source fence";
+  public static final String EXCEPTION_INVALID_MIGRATION_FENCE_AT_ARG_03FF1559 =
+      "Invalid migration fence at %s";
+  public static final String EXCEPTION_MIGRATION_ARG_CANNOT_VERIFY_THE_SOURCE_FENCE_ON_ARG_FF6BFF8D =
+      "Migration %d cannot verify the source fence on %s";
+  public static final String EXCEPTION_MIGRATION_ARG_CANNOT_VERIFY_THE_EXISTING_PEER_ARG_EA694D35 =
+      "Migration %d cannot verify the existing peer %s";
+  public static final String EXCEPTION_SOURCE_MIGRATION_FENCE_DOES_NOT_MATCH_MIGRATION_ARG_5AE240E7 =
+      "Source migration fence does not match migration %d";
+  public static final String EXCEPTION_MIGRATION_ARG_CANNOT_VERIFY_SNAPSHOT_COVERAGE_THROUGH_INDEX_ARG_99DE0F71 =
+      "Migration %d cannot verify snapshot coverage through index %d";
   public static final String EXCEPTION_REPLICATION_CHANNEL_TO_ARG_FAILED_402B2EC5 =
       "Replication channel to %s failed";
   public static final String EXCEPTION_TIMED_OUT_WAITING_FOR_ARG_TO_APPLY_INDEX_ARG_ECAC0A5A =

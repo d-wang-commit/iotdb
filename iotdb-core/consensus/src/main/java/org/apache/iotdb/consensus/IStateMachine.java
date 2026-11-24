@@ -30,6 +30,7 @@ import org.apache.iotdb.consensus.i18n.ConsensusMessages;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.io.File;
+import java.io.IOException;
 import java.util.List;
 import java.util.function.Function;
 
@@ -43,6 +44,11 @@ public interface IStateMachine {
   void stop();
 
   default boolean isReadOnly() {
+    return false;
+  }
+
+  /** Make previously applied writes recoverable before acknowledging a DataRegion migration. */
+  default boolean flushForMigration() throws IOException {
     return false;
   }
 
