@@ -123,6 +123,10 @@ public final class ConsensusMessages {
       "Peer is inactive and not ready to receive sync log request, %s, DataNode Id: %s";
   public static final String PEER_INACTIVE_NOT_READY_WRITE =
       "Peer is inactive and not ready to write request, %s, DataNode Id: %s";
+  public static final String LOG_PEER_ARG_IS_ALREADY_REMOVED_FROM_THE_CONFIGURATION_OF_CONSENSUS_GROUP_ARG_STILL_INACTIVATING_IT_AND_WAITING_FOR_ITS_SYNC_LOG_TO_COMPLETE_BEFORE_DELETION_50D71ACB =
+      "Peer %s is already removed from the configuration of consensus group %s; still inactivating it and waiting for its sync log to complete before deletion.";
+  public static final String LOG_CONSENSUS_GROUP_ARG_IS_ALREADY_ABSENT_WHILE_INACTIVATING_A_PEER_FOR_DELETION_TREAT_IT_AS_ALREADY_FENCED_05A15EB9 =
+      "Consensus group %s is already absent while inactivating a peer for deletion; treat it as already fenced.";
   public static final String REMOVE_SYNC_LOG_CHANNEL_FAILED =
       "remove sync log channel failed";
   public static final String FAILED_TO_CLEANUP_TRANSFERRED_SNAPSHOT =

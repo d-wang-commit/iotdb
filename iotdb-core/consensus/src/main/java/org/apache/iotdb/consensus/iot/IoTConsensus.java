@@ -54,7 +54,6 @@ import org.apache.iotdb.consensus.exception.ConsensusGroupNotExistException;
 import org.apache.iotdb.consensus.exception.IllegalPeerEndpointException;
 import org.apache.iotdb.consensus.exception.IllegalPeerNumException;
 import org.apache.iotdb.consensus.exception.PeerAlreadyInConsensusGroupException;
-import org.apache.iotdb.consensus.exception.PeerNotInConsensusGroupException;
 import org.apache.iotdb.consensus.i18n.ConsensusMessages;
 import org.apache.iotdb.consensus.i18n.IoTConsensusMessages;
 import org.apache.iotdb.consensus.iot.client.AsyncIoTConsensusServiceClient;
@@ -501,14 +500,22 @@ public class IoTConsensus implements IConsensus {
             .orElseThrow(() -> new ConsensusGroupNotExistException(groupId));
 
     synchronized (impl) {
-      if (!impl.getConfiguration().contains(peer)) {
-        throw new PeerNotInConsensusGroupException(groupId, peer.toString());
-      }
-
       KillPoint.setKillPoint(IoTConsensusRemovePeerCoordinatorKillPoints.INIT);
 
-      // let other peers remove the sync channel with target peer
-      impl.notifyPeersToRemoveSyncLogChannel(peer);
+      // A previous attempt may already have removed the peer from this coordinator's configuration
+      // (notifyPeersToRemoveSyncLogChannel removes the local channel first). The peer can still
+      // hold unacknowledged entries, so inactivate it and run the sync-completion barrier in both
+      // cases before reporting success.
+      if (impl.getConfiguration().contains(peer)) {
+        // let other peers remove the sync channel with target peer
+        impl.notifyPeersToRemoveSyncLogChannel(peer);
+      } else {
+        logger.info(
+            ConsensusMessages
+                .LOG_PEER_ARG_IS_ALREADY_REMOVED_FROM_THE_CONFIGURATION_OF_CONSENSUS_GROUP_ARG_STILL_INACTIVATING_IT_AND_WAITING_FOR_ITS_SYNC_LOG_TO_COMPLETE_BEFORE_DELETION_50D71ACB,
+            peer,
+            groupId);
+      }
       KillPoint.setKillPoint(
           IoTConsensusRemovePeerCoordinatorKillPoints
               .AFTER_NOTIFY_PEERS_TO_REMOVE_REPLICATE_CHANNEL);
@@ -659,6 +666,9 @@ public class IoTConsensus implements IConsensus {
         logger.info(
             ConsensusMessages.RESET_PEER_LIST_NOTHING_TO_RESET, groupId, previousPeerListStr);
       }
+      // The local replica is part of the correct replica set, so a removal rollback that resets
+      // the peer list must make it writable again if a previous remove-peer attempt fenced it.
+      impl.setActive(true);
     }
   }
 

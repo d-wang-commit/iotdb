@@ -292,6 +292,12 @@ public class IoTConsensusServerImpl {
     long consensusWriteStartTime = System.nanoTime();
     stateMachineLock.lock();
     try {
+      // Re-check under the write lock: a write may have passed the lock-free active check in
+      // IoTConsensus.write() and queued here. Fencing under the same lock makes the
+      // inactivatePeer result a stable searchIndex boundary for the remove-peer barrier.
+      if (!active) {
+        return inactiveWriteStatus();
+      }
       long getStateMachineLockTime = System.nanoTime();
       // statistic the time of acquiring stateMachine lock
       ioTConsensusServerMetrics.recordGetStateMachineLockTime(
@@ -314,6 +320,11 @@ public class IoTConsensusServerImpl {
           logger.error(IoTConsensusMessages.FAILED_TO_THROTTLE_DOWN, e);
           Thread.currentThread().interrupt();
         }
+      }
+      // The throttle wait above releases stateMachineLock, so a fence applied during the wait
+      // would otherwise be bypassed by this already-accepted write.
+      if (!active) {
+        return inactiveWriteStatus();
       }
       long writeToStateMachineStartTime = System.nanoTime();
       // statistic the time of checking write block
@@ -396,6 +407,15 @@ public class IoTConsensusServerImpl {
       stateMachineLock.unlock();
       persistLatestWriterMeta(false);
     }
+  }
+
+  private TSStatus inactiveWriteStatus() {
+    return RpcUtils.getStatus(
+        TSStatusCode.WRITE_PROCESS_REJECT,
+        String.format(
+            ConsensusMessages.PEER_INACTIVE_NOT_READY_WRITE,
+            consensusGroupId,
+            thisNode.getNodeId()));
   }
 
   public DataSet read(IConsensusRequest request) {
@@ -1417,7 +1437,19 @@ public class IoTConsensusServerImpl {
 
   public void setActive(boolean active) {
     logger.info(ConsensusMessages.SET_ACTIVE_STATUS, this.thisNode, active);
-    this.active = active;
+    if (active) {
+      this.active = true;
+      return;
+    }
+    // Deactivate under the write lock so that when this returns every accepted write has finished
+    // and every later lock holder observes active == false in write(). The searchIndex sampled by
+    // the remove-peer barrier is then stable.
+    stateMachineLock.lock();
+    try {
+      this.active = false;
+    } finally {
+      stateMachineLock.unlock();
+    }
   }
 
   public void cleanupRemoteSnapshot(Peer targetPeer) throws ConsensusGroupModifyPeerException {

@@ -121,6 +121,10 @@ public final class ConsensusMessages {
       "Peer 处于非活跃状态，无法接收同步日志请求，%s，DataNode ID：%s";
   public static final String PEER_INACTIVE_NOT_READY_WRITE =
       "Peer 处于非活跃状态，无法接收写入请求，%s，DataNode ID：%s";
+  public static final String LOG_PEER_ARG_IS_ALREADY_REMOVED_FROM_THE_CONFIGURATION_OF_CONSENSUS_GROUP_ARG_STILL_INACTIVATING_IT_AND_WAITING_FOR_ITS_SYNC_LOG_TO_COMPLETE_BEFORE_DELETION_50D71ACB =
+      "Peer %s 已从共识组 %s 的配置中移除；仍对其进行失活并等待其同步日志完成后再删除。";
+  public static final String LOG_CONSENSUS_GROUP_ARG_IS_ALREADY_ABSENT_WHILE_INACTIVATING_A_PEER_FOR_DELETION_TREAT_IT_AS_ALREADY_FENCED_05A15EB9 =
+      "对 Peer 执行删除目的的失活时共识组 %s 已不存在；视为已完成栅栏。";
   public static final String REMOVE_SYNC_LOG_CHANNEL_FAILED =
       "移除同步日志通道失败";
   public static final String FAILED_TO_CLEANUP_TRANSFERRED_SNAPSHOT =

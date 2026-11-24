@@ -33,24 +33,30 @@ import org.junit.runner.RunWith;
 public class IoTDBRegionMigrateCoordinatorCrashWhenRemoveRemotePeerForIoTV1IT
     extends IoTDBRegionMigrateDataNodeCrashITFrameworkForIoTV1 {
 
+  /**
+   * The killed DataNode is the removePeer coordinator (the destination replica) and is not
+   * restarted by the kill action. The removal gate cannot complete, so the migration must fail and
+   * keep the source replica instead of deleting it; the old "migration succeeded" expectation is no
+   * longer valid.
+   */
   @Test
   public void initCrash() throws Exception {
-    success(IoTConsensusRemovePeerCoordinatorKillPoints.INIT);
+    fail(IoTConsensusRemovePeerCoordinatorKillPoints.INIT);
   }
 
   @Test
   public void crashAfterNotifyPeersToRemoveSyncLogChannel() throws Exception {
-    success(
+    fail(
         IoTConsensusRemovePeerCoordinatorKillPoints.AFTER_NOTIFY_PEERS_TO_REMOVE_REPLICATE_CHANNEL);
   }
 
   @Test
   public void crashAfterInactivePeer() throws Exception {
-    success(IoTConsensusRemovePeerCoordinatorKillPoints.AFTER_INACTIVE_PEER);
+    fail(IoTConsensusRemovePeerCoordinatorKillPoints.AFTER_INACTIVE_PEER);
   }
 
   @Test
   public void crashAfterFinish() throws Exception {
-    success(IoTConsensusRemovePeerCoordinatorKillPoints.FINISH);
+    fail(IoTConsensusRemovePeerCoordinatorKillPoints.FINISH);
   }
 }

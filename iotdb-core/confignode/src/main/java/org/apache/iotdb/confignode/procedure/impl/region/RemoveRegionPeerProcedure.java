@@ -22,6 +22,8 @@ package org.apache.iotdb.confignode.procedure.impl.region;
 import org.apache.iotdb.common.rpc.thrift.TConsensusGroupId;
 import org.apache.iotdb.common.rpc.thrift.TDataNodeLocation;
 import org.apache.iotdb.common.rpc.thrift.TRegionMaintainTaskStatus;
+import org.apache.iotdb.common.rpc.thrift.TRegionMigrateFailedType;
+import org.apache.iotdb.common.rpc.thrift.TRegionReplicaSet;
 import org.apache.iotdb.common.rpc.thrift.TSStatus;
 import org.apache.iotdb.commons.cluster.RegionStatus;
 import org.apache.iotdb.commons.exception.runtime.ThriftSerDeException;
@@ -44,7 +46,11 @@ import javax.annotation.Nullable;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 import static org.apache.iotdb.commons.utils.KillPoint.KillPoint.setKillPoint;
 import static org.apache.iotdb.confignode.procedure.state.RemoveRegionPeerState.DELETE_OLD_REGION_PEER;
@@ -60,6 +66,8 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
   private static final long DELETE_OLD_REGION_PEER_RETRY_INTERVAL_MS = 5_000;
   private static final int MAX_FINALIZATION_RETRY = 3;
   private static final long FINALIZATION_RETRY_INTERVAL_MS = 5_000;
+  private static final int MAX_RESET_PEER_LIST_RETRY = 3;
+  private static final long RESET_PEER_LIST_RETRY_INTERVAL_MS = 5_000;
   private TDataNodeLocation coordinator;
   private TDataNodeLocation targetDataNode;
   private transient int deleteOldRegionPeerAttempted = 0;
@@ -110,31 +118,28 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
                   this.getProcId(), targetDataNode, regionId, coordinator);
           setKillPoint(state);
           if (tsStatus.getCode() != SUCCESS_STATUS.getStatusCode()) {
-            LOGGER.warn(
-                ProcedureMessages
-                    .PID_REMOVEREGION_TASK_SUBMITTED_FAILED_CONFIGNODE_BELIEVE_CURRENT_PEER_LIST,
-                getProcId(),
-                state,
-                regionId,
-                handler.getRegionReplicaSetString(regionId));
-            setNextState(DELETE_OLD_REGION_PEER);
-            return Flow.HAS_MORE_STATE;
+            return retryRemovePeerStep(env, state, tsStatus, true);
           }
-          TRegionMigrateResult removeRegionPeerResult =
+          final TRegionMigrateResult removeRegionPeerResult =
               handler.waitTaskFinish(this.getProcId(), coordinator);
-          if (removeRegionPeerResult.getTaskStatus() != TRegionMaintainTaskStatus.SUCCESS) {
-            LOGGER.warn(
-                ProcedureMessages
-                    .PID_REMOVEREGION_EXECUTED_FAILED_CONFIGNODE_BELIEVE_CURRENT_PEER_LIST_OF,
-                getProcId(),
-                state,
-                regionId,
-                handler.getRegionReplicaSetString(regionId));
+          if (removeRegionPeerResult.getTaskStatus() == TRegionMaintainTaskStatus.SUCCESS) {
             setNextState(DELETE_OLD_REGION_PEER);
-            return Flow.HAS_MORE_STATE;
+            break;
           }
-          setNextState(DELETE_OLD_REGION_PEER);
-          break;
+          if (removeRegionPeerResult.getTaskStatus() == TRegionMaintainTaskStatus.PROCESSING) {
+            // waitTaskFinish only returns PROCESSING when the wait was interrupted, i.e. this
+            // ConfigNode is stopping or losing leadership. The task may still be running, so
+            // persist the state and re-poll after recovery instead of deleting the source.
+            return retryStep(state, null);
+          }
+          if (removeRegionPeerResult.getTaskStatus() == TRegionMaintainTaskStatus.TASK_NOT_EXIST
+              || isDisconnectFailure(removeRegionPeerResult)) {
+            // The coordinator restarted and lost its in-memory task table (or is unreachable).
+            // Resubmit in the next round; the same taskId can run again on the new process and
+            // re-run inactivate + the barrier.
+            return retryRemovePeerStep(env, state, removeRegionPeerResult, true);
+          }
+          return retryRemovePeerStep(env, state, removeRegionPeerResult, false);
         case DELETE_OLD_REGION_PEER:
           handler.forceUpdateRegionCache(regionId, targetDataNode, RegionStatus.Removing);
           tsStatus =
@@ -227,6 +232,21 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
       }
     } catch (Exception e) {
       LOGGER.error(ProcedureMessages.REMOVEREGIONPEER_STATE_FAILED, state, e);
+      if (e instanceof InterruptedException) {
+        // The wait was interrupted because this ConfigNode is stopping or losing leadership.
+        // Keep the state for recovery instead of treating it as a remove-peer failure.
+        Thread.currentThread().interrupt();
+        if (state == REMOVE_REGION_PEER) {
+          setNextState(REMOVE_REGION_PEER);
+          return Flow.HAS_MORE_STATE;
+        }
+        return Flow.NO_MORE_STATE;
+      }
+      if (state == REMOVE_REGION_PEER) {
+        // Any other error in the remove-peer phase must not fall through to the delete phase.
+        rollbackAndFail(env, e);
+        return Flow.NO_MORE_STATE;
+      }
       if (state == REMOVE_REGION_LOCATION_CACHE) {
         return retryStep(state, new ProcedureException(e));
       }
@@ -237,6 +257,119 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
     }
     LOGGER.info(ProcedureMessages.PID_REMOVEREGION_STATE_SUCCESS, getProcId(), state);
     return Flow.HAS_MORE_STATE;
+  }
+
+  /**
+   * Uses the shared retry budget for the remove-peer task. When a retry cannot help, or the budget
+   * is exhausted, the source region data must not be deleted: the peer list of the region's current
+   * replica set is reset so the source replica becomes writable again, and the procedure fails.
+   */
+  private Flow retryRemovePeerStep(
+      ConfigNodeProcedureEnv env, RemoveRegionPeerState state, Object reason, boolean retryable)
+      throws InterruptedException {
+    if (!retryable) {
+      rollbackAndFail(env, reason);
+      return Flow.NO_MORE_STATE;
+    }
+    final Flow flow = retryStep(state, null);
+    if (flow == Flow.NO_MORE_STATE) {
+      rollbackAndFail(env, reason);
+    }
+    return flow;
+  }
+
+  private void rollbackAndFail(ConfigNodeProcedureEnv env, Object reason) {
+    LOGGER.warn(
+        ProcedureMessages
+            .LOG_NO_MORE_RETRY_FOR_REMOVEPEER_ROLLING_BACK_REGION_ARG_AND_KEEPING_THE_SOURCE_DATA_REASON_ARG_8946EDE8,
+        regionId,
+        reason);
+    rollbackPeerListOnAbort(env);
+    setFailure(
+        new ProcedureException(
+            String.format(
+                ProcedureMessages
+                    .EXCEPTION_REMOVEPEER_FOR_REGION_ARG_FAILED_AND_THE_SOURCE_REGION_DATA_IS_KEPT_ARG_FDC2F5CF,
+                regionId,
+                reason)));
+  }
+
+  private static boolean isDisconnectFailure(TRegionMigrateResult result) {
+    Map<TDataNodeLocation, TRegionMigrateFailedType> failedNodes = result.getFailedNodeAndReason();
+    return failedNodes != null
+        && failedNodes.values().stream()
+            .anyMatch(failedType -> failedType == TRegionMigrateFailedType.Disconnect);
+  }
+
+  /**
+   * Rolls the region back to the replica set currently recorded by ConfigNode. Resetting all
+   * replicas (not only the source) also restores the sync channels and configuration entries that
+   * notifyPeersToRemoveSyncLogChannel removed, and reactivates the local peer if a previous
+   * remove-peer attempt fenced it.
+   */
+  private void rollbackPeerListOnAbort(ConfigNodeProcedureEnv env) {
+    Map<Integer, TSStatus> responses = null;
+    try {
+      RegionMaintainHandler handler = env.getRegionMaintainHandler();
+      Optional<TRegionReplicaSet> replicaSet = handler.getRegionReplicaSet(regionId);
+      if (!replicaSet.isPresent()) {
+        return;
+      }
+      List<TDataNodeLocation> correctLocations = replicaSet.get().getDataNodeLocations();
+      Map<Integer, TDataNodeLocation> relatedLocations = new HashMap<>();
+      correctLocations.forEach(
+          location -> relatedLocations.put(location.getDataNodeId(), location));
+      for (int retry = 0; retry < MAX_RESET_PEER_LIST_RETRY; retry++) {
+        responses = handler.resetPeerList(regionId, correctLocations, relatedLocations);
+        final TSStatus targetStatus =
+            responses == null ? null : responses.get(targetDataNode.getDataNodeId());
+        // Other replicas may be offline (e.g. a dead coordinator). A restarted DataNode rebuilds
+        // its peer list from the CN partition table (DataNode.prepareToResetDataRegionPeerList ->
+        // recordCorrectPeerListBeforeStarting -> resetPeerListImpl), so only the source replica
+        // must be confirmed writable here; remaining failures are logged below.
+        if (targetStatus != null && targetStatus.getCode() == SUCCESS_STATUS.getStatusCode()) {
+          LOGGER.info(
+              ProcedureMessages
+                  .LOG_RESET_THE_PEER_LIST_FOR_REGION_ARG_AFTER_REMOVEPEER_FAILED_THE_SOURCE_REPLICA_IS_WRITABLE_AGAIN_FABA0DE9,
+              regionId);
+          handler.forceUpdateRegionCache(regionId, targetDataNode, RegionStatus.Running);
+          final Map<Integer, TSStatus> unresolved = new HashMap<>();
+          for (TDataNodeLocation location : correctLocations) {
+            final TSStatus status = responses.get(location.getDataNodeId());
+            if (status == null || status.getCode() != SUCCESS_STATUS.getStatusCode()) {
+              unresolved.put(location.getDataNodeId(), status);
+            }
+          }
+          if (!unresolved.isEmpty()) {
+            LOGGER.warn(
+                ProcedureMessages
+                    .LOG_RESET_THE_PEER_LIST_FOR_REGION_ARG_AFTER_REMOVEPEER_FAILED_THE_SOURCE_REPLICA_IS_WRITABLE_AGAIN_BUT_SOME_REPLICAS_DID_NOT_RESET_ARG_3E704184,
+                regionId,
+                unresolved);
+          }
+          return;
+        }
+        Thread.sleep(RESET_PEER_LIST_RETRY_INTERVAL_MS);
+      }
+      LOGGER.warn(
+          ProcedureMessages
+              .LOG_FAILED_TO_RESET_THE_PEER_LIST_FOR_REGION_ARG_AFTER_REMOVEPEER_FAILED_THE_SOURCE_REPLICA_MAY_STAY_READ_ONLY_ARG_54DA709D,
+          regionId,
+          responses);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      LOGGER.warn(
+          ProcedureMessages
+              .LOG_FAILED_TO_RESET_THE_PEER_LIST_FOR_REGION_ARG_AFTER_REMOVEPEER_FAILED_THE_SOURCE_REPLICA_MAY_STAY_READ_ONLY_ARG_54DA709D,
+          regionId,
+          e);
+    } catch (Exception e) {
+      LOGGER.warn(
+          ProcedureMessages
+              .LOG_FAILED_TO_RESET_THE_PEER_LIST_FOR_REGION_ARG_AFTER_REMOVEPEER_FAILED_THE_SOURCE_REPLICA_MAY_STAY_READ_ONLY_ARG_54DA709D,
+          regionId,
+          e);
+    }
   }
 
   private Flow retryStep(

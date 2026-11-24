@@ -42,4 +42,9 @@ public class IoTDBRegionMigrateDataNodeCrashITFrameworkForIoTV1
   public final <T extends Enum<T>> void success(T... dataNodeKillPoints) throws Exception {
     successTest(1, 1, 1, 2, noKillPoints(), buildSet(dataNodeKillPoints), KillNode.ALL_NODES);
   }
+
+  @SafeVarargs
+  public final <T extends Enum<T>> void fail(T... dataNodeKillPoints) throws Exception {
+    failTest(1, 1, 1, 2, noKillPoints(), buildSet(dataNodeKillPoints), KillNode.ALL_NODES);
+  }
 }

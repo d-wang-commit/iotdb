@@ -175,6 +175,14 @@ public class IoTConsensusRPCServiceProcessor implements IoTConsensusIService.Ifa
     IoTConsensusServerImpl impl = consensus.getImpl(groupId);
 
     if (impl == null) {
+      if (req.isForDeletionPurpose()) {
+        // The target region is already gone, so there is no write left to fence.
+        LOGGER.info(
+            ConsensusMessages
+                .LOG_CONSENSUS_GROUP_ARG_IS_ALREADY_ABSENT_WHILE_INACTIVATING_A_PEER_FOR_DELETION_TREAT_IT_AS_ALREADY_FENCED_05A15EB9,
+            groupId);
+        return new TInactivatePeerRes(new TSStatus(TSStatusCode.SUCCESS_STATUS.getStatusCode()));
+      }
       String message =
           String.format(
               ConsensusMessages.UNEXPECTED_CONSENSUS_GROUP_ID_FOR_REQUEST,

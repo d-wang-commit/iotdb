@@ -32,13 +32,19 @@ import org.junit.runner.RunWith;
 @RunWith(IoTDBTestRunner.class)
 public class IoTDBRegionMigrateOriginalCrashWhenRemoveRemotePeerForIoTV1IT
     extends IoTDBRegionMigrateDataNodeCrashITFrameworkForIoTV1 {
+
+  /**
+   * The killed DataNode is the source replica being removed and is not restarted. The removal gate
+   * cannot prove the source has been drained, so the migration must fail and keep the source
+   * replica; the old "migration succeeded" expectation is no longer valid.
+   */
   @Test
   public void crashBeforeInactivate() throws Exception {
-    success(IoTConsensusInactivatePeerKillPoints.BEFORE_INACTIVATE);
+    fail(IoTConsensusInactivatePeerKillPoints.BEFORE_INACTIVATE);
   }
 
   @Test
   public void crashAfterInactivate() throws Exception {
-    success(IoTConsensusInactivatePeerKillPoints.AFTER_INACTIVATE);
+    fail(IoTConsensusInactivatePeerKillPoints.AFTER_INACTIVATE);
   }
 }

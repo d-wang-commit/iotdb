@@ -431,6 +431,10 @@ public class RegionMigrateService implements IService {
               regionId, new Peer(regionId, destDataNode.getDataNodeId(), destEndPoint));
           removePeerSucceed = true;
         } catch (PeerNotInConsensusGroupException e) {
+          // Ratis / IoTConsensusV2: the peer is already out of the group, so the removal has
+          // already been committed. IoTConsensus v1 no longer throws this here: removeRemotePeer
+          // handles a missing local configuration by still inactivating the peer and waiting for
+          // its sync log to complete.
           removePeerSucceed = true;
         } catch (InterruptedException e) {
           throwable = e;

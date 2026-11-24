@@ -687,6 +687,21 @@ public final class ProcedureMessages {
   public static final String
       PID_REMOVEREGION_TASK_SUBMITTED_FAILED_CONFIGNODE_BELIEVE_CURRENT_PEER_LIST =
           "[pid{}][RemoveRegion] {} task submitted failed, ConfigNode believe current peer list of {} is {}. Procedure will continue. You should manually clear peer list.";
+  public static final String
+      LOG_NO_MORE_RETRY_FOR_REMOVEPEER_ROLLING_BACK_REGION_ARG_AND_KEEPING_THE_SOURCE_DATA_REASON_ARG_8946EDE8 =
+          "no more retry for removePeer; rolling back region {} and keeping the source data. Reason: {}";
+  public static final String
+      EXCEPTION_REMOVEPEER_FOR_REGION_ARG_FAILED_AND_THE_SOURCE_REGION_DATA_IS_KEPT_ARG_FDC2F5CF =
+          "removePeer for region %s failed and the source region data is kept: %s";
+  public static final String
+      LOG_RESET_THE_PEER_LIST_FOR_REGION_ARG_AFTER_REMOVEPEER_FAILED_THE_SOURCE_REPLICA_IS_WRITABLE_AGAIN_FABA0DE9 =
+          "reset the peer list for region {} after removePeer failed; the source replica is writable again.";
+  public static final String
+      LOG_RESET_THE_PEER_LIST_FOR_REGION_ARG_AFTER_REMOVEPEER_FAILED_THE_SOURCE_REPLICA_IS_WRITABLE_AGAIN_BUT_SOME_REPLICAS_DID_NOT_RESET_ARG_3E704184 =
+          "reset the peer list for region {} after removePeer failed; the source replica is writable again, but some replicas did not reset: {}";
+  public static final String
+      LOG_FAILED_TO_RESET_THE_PEER_LIST_FOR_REGION_ARG_AFTER_REMOVEPEER_FAILED_THE_SOURCE_REPLICA_MAY_STAY_READ_ONLY_ARG_54DA709D =
+          "failed to reset the peer list for region {} after removePeer failed; the source replica may stay read-only: {}";
   public static final String PIPEHANDLELEADERCHANGEPROCEDURE_EXECUTEFROMCALCULATEINFOFORTASK =
       "PipeHandleLeaderChangeProcedure: executeFromCalculateInfoForTask";
   public static final String PIPEHANDLELEADERCHANGEPROCEDURE_EXECUTEFROMHANDLEONCONFIGNODES =
