@@ -53,6 +53,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
 import java.util.function.Supplier;
 
 public class DataRegionStateMachine extends BaseStateMachine {
@@ -85,6 +86,22 @@ public class DataRegionStateMachine extends BaseStateMachine {
   @Override
   public boolean isReadOnly() {
     return CommonDescriptor.getInstance().getConfig().isReadOnly();
+  }
+
+  @Override
+  public boolean flushForMigration() throws IOException {
+    if (isReadOnly()) {
+      return false;
+    }
+    try {
+      region.syncCloseAllWorkingAndClosingTsFileProcessors();
+      return !isReadOnly();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IOException(e);
+    } catch (ExecutionException e) {
+      throw new IOException(e.getCause());
+    }
   }
 
   @Override

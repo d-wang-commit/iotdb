@@ -29,6 +29,7 @@ import org.apache.iotdb.common.rpc.thrift.TRegionReplicaSet;
 import org.apache.iotdb.common.rpc.thrift.TSStatus;
 import org.apache.iotdb.commons.client.ClientPoolFactory;
 import org.apache.iotdb.commons.client.IClientManager;
+import org.apache.iotdb.commons.client.exception.ClientManagerException;
 import org.apache.iotdb.commons.client.sync.SyncDataNodeInternalServiceClient;
 import org.apache.iotdb.commons.cluster.NodeStatus;
 import org.apache.iotdb.commons.cluster.RegionStatus;
@@ -65,9 +66,11 @@ import org.apache.iotdb.mpp.rpc.thrift.TRegionMigrateResult;
 import org.apache.iotdb.mpp.rpc.thrift.TResetPeerListReq;
 import org.apache.iotdb.rpc.TSStatusCode;
 
+import org.apache.thrift.TException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -237,11 +240,23 @@ public class RegionMaintainHandler {
       TDataNodeLocation destDataNode,
       TConsensusGroupId regionId,
       TDataNodeLocation coordinator) {
+    return submitAddRegionPeerTask(procedureId, destDataNode, regionId, coordinator, null);
+  }
+
+  public TSStatus submitAddRegionPeerTask(
+      long procedureId,
+      TDataNodeLocation destDataNode,
+      TConsensusGroupId regionId,
+      TDataNodeLocation coordinator,
+      Long migrationId) {
     TSStatus status;
 
     // Send addRegionPeer request to the selected DataNode,
     // destDataNode is where the new RegionReplica is created
     TMaintainPeerReq maintainPeerReq = new TMaintainPeerReq(regionId, destDataNode, procedureId);
+    if (migrationId != null) {
+      maintainPeerReq.setMigrationId(migrationId);
+    }
     status =
         (TSStatus)
             SyncDataNodeClientPool.getInstance()
@@ -275,11 +290,23 @@ public class RegionMaintainHandler {
       TDataNodeLocation originalDataNode,
       TConsensusGroupId regionId,
       TDataNodeLocation coordinator) {
+    return submitRemoveRegionPeerTask(procedureId, originalDataNode, regionId, coordinator, null);
+  }
+
+  public TSStatus submitRemoveRegionPeerTask(
+      long procedureId,
+      TDataNodeLocation originalDataNode,
+      TConsensusGroupId regionId,
+      TDataNodeLocation coordinator,
+      Long migrationId) {
     TSStatus status;
 
     // Send removeRegionPeer request to the rpcClientDataNode
     TMaintainPeerReq maintainPeerReq =
         new TMaintainPeerReq(regionId, originalDataNode, procedureId);
+    if (migrationId != null) {
+      maintainPeerReq.setMigrationId(migrationId);
+    }
     status =
         (TSStatus)
             SyncDataNodeClientPool.getInstance()
@@ -307,10 +334,20 @@ public class RegionMaintainHandler {
    */
   public TSStatus submitDeleteOldRegionPeerTask(
       long procedureId, TDataNodeLocation originalDataNode, TConsensusGroupId regionId) {
+    return submitDeleteOldRegionPeerTask(procedureId, originalDataNode, regionId, null);
+  }
 
+  public TSStatus submitDeleteOldRegionPeerTask(
+      long procedureId,
+      TDataNodeLocation originalDataNode,
+      TConsensusGroupId regionId,
+      Long migrationId) {
     TSStatus status;
     TMaintainPeerReq maintainPeerReq =
         new TMaintainPeerReq(regionId, originalDataNode, procedureId);
+    if (migrationId != null) {
+      maintainPeerReq.setMigrationId(migrationId);
+    }
 
     final NodeStatus nodeStatus = getDataNodeStatus(originalDataNode.getDataNodeId());
     final boolean useFullRetry = !nodeStatus.isOffline();
@@ -338,6 +375,10 @@ public class RegionMaintainHandler {
 
   protected NodeStatus getDataNodeStatus(int dataNodeId) {
     return configManager.getLoadManager().getNodeStatus(dataNodeId);
+  }
+
+  public boolean isDataNodeOffline(int dataNodeId) {
+    return getDataNodeStatus(dataNodeId).isOffline();
   }
 
   protected TSStatus submitDataNodeSyncRequest(
@@ -480,6 +521,45 @@ public class RegionMaintainHandler {
         Thread.currentThread().interrupt();
         return new TRegionMigrateResult(TRegionMaintainTaskStatus.PROCESSING);
       }
+    }
+  }
+
+  public boolean isRegionMigrationConfirmed(
+      TConsensusGroupId regionId,
+      TDataNodeLocation source,
+      TDataNodeLocation target,
+      long migrationId) {
+    try (SyncDataNodeInternalServiceClient client =
+        dataNodeClientManager.borrowClient(target.getInternalEndPoint())) {
+      return client.isRegionMigrationConfirmed(regionId, source.getDataNodeId(), migrationId);
+    } catch (Exception e) {
+      LOGGER.warn(
+          ProcedureMessages
+              .LOG_COULD_NOT_READ_THE_CONFIRMATION_FOR_MIGRATION_ARG_OF_ARG_ON_DATANODE_ARG_KEEPING_THE_SOURCE_BFD756EB,
+          migrationId,
+          regionId,
+          target.getDataNodeId(),
+          e);
+      return false;
+    }
+  }
+
+  public void rollbackRegionMigration(
+      TConsensusGroupId regionId,
+      TDataNodeLocation node,
+      TDataNodeLocation other,
+      long migrationId,
+      boolean isSource)
+      throws IOException {
+    try (SyncDataNodeInternalServiceClient client =
+        dataNodeClientManager.borrowClient(node.getInternalEndPoint())) {
+      TSStatus status =
+          client.rollbackRegionMigration(regionId, other.getDataNodeId(), migrationId, isSource);
+      if (!isSucceed(status)) {
+        throw new IOException(String.valueOf(status));
+      }
+    } catch (ClientManagerException | TException e) {
+      throw new IOException(e);
     }
   }
 

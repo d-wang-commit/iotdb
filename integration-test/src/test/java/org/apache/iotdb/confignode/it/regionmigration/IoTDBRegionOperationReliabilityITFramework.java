@@ -28,6 +28,8 @@ import org.apache.iotdb.commons.pipe.config.constant.SystemConstant;
 import org.apache.iotdb.commons.schema.column.ColumnHeaderConstant;
 import org.apache.iotdb.commons.utils.KillPoint.KillNode;
 import org.apache.iotdb.commons.utils.KillPoint.KillPoint;
+import org.apache.iotdb.confignode.procedure.state.AddRegionPeerState;
+import org.apache.iotdb.confignode.procedure.state.RemoveRegionPeerState;
 import org.apache.iotdb.confignode.rpc.thrift.TRegionInfo;
 import org.apache.iotdb.confignode.rpc.thrift.TShowRegionReq;
 import org.apache.iotdb.confignode.rpc.thrift.TShowRegionResp;
@@ -58,6 +60,8 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -65,6 +69,7 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -94,7 +99,6 @@ public class IoTDBRegionOperationReliabilityITFramework {
   public static final String FLUSH_COMMAND = "flush on cluster";
   private static final String SHOW_REGIONS = "show regions";
   private static final String SHOW_DATANODES = "show datanodes";
-  private static final String COUNT_TIMESERIES = "select count(*) from root.sg.**";
   private static final String REGION_MIGRATE_COMMAND_FORMAT = "migrate region %d from %d to %d";
   ExecutorService executorService = IoTDBThreadPoolFactory.newCachedThreadPool("regionMigrateIT");
 
@@ -238,7 +242,15 @@ public class IoTDBRegionOperationReliabilityITFramework {
         actionOfKillNode,
         false,
         killNode,
-        true);
+        RecoveryExpectation.REMOVE_DESTINATION);
+  }
+
+  protected enum RecoveryExpectation {
+    DEFAULT,
+    REMOVE_DESTINATION,
+    RETAIN_DESTINATION,
+    ADD_FAILED,
+    RESOLVE_REMOVE
   }
 
   public void killClusterTest(
@@ -279,10 +291,10 @@ public class IoTDBRegionOperationReliabilityITFramework {
         actionWhenDetectKeyWords,
         expectMigrateSuccess,
         killNode,
-        false);
+        RecoveryExpectation.DEFAULT);
   }
 
-  private void generalTestWithAllOptions(
+  protected void generalTestWithAllOptions(
       final int dataReplicateFactor,
       final int schemaReplicationFactor,
       final int configNodeNum,
@@ -292,7 +304,7 @@ public class IoTDBRegionOperationReliabilityITFramework {
       Consumer<KillPointContext> actionWhenDetectKeyWords,
       final boolean expectMigrateSuccess,
       KillNode killNode,
-      boolean expectRollbackWhenFail)
+      RecoveryExpectation recovery)
       throws Exception {
     // prepare env
     EnvFactory.getEnv()
@@ -356,14 +368,36 @@ public class IoTDBRegionOperationReliabilityITFramework {
       statement.execute(buildRegionMigrateCommand(selectedRegion, originalDataNode, destDataNode));
 
       boolean success = false;
-      if (expectRollbackWhenFail) {
+      if (recovery == RecoveryExpectation.RESOLVE_REMOVE) {
+        // Check which side completed the handoff against the whole running replica set.
+        Set<Integer> migrated = new HashSet<>(regionMap.get(selectedRegion));
+        migrated.remove(originalDataNode);
+        migrated.add(destDataNode);
+        Predicate<TShowRegionResp> sourceRestored =
+            membershipPredicate(selectedRegion, regionMap.get(selectedRegion));
+        Predicate<TShowRegionResp> targetRetained = membershipPredicate(selectedRegion, migrated);
+        awaitKillPointsTriggered(configNodeKeywords);
+        awaitKillPointsTriggered(dataNodeKeywords);
+        awaitUntilSuccess(
+            client,
+            selectedRegion,
+            resp ->
+                (sourceRestored.test(resp)
+                        && migrationIndex(originalDataNode, selectedRegion, "migration.source")
+                            == -2)
+                    || (targetRetained.test(resp)
+                        && migrationIndex(destDataNode, selectedRegion, "migration.target") >= 0),
+            Optional.empty(),
+            Optional.empty());
+      } else if (recovery == RecoveryExpectation.REMOVE_DESTINATION
+          || recovery == RecoveryExpectation.RETAIN_DESTINATION) {
         awaitKillPointsTriggered(configNodeKeywords);
         awaitKillPointsTriggered(dataNodeKeywords);
         try {
           awaitUntilSuccess(
               client,
               selectedRegion,
-              rollbackPredicate(selectedRegion, regionMap.get(selectedRegion), destDataNode),
+              membershipPredicate(selectedRegion, regionMap.get(selectedRegion)),
               Optional.empty(),
               Optional.of(destDataNode));
         } catch (ConditionTimeoutException e) {
@@ -414,11 +448,21 @@ public class IoTDBRegionOperationReliabilityITFramework {
       checkKillPointsAllTriggered(dataNodeKeywords);
 
       // check the remaining file
-      if (success) {
+      if (recovery == RecoveryExpectation.RESOLVE_REMOVE) {
+        checkRegionFileExist(destDataNode, selectedRegion);
+        checkClusterStillWritable();
+      } else if (success) {
         checkRegionFileClearIfNodeAlive(originalDataNode, selectedRegion);
         checkRegionFileExistIfNodeAlive(destDataNode, selectedRegion);
         // TODO: @YongzaoDan enable this check after the __system database is refactored!!!
         //        checkClusterStillWritable();
+      } else if (recovery == RecoveryExpectation.ADD_FAILED) {
+        checkRegionFileExist(destDataNode, selectedRegion);
+        checkRegionFileExist(originalDataNode, selectedRegion);
+      } else if (recovery == RecoveryExpectation.RETAIN_DESTINATION) {
+        checkRegionFileExist(destDataNode, selectedRegion);
+        checkRegionFileExist(originalDataNode, selectedRegion);
+        checkClusterStillWritable();
       } else {
         checkRegionFileClearIfNodeAlive(destDataNode, selectedRegion);
         checkRegionFileExistIfNodeAlive(originalDataNode, selectedRegion);
@@ -428,8 +472,19 @@ public class IoTDBRegionOperationReliabilityITFramework {
     }
   }
 
-  private static Predicate<TShowRegionResp> rollbackPredicate(
-      int selectedRegion, Set<Integer> originalDataNodes, int destDataNode) {
+  private long migrationIndex(int node, int region, String fileName) {
+    try {
+      byte[] record =
+          Files.readAllBytes(new File(buildRegionDirPath(node, region), fileName).toPath());
+      // Both migration records end with the decision index followed by the checksum.
+      return ByteBuffer.wrap(record).getLong(record.length - 2 * Long.BYTES);
+    } catch (IOException | IndexOutOfBoundsException e) {
+      return -1;
+    }
+  }
+
+  private static Predicate<TShowRegionResp> membershipPredicate(
+      int selectedRegion, Set<Integer> expectedNodes) {
     return tShowRegionResp -> {
       List<TRegionInfo> selectedDataRegionInfos =
           tShowRegionResp.getRegionInfoList().stream()
@@ -442,8 +497,7 @@ public class IoTDBRegionOperationReliabilityITFramework {
           selectedDataRegionInfos.stream()
               .map(TRegionInfo::getDataNodeId)
               .collect(Collectors.toSet());
-      return dataNodes.equals(originalDataNodes)
-          && !dataNodes.contains(destDataNode)
+      return dataNodes.equals(expectedNodes)
           && selectedDataRegionInfos.stream()
               .allMatch(
                   regionInfo -> RegionStatus.Running.getStatus().equals(regionInfo.getStatus()));
@@ -811,26 +865,29 @@ public class IoTDBRegionOperationReliabilityITFramework {
     Assert.assertFalse(regionDir.getAbsolutePath(), regionDir.exists());
   }
 
-  private void checkClusterStillWritable() {
+  private void checkClusterStillWritable() throws SQLException {
+    String select = "select speed, temperature from root.sg.d1 order by time";
     try (Connection connection = EnvFactory.getEnv().getAvailableConnection();
         Statement statement = connection.createStatement()) {
-      // check old data
-      ResultSet resultSet = statement.executeQuery(COUNT_TIMESERIES);
-      resultSet.next();
-      Assert.assertEquals(1, resultSet.getLong(1));
-      Assert.assertEquals(1, resultSet.getLong(2));
-      LOGGER.info("Old data is still remain");
-      // write new data
+      try (ResultSet rows = statement.executeQuery(select)) {
+        assertRow(rows, 100, 1, 2);
+        Assert.assertFalse(rows.next());
+      }
       statement.execute(INSERTION2);
-      resultSet = statement.executeQuery(COUNT_TIMESERIES);
-      resultSet.next();
-      Assert.assertEquals(2, resultSet.getLong(1));
-      Assert.assertEquals(2, resultSet.getLong(2));
-      LOGGER.info("Region group is still writable");
-    } catch (SQLException e) {
-      LOGGER.error("Something wrong", e);
-      Assert.fail("Something wrong");
+      try (ResultSet rows = statement.executeQuery(select)) {
+        assertRow(rows, 100, 1, 2);
+        assertRow(rows, 101, 3, 4);
+        Assert.assertFalse(rows.next());
+      }
     }
+  }
+
+  private static void assertRow(ResultSet rows, long time, int speed, int temperature)
+      throws SQLException {
+    Assert.assertTrue(rows.next());
+    Assert.assertEquals(time, rows.getLong(1));
+    Assert.assertEquals(speed, ((Number) rows.getObject(2)).doubleValue(), 0);
+    Assert.assertEquals(temperature, ((Number) rows.getObject(3)).doubleValue(), 0);
   }
 
   private String buildRegionDirPath(int dataNode, int regionId) {
@@ -867,6 +924,14 @@ public class IoTDBRegionOperationReliabilityITFramework {
 
   protected static KeySetView<String, Boolean> noKillPoints() {
     return ConcurrentHashMap.newKeySet();
+  }
+
+  protected static KeySetView<String, Boolean> successfulMigrationKillPoints(
+      RemoveRegionPeerState lastRemoveState) {
+    KeySetView<String, Boolean> points = buildSet(AddRegionPeerState.values());
+    EnumSet.range(RemoveRegionPeerState.TRANSFER_REGION_LEADER, lastRemoveState)
+        .forEach(state -> points.add(KillPoint.enumToString(state)));
+    return points;
   }
 
   @SafeVarargs

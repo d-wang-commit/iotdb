@@ -32,6 +32,7 @@ import org.apache.iotdb.confignode.manager.ConfigManager;
 import org.apache.iotdb.confignode.persistence.ProcedureInfo;
 import org.apache.iotdb.confignode.procedure.Procedure;
 import org.apache.iotdb.confignode.procedure.env.ConfigNodeProcedureEnv;
+import org.apache.iotdb.confignode.procedure.impl.region.RemoveRegionPeerProcedure;
 import org.apache.iotdb.confignode.procedure.impl.schema.DeleteDatabaseProcedure;
 import org.apache.iotdb.confignode.procedure.impl.schema.DeleteTimeSeriesProcedure;
 import org.apache.iotdb.confignode.procedure.impl.schema.table.DropTableColumnProcedure;
@@ -80,20 +81,20 @@ public class ConfigProcedureStore implements IProcedureStore<ConfigNodeProcedure
 
   @Override
   public List<Procedure<ConfigNodeProcedureEnv>> load() {
-    return copyDeletionProcedures(procedureInfo.oldLoad());
+    return copyStoredProcedures(procedureInfo.oldLoad());
   }
 
   @Override
   public List<Procedure<ConfigNodeProcedureEnv>> getProcedures() {
-    return copyDeletionProcedures(procedureInfo.getProcedures());
+    return copyStoredProcedures(procedureInfo.getProcedures());
   }
 
-  private List<Procedure<ConfigNodeProcedureEnv>> copyDeletionProcedures(
+  private List<Procedure<ConfigNodeProcedureEnv>> copyStoredProcedures(
       List<Procedure<ConfigNodeProcedureEnv>> procedures) {
     final List<Procedure<ConfigNodeProcedureEnv>> copies = new ArrayList<>(procedures.size());
     for (Procedure<ConfigNodeProcedureEnv> procedure : procedures) {
       try {
-        copies.add(copyDeletionProcedure(procedure));
+        copies.add(copyStoredProcedure(procedure));
       } catch (IOException e) {
         throw new IllegalStateException(ConfigNodeMessages.LOAD_PROCEDURE_WAL_FAILED, e);
       }
@@ -101,9 +102,12 @@ public class ConfigProcedureStore implements IProcedureStore<ConfigNodeProcedure
     return copies;
   }
 
-  private Procedure<ConfigNodeProcedureEnv> copyDeletionProcedure(
+  private Procedure<ConfigNodeProcedureEnv> copyStoredProcedure(
       Procedure<ConfigNodeProcedureEnv> procedure) throws IOException {
-    if (procedure instanceof DeleteTimeSeriesProcedure
+    // A child Remove learns its migration ID from the parent at execution time. Keep its live
+    // decision separate from the committed copy used by snapshots and leadership recovery.
+    if ((procedure instanceof RemoveRegionPeerProcedure && procedure.hasParent())
+        || procedure instanceof DeleteTimeSeriesProcedure
         || procedure instanceof DeleteDatabaseProcedure
         || (procedure instanceof DropTableColumnProcedure
             && !(procedure instanceof DropViewColumnProcedure))) {
@@ -135,7 +139,7 @@ public class ConfigProcedureStore implements IProcedureStore<ConfigNodeProcedure
         ProcedureFactory.getProcedureType(procedure),
         ConfigNodeMessages.EXCEPTION_PROCEDURE_TYPE_IS_NULL_93147BD3);
     final UpdateProcedurePlan updateProcedurePlan =
-        new UpdateProcedurePlan(copyDeletionProcedure(procedure));
+        new UpdateProcedurePlan(copyStoredProcedure(procedure));
     try {
       final TSStatus status = configManager.getConsensusManager().write(updateProcedurePlan);
       if (status.getCode() != TSStatusCode.SUCCESS_STATUS.getStatusCode()) {

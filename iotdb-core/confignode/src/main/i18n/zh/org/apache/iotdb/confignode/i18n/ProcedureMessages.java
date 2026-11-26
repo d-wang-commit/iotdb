@@ -20,6 +20,15 @@
 package org.apache.iotdb.confignode.i18n;
 
 public final class ProcedureMessages {
+  public static final String EXCEPTION_MIGRATION_ARG_FOR_ARG_IS_ROLLING_BACK_TO_SOURCE_DATANODE_ARG_AND_WITHDRAWING_TARGET_DATANODE_ARG_B268D9F8 = "迁移 %s 正在将 %s 回滚到源 DataNode %s，并撤下目标 DataNode %s。";
+  public static final String EXCEPTION_COULD_NOT_RESTORE_THE_PEER_LIST_FOR_ARG_DURING_MIGRATION_ARG_ROLLBACK_EC18FB08 = "未能在 Region %s 的迁移 %s 回滚期间恢复副本列表。";
+  public static final String LOG_COULD_NOT_READ_THE_CONFIRMATION_FOR_MIGRATION_ARG_OF_ARG_ON_DATANODE_ARG_KEEPING_THE_SOURCE_BFD756EB = "未能从 DataNode 读取迁移 {} 对 Region {} 的确认记录（目标 DataNode {}）。将保留源副本。";
+  public static final String LOG_MIGRATION_ARG_CONFIRMED_ARG_ON_DATANODE_ARG_VERIFY_CLEANUP_ON_SOURCE_DATANODE_ARG_BEFORE_REUSE_ARG_FE89210A = "迁移 {} 已确认 {} 在 DataNode {} 上的数据完整。再次使用源 DataNode {} 上的此副本前，请核实清理结果。{}";
+  public static final String EXCEPTION_MIGRATION_ARG_FOR_ARG_COULD_NOT_VERIFY_ARG_ARG_AAF21262 = "迁移 %s 无法确认 %s 在 %s 阶段的结果：%s";
+  public static final String EXCEPTION_CANNOT_MIGRATE_ARG_FROM_OFFLINE_DATANODE_ARG_93E90367 = "无法迁移 %s，源 DataNode %s 已离线";
+  public static final String EXCEPTION_CANNOT_CONTINUE_LEGACY_MIGRATION_OF_ARG_WITHOUT_A_VERIFIED_HANDOFF_34FDA439 = "旧版迁移缺少交接确认，无法继续迁移 %s";
+  public static final String EXCEPTION_MIGRATION_ARG_FAILED_ITS_MEMBERSHIP_CHECK_FOR_ARG_AT_ARG_33CF2029 = "迁移 %s 对 %s 的成员校验在 %s 阶段失败";
+
 
   public static final String NEVER_FINISH_PROCEDURE_RAN_AGAIN =
       "AddNeverFinishSubProcedureProcedure 再次运行，这种情况不应发生";

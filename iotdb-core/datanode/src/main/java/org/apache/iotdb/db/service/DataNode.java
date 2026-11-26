@@ -71,6 +71,7 @@ import org.apache.iotdb.confignode.rpc.thrift.TRuntimeConfiguration;
 import org.apache.iotdb.confignode.rpc.thrift.TSystemConfigurationResp;
 import org.apache.iotdb.consensus.ConsensusFactory;
 import org.apache.iotdb.consensus.common.Peer;
+import org.apache.iotdb.consensus.iot.IoTConsensus;
 import org.apache.iotdb.db.audit.DNAuditLogger;
 import org.apache.iotdb.db.auth.AuthorityChecker;
 import org.apache.iotdb.db.conf.DataNodeStartupCheck;
@@ -654,7 +655,11 @@ public class DataNode extends ServerCommandLine implements DataNodeMBean {
     localDataRegionInfo.forEach(
         (database, dataRegionIds) -> {
           for (DataRegionId dataRegionId : dataRegionIds) {
-            if (!dataNodeConsensusGroupIds.contains(dataRegionId)) {
+            if (!dataNodeConsensusGroupIds.contains(dataRegionId)
+                && !(ConsensusFactory.IOT_CONSENSUS.equals(
+                        config.getDataRegionConsensusProtocolClass())
+                    && IoTConsensus.mustRetainMigrationPeer(
+                        new File(config.getDataRegionConsensusDir()), dataRegionId))) {
               removeDataDirRegion(database, dataRegionId, allLocalFilesFolders);
             }
           }

@@ -52,9 +52,10 @@ import static org.apache.iotdb.confignode.procedure.state.RemoveRegionPeerState.
 import static org.apache.iotdb.confignode.procedure.state.RemoveRegionPeerState.REMOVE_REGION_LOCATION_CACHE;
 import static org.apache.iotdb.confignode.procedure.state.RemoveRegionPeerState.REMOVE_REGION_PEER;
 import static org.apache.iotdb.confignode.procedure.state.RemoveRegionPeerState.RESET_IOT_CONSENSUS_V1_PEER_LIST;
+import static org.apache.iotdb.confignode.procedure.state.RemoveRegionPeerState.ROLLBACK_MIGRATION_TO_SOURCE;
 import static org.apache.iotdb.rpc.TSStatusCode.SUCCESS_STATUS;
 
-public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRegionPeerState> {
+public class RemoveRegionPeerProcedure extends RegionPeerProcedure<RemoveRegionPeerState> {
   private static final Logger LOGGER = LoggerFactory.getLogger(RemoveRegionPeerProcedure.class);
   private static final int MAX_DELETE_OLD_REGION_PEER_RETRY = 3;
   private static final long DELETE_OLD_REGION_PEER_RETRY_INTERVAL_MS = 5_000;
@@ -89,11 +90,9 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
   }
 
   @Override
-  protected Flow executeFromState(ConfigNodeProcedureEnv env, RemoveRegionPeerState state)
+  protected Flow executePeerState(
+      ConfigNodeProcedureEnv env, RemoveRegionPeerState state, Long migrationId)
       throws InterruptedException {
-    if (regionId == null) {
-      return Flow.NO_MORE_STATE;
-    }
     TSStatus tsStatus;
     RegionMaintainHandler handler = env.getRegionMaintainHandler();
     try {
@@ -105,6 +104,17 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
           break;
         case REMOVE_REGION_PEER:
           handler.forceUpdateRegionCache(regionId, targetDataNode, RegionStatus.Removing);
+          if (migrationId != null) {
+            return runVerifiedTask(
+                handler,
+                state,
+                DELETE_OLD_REGION_PEER,
+                coordinator,
+                () ->
+                    handler.submitRemoveRegionPeerTask(
+                        getProcId(), targetDataNode, regionId, coordinator, migrationId),
+                null);
+          }
           tsStatus =
               handler.submitRemoveRegionPeerTask(
                   this.getProcId(), targetDataNode, regionId, coordinator);
@@ -137,6 +147,17 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
           break;
         case DELETE_OLD_REGION_PEER:
           handler.forceUpdateRegionCache(regionId, targetDataNode, RegionStatus.Removing);
+          if (migrationId != null) {
+            return runVerifiedTask(
+                handler,
+                state,
+                DROP_CONSENSUS_PIPES,
+                targetDataNode,
+                () ->
+                    handler.submitDeleteOldRegionPeerTask(
+                        getProcId(), targetDataNode, regionId, migrationId),
+                null);
+          }
           tsStatus =
               handler.submitDeleteOldRegionPeerTask(this.getProcId(), targetDataNode, regionId);
           setKillPoint(state);
@@ -222,10 +243,41 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
             return retryStep(state, null);
           }
           return finishRemoval(state);
+        case ROLLBACK_MIGRATION_TO_SOURCE:
+          if (migrationId == null) {
+            setFailure(new ProcedureException(ProcedureMessages.UNSUPPORTED_STATE + state));
+          } else {
+            setFailure(
+                new ProcedureException(
+                    String.format(
+                        ProcedureMessages
+                            .EXCEPTION_MIGRATION_ARG_FOR_ARG_IS_ROLLING_BACK_TO_SOURCE_DATANODE_ARG_AND_WITHDRAWING_TARGET_DATANODE_ARG_B268D9F8,
+                        migrationId,
+                        regionId,
+                        targetDataNode.getDataNodeId(),
+                        coordinator.getDataNodeId())));
+          }
+          return Flow.NO_MORE_STATE;
         default:
           throw new ProcedureException(ProcedureMessages.UNSUPPORTED_STATE + state.name());
       }
     } catch (Exception e) {
+      if (migrationId != null) {
+        if (state == DELETE_OLD_REGION_PEER) {
+          // Only a verified Remove can schedule this state. The source is already fenced.
+          return finishWithoutSourceCleanup(migrationId, e.getMessage());
+        }
+        if (state == REMOVE_REGION_PEER) {
+          LOGGER.warn(ProcedureMessages.REMOVEREGIONPEER_STATE_FAILED, state, e);
+          if (handler.isRegionMigrationConfirmed(
+              regionId, targetDataNode, coordinator, migrationId)) {
+            return finishWithoutSourceCleanup(migrationId, e.getMessage());
+          }
+          // CN has not authorized a Delete. Persist this choice before the source can reopen.
+          setNextState(ROLLBACK_MIGRATION_TO_SOURCE);
+          return Flow.HAS_MORE_STATE;
+        }
+      }
       LOGGER.error(ProcedureMessages.REMOVEREGIONPEER_STATE_FAILED, state, e);
       if (state == REMOVE_REGION_LOCATION_CACHE) {
         return retryStep(state, new ProcedureException(e));
@@ -233,9 +285,36 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
       if (state == RESET_IOT_CONSENSUS_V1_PEER_LIST) {
         return retryStep(state, null);
       }
+      if (migrationId != null) {
+        setFailure(new ProcedureException(e));
+      }
       return Flow.NO_MORE_STATE;
     }
     LOGGER.info(ProcedureMessages.PID_REMOVEREGION_STATE_SUCCESS, getProcId(), state);
+    return Flow.HAS_MORE_STATE;
+  }
+
+  @Override
+  protected boolean requiresDurableState(ConfigNodeProcedureEnv env) {
+    RemoveRegionPeerState state = getCurrentState();
+    // Recovery must choose the same replica once Delete, source reopening, or membership
+    // withdrawal can start. A positive receipt can also skip Delete and proceed directly to DROP.
+    return state == ROLLBACK_MIGRATION_TO_SOURCE
+        || ((state == DELETE_OLD_REGION_PEER || state == DROP_CONSENSUS_PIPES)
+            && hasParent()
+            && isVerifiedMigration(getParentProcedure(env)));
+  }
+
+  private Flow finishWithoutSourceCleanup(long migrationId, Object reason) {
+    LOGGER.warn(
+        ProcedureMessages
+            .LOG_MIGRATION_ARG_CONFIRMED_ARG_ON_DATANODE_ARG_VERIFY_CLEANUP_ON_SOURCE_DATANODE_ARG_BEFORE_REUSE_ARG_FE89210A,
+        migrationId,
+        regionId,
+        coordinator.getDataNodeId(),
+        targetDataNode.getDataNodeId(),
+        reason);
+    setNextState(DROP_CONSENSUS_PIPES);
     return Flow.HAS_MORE_STATE;
   }
 
@@ -273,7 +352,43 @@ public class RemoveRegionPeerProcedure extends RegionOperationProcedure<RemoveRe
 
   @Override
   protected void rollbackState(ConfigNodeProcedureEnv env, RemoveRegionPeerState state)
-      throws IOException, InterruptedException, ProcedureException {}
+      throws IOException, InterruptedException, ProcedureException {
+    if (state != ROLLBACK_MIGRATION_TO_SOURCE) {
+      return;
+    }
+    long migrationId = getParentProcId();
+    RegionMaintainHandler handler = env.getRegionMaintainHandler();
+    // The destination leaves CN membership only after the source has acknowledged reopening.
+    // On replay, an absent destination means that the source is already serving.
+    if (env.getConfigManager()
+        .getPartitionManager()
+        .isDataNodeContainsRegion(coordinator.getDataNodeId(), regionId)) {
+      handler.rollbackRegionMigration(regionId, targetDataNode, coordinator, migrationId, true);
+      handler.forceUpdateRegionCache(regionId, coordinator, RegionStatus.Adding);
+      handler.forceUpdateRegionCache(regionId, targetDataNode, RegionStatus.Running);
+      handler.transferRegionLeader(regionId, coordinator, targetDataNode);
+      TSStatus removal = handler.removeRegionLocation(regionId, coordinator);
+      if (removal == null || !handler.isSucceed(removal)) {
+        throw new IOException(String.valueOf(removal));
+      }
+    }
+    if (!handler.resetPeerListAfterRemoveForIoTConsensusV1(regionId, coordinator)) {
+      throw new IOException(
+          String.format(
+              ProcedureMessages
+                  .EXCEPTION_COULD_NOT_RESTORE_THE_PEER_LIST_FOR_ARG_DURING_MIGRATION_ARG_ROLLBACK_EC18FB08,
+              regionId,
+              migrationId));
+    }
+    handler.rollbackRegionMigration(regionId, coordinator, targetDataNode, migrationId, false);
+  }
+
+  @Override
+  protected long getRollbackRetryTimeout() {
+    return getCurrentState() == ROLLBACK_MIGRATION_TO_SOURCE
+        ? FINALIZATION_RETRY_INTERVAL_MS
+        : super.getRollbackRetryTimeout();
+  }
 
   @Override
   protected RemoveRegionPeerState getState(int stateId) {

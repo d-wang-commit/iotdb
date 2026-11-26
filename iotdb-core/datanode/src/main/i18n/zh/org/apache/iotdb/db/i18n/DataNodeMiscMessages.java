@@ -210,6 +210,9 @@ public final class DataNodeMiscMessages {
   public static final String CREATE_NEW_REGION_ERROR_FMT = "创建新 region %s 错误，异常：%s";
   public static final String CREATE_NEW_REGION_SUCCEED_FMT = "创建新 region %s 成功";
   public static final String LOG_USER_ARG_ROLE_ARG_422D48D3 = "用户：%s，角色：%s";
+  public static final String EXCEPTION_VERIFIED_REGION_MIGRATION_REQUIRES_AN_IOTCONSENSUS_V1_DATAREGION_830F28B9 =
+      "经过校验的 Region 迁移需要使用 IoTConsensus v1 的 DataRegion。";
+
   private DataNodeMiscMessages() {}
 
   // ---------------------------------------------------------------------------

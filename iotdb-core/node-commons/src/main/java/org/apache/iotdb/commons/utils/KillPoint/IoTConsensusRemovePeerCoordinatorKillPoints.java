@@ -24,4 +24,5 @@ public enum IoTConsensusRemovePeerCoordinatorKillPoints {
   AFTER_NOTIFY_PEERS_TO_REMOVE_REPLICATE_CHANNEL,
   AFTER_INACTIVE_PEER,
   FINISH,
+  AFTER_CONFIRMATION,
 }

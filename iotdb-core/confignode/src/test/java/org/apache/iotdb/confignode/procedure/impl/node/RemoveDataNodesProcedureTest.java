@@ -78,6 +78,7 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -213,22 +214,37 @@ public class RemoveDataNodesProcedureTest {
         .when(regionHandler)
         .addRegionLocation(any(), any());
     when(regionHandler.createNewRegionPeer(any(), any())).thenReturn(success());
-    when(regionHandler.submitAddRegionPeerTask(anyLong(), any(), any(), any()))
-        .thenReturn(success());
-    when(regionHandler.submitRemoveRegionPeerTask(anyLong(), any(), any(), any()))
+    AtomicLong migrationId = new AtomicLong(-1);
+    when(regionHandler.submitAddRegionPeerTask(
+            anyLong(), eq(toDataNodeLocation), eq(consensusGroupId), eq(runningNode), anyLong()))
         .thenAnswer(
             call -> {
+              migrationId.set(call.getArgument(4));
+              return success();
+            });
+    when(regionHandler.submitRemoveRegionPeerTask(
+            anyLong(), eq(runningNode), eq(consensusGroupId), eq(toDataNodeLocation), anyLong()))
+        .thenAnswer(
+            call -> {
+              Assert.assertEquals(migrationId.get(), (long) call.<Long>getArgument(4));
               removalTargets.forEach(
                   node ->
                       Assert.assertEquals(
                           NodeStatus.Removing, currentStatuses.get(node.getDataNodeId())));
               return success();
             });
-    when(regionHandler.submitDeleteOldRegionPeerTask(anyLong(), any(), any()))
-        .thenReturn(success());
-    TRegionMigrateResult taskSuccess = new TRegionMigrateResult(TRegionMaintainTaskStatus.SUCCESS);
-    when(regionHandler.waitTaskFinish(anyLong(), any())).thenReturn(taskSuccess);
-    when(regionHandler.waitTaskFinish(anyLong(), any(), any())).thenReturn(taskSuccess);
+    when(regionHandler.submitDeleteOldRegionPeerTask(
+            anyLong(), eq(runningNode), eq(consensusGroupId), anyLong()))
+        .thenAnswer(
+            call -> {
+              Assert.assertEquals(migrationId.get(), (long) call.<Long>getArgument(3));
+              return success();
+            });
+    when(regionHandler.waitTaskFinish(anyLong(), any(), any()))
+        .thenAnswer(
+            call ->
+                new TRegionMigrateResult(TRegionMaintainTaskStatus.SUCCESS)
+                    .setVerifiedMigrationId(migrationId.get()));
     when(regionHandler.isIoTConsensusV1DataRegion(consensusGroupId)).thenReturn(true);
     when(regionHandler.removeRegionLocation(consensusGroupId, runningNode))
         .thenAnswer(
@@ -297,6 +313,7 @@ public class RemoveDataNodesProcedureTest {
     when(env.getNodeLock()).thenReturn(new LockQueue());
     RecordingProcedureStore store = new RecordingProcedureStore();
     ProcedureExecutor<ConfigNodeProcedureEnv> executor = new ProcedureExecutor<>(env, store);
+    when(configManager.getProcedureManager().getExecutor()).thenReturn(executor);
     when(env.getScheduler()).thenReturn(executor.getScheduler());
     store.start();
     executor.init(1);

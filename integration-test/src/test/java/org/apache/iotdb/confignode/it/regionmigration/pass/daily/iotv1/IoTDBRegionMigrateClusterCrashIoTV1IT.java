@@ -19,6 +19,7 @@
 
 package org.apache.iotdb.confignode.it.regionmigration.pass.daily.iotv1;
 
+import org.apache.iotdb.commons.utils.KillPoint.KillNode;
 import org.apache.iotdb.confignode.it.regionmigration.IoTDBRegionOperationReliabilityITFramework;
 import org.apache.iotdb.confignode.procedure.state.AddRegionPeerState;
 import org.apache.iotdb.confignode.procedure.state.RemoveRegionPeerState;
@@ -47,6 +48,20 @@ public class IoTDBRegionMigrateClusterCrashIoTV1IT
         .setDataRegionConsensusProtocolClass(ConsensusFactory.IOT_CONSENSUS);
   }
 
+  private void restartDuringMigration(Enum<?> step, RecoveryExpectation recovery) throws Exception {
+    generalTestWithAllOptions(
+        2,
+        3,
+        3,
+        3,
+        buildSet(step),
+        noKillPoints(),
+        actionOfRestartCluster,
+        false,
+        KillNode.ALL_NODES,
+        recovery);
+  }
+
   @Test
   public void clusterCrash1() throws Exception {
     killClusterTest(buildSet(AddRegionPeerState.CREATE_NEW_REGION_PEER), true);
@@ -54,22 +69,25 @@ public class IoTDBRegionMigrateClusterCrashIoTV1IT
 
   @Test
   public void clusterCrash2() throws Exception {
-    killClusterTest(buildSet(AddRegionPeerState.DO_ADD_REGION_PEER), false);
+    restartDuringMigration(AddRegionPeerState.DO_ADD_REGION_PEER, RecoveryExpectation.ADD_FAILED);
   }
 
   @Test
   public void clusterCrash3() throws Exception {
-    killClusterTest(buildSet(AddRegionPeerState.UPDATE_REGION_LOCATION_CACHE), true);
+    restartDuringMigration(
+        AddRegionPeerState.UPDATE_REGION_LOCATION_CACHE, RecoveryExpectation.RETAIN_DESTINATION);
   }
 
   @Test
   public void clusterCrash4() throws Exception {
-    killClusterTest(buildSet(RemoveRegionPeerState.TRANSFER_REGION_LEADER), true);
+    restartDuringMigration(
+        RemoveRegionPeerState.TRANSFER_REGION_LEADER, RecoveryExpectation.RETAIN_DESTINATION);
   }
 
   @Test
   public void clusterCrash6() throws Exception {
-    killClusterTest(buildSet(RemoveRegionPeerState.REMOVE_REGION_PEER), true);
+    restartDuringMigration(
+        RemoveRegionPeerState.REMOVE_REGION_PEER, RecoveryExpectation.RESOLVE_REMOVE);
   }
 
   // TODO: @Yongzao Dan, reopen this CI after discussion with @HxpSerein

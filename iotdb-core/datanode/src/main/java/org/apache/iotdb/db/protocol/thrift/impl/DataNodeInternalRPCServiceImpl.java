@@ -108,6 +108,7 @@ import org.apache.iotdb.consensus.common.Peer;
 import org.apache.iotdb.consensus.exception.ConsensusException;
 import org.apache.iotdb.consensus.exception.ConsensusGroupAlreadyExistException;
 import org.apache.iotdb.consensus.exception.ConsensusGroupNotExistException;
+import org.apache.iotdb.consensus.iot.IoTConsensus;
 import org.apache.iotdb.db.audit.DNAuditLogger;
 import org.apache.iotdb.db.auth.AuthorityChecker;
 import org.apache.iotdb.db.auth.LoginLockManager;
@@ -3233,6 +3234,15 @@ public class DataNodeInternalRPCServiceImpl implements IDataNodeRPCService.Iface
                         location.getDataNodeId(),
                         getConsensusEndPoint(location, regionId)))
             .collect(Collectors.toList());
+    if (regionId instanceof DataRegionId
+        && DataRegionConsensusImpl.getInstance() instanceof IoTConsensus) {
+      try {
+        ((IoTConsensus) DataRegionConsensusImpl.getInstance())
+            .checkMigrationPeerBeforeCreate(regionId);
+      } catch (ConsensusException e) {
+        return RpcUtils.getStatus(TSStatusCode.CREATE_REGION_ERROR, e.getMessage());
+      }
+    }
     TSStatus status = createNewRegion(regionId, req.getStorageGroup());
     if (!isSucceed(status)) {
       return status;
@@ -3284,6 +3294,24 @@ public class DataNodeInternalRPCServiceImpl implements IDataNodeRPCService.Iface
     status.setCode(TSStatusCode.MIGRATE_REGION_ERROR.getStatusCode());
     status.setMessage(DataNodeMiscMessages.SUBMIT_REMOVE_REGION_PEER_TASK_FAILED_REGION + regionId);
     return status;
+  }
+
+  @Override
+  public boolean isRegionMigrationConfirmed(
+      TConsensusGroupId regionId, int sourceNodeId, long migrationId) {
+    return waitForConsensusStarted() == null
+        && RegionMigrateService.getInstance()
+            .isRegionMigrationConfirmed(regionId, sourceNodeId, migrationId);
+  }
+
+  @Override
+  public TSStatus rollbackRegionMigration(
+      TConsensusGroupId regionId, int otherNodeId, long migrationId, boolean isSource) {
+    TSStatus status = waitForConsensusStarted();
+    return status != null
+        ? status
+        : RegionMigrateService.getInstance()
+            .rollbackRegionMigration(regionId, otherNodeId, migrationId, isSource);
   }
 
   @Override

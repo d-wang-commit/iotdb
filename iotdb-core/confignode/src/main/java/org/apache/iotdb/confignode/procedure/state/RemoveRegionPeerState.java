@@ -27,4 +27,6 @@ public enum RemoveRegionPeerState {
   DROP_CONSENSUS_PIPES,
   // Reconcile retained DataRegion replicas after removal, only for IoTConsensus V1.
   RESET_IOT_CONSENSUS_V1_PEER_LIST,
+  // CN selected the source before authorizing any physical deletion.
+  ROLLBACK_MIGRATION_TO_SOURCE,
 }

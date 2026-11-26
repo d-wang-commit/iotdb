@@ -20,6 +20,15 @@
 package org.apache.iotdb.confignode.i18n;
 
 public final class ProcedureMessages {
+  public static final String EXCEPTION_MIGRATION_ARG_FOR_ARG_IS_ROLLING_BACK_TO_SOURCE_DATANODE_ARG_AND_WITHDRAWING_TARGET_DATANODE_ARG_B268D9F8 = "Migration %s for %s is rolling back to source DataNode %s and withdrawing target DataNode %s.";
+  public static final String EXCEPTION_COULD_NOT_RESTORE_THE_PEER_LIST_FOR_ARG_DURING_MIGRATION_ARG_ROLLBACK_EC18FB08 = "Could not restore the peer list for %s during migration %s rollback.";
+  public static final String LOG_COULD_NOT_READ_THE_CONFIRMATION_FOR_MIGRATION_ARG_OF_ARG_ON_DATANODE_ARG_KEEPING_THE_SOURCE_BFD756EB = "Could not read the confirmation for migration {} of {} on DataNode {}. Keeping the source.";
+  public static final String LOG_MIGRATION_ARG_CONFIRMED_ARG_ON_DATANODE_ARG_VERIFY_CLEANUP_ON_SOURCE_DATANODE_ARG_BEFORE_REUSE_ARG_FE89210A = "Migration {} confirmed {} on DataNode {}. Verify cleanup on source DataNode {} before reuse. {}";
+  public static final String EXCEPTION_MIGRATION_ARG_FOR_ARG_COULD_NOT_VERIFY_ARG_ARG_AAF21262 = "Migration %s for %s could not verify %s: %s";
+  public static final String EXCEPTION_CANNOT_MIGRATE_ARG_FROM_OFFLINE_DATANODE_ARG_93E90367 = "Cannot migrate %s from offline DataNode %s";
+  public static final String EXCEPTION_CANNOT_CONTINUE_LEGACY_MIGRATION_OF_ARG_WITHOUT_A_VERIFIED_HANDOFF_34FDA439 = "Cannot continue legacy migration of %s without a verified handoff";
+  public static final String EXCEPTION_MIGRATION_ARG_FAILED_ITS_MEMBERSHIP_CHECK_FOR_ARG_AT_ARG_33CF2029 = "Migration %s failed its membership check for %s at %s";
+
 
   public static final String NEVER_FINISH_PROCEDURE_RAN_AGAIN =
       "AddNeverFinishSubProcedureProcedure run again, which should never happen";

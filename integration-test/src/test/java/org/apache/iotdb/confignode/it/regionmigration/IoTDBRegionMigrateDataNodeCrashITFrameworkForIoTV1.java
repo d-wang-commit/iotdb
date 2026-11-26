@@ -25,6 +25,8 @@ import org.apache.iotdb.it.env.EnvFactory;
 
 import org.junit.Before;
 
+import java.util.function.Consumer;
+
 public class IoTDBRegionMigrateDataNodeCrashITFrameworkForIoTV1
     extends IoTDBRegionOperationReliabilityITFramework {
 
@@ -41,5 +43,22 @@ public class IoTDBRegionMigrateDataNodeCrashITFrameworkForIoTV1
   @SafeVarargs
   public final <T extends Enum<T>> void success(T... dataNodeKillPoints) throws Exception {
     successTest(1, 1, 1, 2, noKillPoints(), buildSet(dataNodeKillPoints), KillNode.ALL_NODES);
+  }
+
+  protected void rollbackAfterPeerCrash(Enum<?> killPoint, KillNode crashedNode) throws Exception {
+    recoverAfterPeerCrash(killPoint, crashedNode, RecoveryExpectation.RETAIN_DESTINATION);
+  }
+
+  protected void recoverAfterPeerCrash(
+      Enum<?> killPoint, KillNode crashedNode, RecoveryExpectation recovery) throws Exception {
+    Consumer<KillPointContext> action =
+        context -> {
+          actionOfKillNode.accept(context);
+          if (crashedNode == KillNode.ORIGINAL_DATANODE) {
+            context.getNodeWrapper().start();
+          }
+        };
+    generalTestWithAllOptions(
+        1, 3, 1, 3, noKillPoints(), buildSet(killPoint), action, false, crashedNode, recovery);
   }
 }

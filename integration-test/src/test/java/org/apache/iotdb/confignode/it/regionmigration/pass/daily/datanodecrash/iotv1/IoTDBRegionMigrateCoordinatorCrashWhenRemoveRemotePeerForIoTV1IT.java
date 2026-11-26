@@ -20,6 +20,7 @@
 package org.apache.iotdb.confignode.it.regionmigration.pass.daily.datanodecrash.iotv1;
 
 import org.apache.iotdb.commons.utils.KillPoint.IoTConsensusRemovePeerCoordinatorKillPoints;
+import org.apache.iotdb.commons.utils.KillPoint.KillNode;
 import org.apache.iotdb.confignode.it.regionmigration.IoTDBRegionMigrateDataNodeCrashITFrameworkForIoTV1;
 import org.apache.iotdb.it.framework.IoTDBTestRunner;
 import org.apache.iotdb.itbase.category.DailyIT;
@@ -35,22 +36,27 @@ public class IoTDBRegionMigrateCoordinatorCrashWhenRemoveRemotePeerForIoTV1IT
 
   @Test
   public void initCrash() throws Exception {
-    success(IoTConsensusRemovePeerCoordinatorKillPoints.INIT);
+    rollbackAfterPeerCrash(
+        IoTConsensusRemovePeerCoordinatorKillPoints.INIT, KillNode.DESTINATION_DATANODE);
   }
 
   @Test
-  public void crashAfterNotifyPeersToRemoveSyncLogChannel() throws Exception {
-    success(
-        IoTConsensusRemovePeerCoordinatorKillPoints.AFTER_NOTIFY_PEERS_TO_REMOVE_REPLICATE_CHANNEL);
+  public void crashAfterConfirmation() throws Exception {
+    rollbackAfterPeerCrash(
+        IoTConsensusRemovePeerCoordinatorKillPoints.AFTER_CONFIRMATION,
+        KillNode.DESTINATION_DATANODE);
   }
 
   @Test
   public void crashAfterInactivePeer() throws Exception {
-    success(IoTConsensusRemovePeerCoordinatorKillPoints.AFTER_INACTIVE_PEER);
+    rollbackAfterPeerCrash(
+        IoTConsensusRemovePeerCoordinatorKillPoints.AFTER_INACTIVE_PEER,
+        KillNode.DESTINATION_DATANODE);
   }
 
   @Test
   public void crashAfterFinish() throws Exception {
-    success(IoTConsensusRemovePeerCoordinatorKillPoints.FINISH);
+    rollbackAfterPeerCrash(
+        IoTConsensusRemovePeerCoordinatorKillPoints.FINISH, KillNode.DESTINATION_DATANODE);
   }
 }

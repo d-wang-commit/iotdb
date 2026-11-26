@@ -19,6 +19,10 @@
 
 package org.apache.iotdb.confignode.procedure;
 
+import org.apache.iotdb.common.rpc.thrift.TConsensusGroupId;
+import org.apache.iotdb.common.rpc.thrift.TConsensusGroupType;
+import org.apache.iotdb.common.rpc.thrift.TDataNodeLocation;
+import org.apache.iotdb.common.rpc.thrift.TEndPoint;
 import org.apache.iotdb.common.rpc.thrift.TSStatus;
 import org.apache.iotdb.commons.exception.IoTDBException;
 import org.apache.iotdb.commons.path.PartialPath;
@@ -28,6 +32,7 @@ import org.apache.iotdb.confignode.manager.ConfigManager;
 import org.apache.iotdb.confignode.manager.consensus.ConsensusManager;
 import org.apache.iotdb.confignode.persistence.ProcedureInfo;
 import org.apache.iotdb.confignode.procedure.env.ConfigNodeProcedureEnv;
+import org.apache.iotdb.confignode.procedure.impl.region.RemoveRegionPeerProcedure;
 import org.apache.iotdb.confignode.procedure.impl.schema.DeleteDatabaseProcedure;
 import org.apache.iotdb.confignode.procedure.impl.schema.DeleteTimeSeriesProcedure;
 import org.apache.iotdb.confignode.procedure.impl.schema.table.DropTableColumnProcedure;
@@ -49,6 +54,20 @@ import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
 
 public class ConfigProcedureStoreTest {
+
+  @Test
+  public void rejectedRemovePeerUpdatePreservesCommittedChildState() throws Exception {
+    TEndPoint endpoint = new TEndPoint("127.0.0.1", 6667);
+    TDataNodeLocation source =
+        new TDataNodeLocation(10, endpoint, endpoint, endpoint, endpoint, endpoint);
+    TDataNodeLocation target =
+        new TDataNodeLocation(9, endpoint, endpoint, endpoint, endpoint, endpoint);
+    Procedure<ConfigNodeProcedureEnv> remove =
+        new RemoveRegionPeerProcedure(
+            new TConsensusGroupId(TConsensusGroupType.DataRegion, 11), target, source);
+    remove.setParentProcId(123);
+    assertRejectedUpdatePreservesRecovery(remove, false);
+  }
 
   @Test
   public void testRejectedTreeDeletionUpdatePreservesRecoveryState() throws Exception {

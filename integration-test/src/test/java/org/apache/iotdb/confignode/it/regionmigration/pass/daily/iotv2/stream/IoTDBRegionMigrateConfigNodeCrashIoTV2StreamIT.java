@@ -20,7 +20,6 @@
 package org.apache.iotdb.confignode.it.regionmigration.pass.daily.iotv2.stream;
 
 import org.apache.iotdb.commons.utils.KillPoint.KillNode;
-import org.apache.iotdb.commons.utils.KillPoint.KillPoint;
 import org.apache.iotdb.commons.utils.KillPoint.RegionMaintainKillPoints;
 import org.apache.iotdb.confignode.it.regionmigration.IoTDBRegionOperationReliabilityITFramework;
 import org.apache.iotdb.confignode.procedure.state.AddRegionPeerState;
@@ -36,10 +35,6 @@ import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.experimental.categories.Category;
 import org.junit.runner.RunWith;
-
-import java.util.Arrays;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.stream.Collectors;
 
 @Category({DailyIT.class})
 @RunWith(IoTDBTestRunner.class)
@@ -180,17 +175,13 @@ public class IoTDBRegionMigrateConfigNodeCrashIoTV2StreamIT
 
   @Test
   public void cnCrashTest() throws Exception {
-    ConcurrentHashMap.KeySetView<String, Boolean> killConfigNodeKeywords = noKillPoints();
-    killConfigNodeKeywords.addAll(
-        Arrays.stream(AddRegionPeerState.values())
-            .map(KillPoint::enumToString)
-            .collect(Collectors.toList()));
-    killConfigNodeKeywords.addAll(
-        Arrays.stream(RemoveRegionPeerState.values())
-            // IoTConsensus V2 finishes removal before the V1-only reset state.
-            .filter(state -> state != RemoveRegionPeerState.RESET_IOT_CONSENSUS_V1_PEER_LIST)
-            .map(KillPoint::enumToString)
-            .collect(Collectors.toList()));
-    successTest(1, 1, 1, 2, killConfigNodeKeywords, noKillPoints(), KillNode.CONFIG_NODE);
+    successTest(
+        1,
+        1,
+        1,
+        2,
+        successfulMigrationKillPoints(RemoveRegionPeerState.DROP_CONSENSUS_PIPES),
+        noKillPoints(),
+        KillNode.CONFIG_NODE);
   }
 }

@@ -88,6 +88,53 @@ public class TestProcedureExecutor extends TestProcedureBase {
   }
 
   @Test
+  public void testDurableDecisionIsRetriedBeforeNextStep() throws InterruptedException {
+    AtomicInteger steps = new AtomicInteger();
+    AtomicInteger updates = new AtomicInteger();
+    AtomicInteger updatesSeenByNextStep = new AtomicInteger();
+    Procedure<TestProcEnv> decision =
+        new NoopProcedure() {
+          @Override
+          protected Procedure<TestProcEnv>[] execute(TestProcEnv env) {
+            if (steps.incrementAndGet() == 1) {
+              return new Procedure[] {this};
+            }
+            updatesSeenByNextStep.set(updates.get());
+            return null;
+          }
+
+          @Override
+          protected boolean requiresDurableState(TestProcEnv env) {
+            return steps.get() == 1;
+          }
+        };
+    NoopProcedureStore store =
+        new NoopProcedureStore() {
+          @Override
+          public void update(Procedure procedure) {
+            if (procedure == decision && steps.get() == 1 && updates.incrementAndGet() == 1) {
+              throw new IllegalStateException("Injected failure persisting the decision");
+            }
+          }
+        };
+    TestProcEnv localEnv = new TestProcEnv();
+    ProcedureExecutor<TestProcEnv> executor = new ProcedureExecutor<>(localEnv, store);
+    localEnv.setScheduler(executor.getScheduler());
+    store.start();
+    executor.init(1);
+    executor.startWorkers();
+    try {
+      long id = executor.submitProcedure(decision);
+      ProcedureTestUtil.waitForProcedure(executor, id);
+      Assert.assertEquals(2, updatesSeenByNextStep.get());
+    } finally {
+      executor.stop();
+      executor.join();
+      store.stop();
+    }
+  }
+
+  @Test
   public void testProcedureFailedDuringSubmissionIsRolledBack() throws InterruptedException {
     TestProcEnv localEnv = new TestProcEnv();
     FailOnFirstUpdateProcedureStore localStore = new FailOnFirstUpdateProcedureStore();

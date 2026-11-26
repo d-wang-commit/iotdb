@@ -51,6 +51,7 @@ struct TRegionMigrateResult {
   2: optional common.TSStatus migrateResult
   3: optional map<common.TDataNodeLocation, common.TRegionMigrateFailedType> failedNodeAndReason
   4: required common.TRegionMaintainTaskStatus taskStatus
+  5: optional i64 verifiedMigrationId
 }
 
 struct TNotifyRegionMigrationReq {
@@ -71,6 +72,7 @@ struct TMaintainPeerReq {
   1: required common.TConsensusGroupId regionId
   2: required common.TDataNodeLocation destNode
   3: required i64 taskId
+  4: optional i64 migrationId
 }
 
 struct TResetPeerListReq {
@@ -1078,6 +1080,11 @@ service IDataNodeRPCService {
    * Get the result of a region maintainance task
    */
   TRegionMigrateResult getRegionMaintainResult(i64 taskId)
+
+  bool isRegionMigrationConfirmed(1: common.TConsensusGroupId regionId, 2: i32 sourceNodeId, 3: i64 migrationId)
+
+  common.TSStatus rollbackRegionMigration(1: common.TConsensusGroupId regionId,
+      2: i32 otherNodeId, 3: i64 migrationId, 4: bool isSource)
 
     /**
      * Notify the DataNode of the beginning or ending the migration of the specified RegionGroup

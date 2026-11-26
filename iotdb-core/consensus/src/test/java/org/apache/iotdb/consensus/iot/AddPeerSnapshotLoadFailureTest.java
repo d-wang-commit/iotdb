@@ -21,15 +21,21 @@ package org.apache.iotdb.consensus.iot;
 
 import org.apache.iotdb.common.rpc.thrift.TConsensusGroupType;
 import org.apache.iotdb.common.rpc.thrift.TEndPoint;
+import org.apache.iotdb.common.rpc.thrift.TSStatus;
+import org.apache.iotdb.commons.audit.UserDataTransferAuditHandler;
 import org.apache.iotdb.commons.consensus.ConsensusGroupId;
 import org.apache.iotdb.commons.consensus.DataRegionId;
 import org.apache.iotdb.commons.exception.StartupException;
 import org.apache.iotdb.consensus.ConsensusFactory;
 import org.apache.iotdb.consensus.common.Peer;
+import org.apache.iotdb.consensus.common.request.IndexedConsensusRequest;
 import org.apache.iotdb.consensus.config.ConsensusConfig;
 import org.apache.iotdb.consensus.exception.ConsensusException;
+import org.apache.iotdb.consensus.iot.log.ConsensusReqReader;
 import org.apache.iotdb.consensus.iot.util.TestEntry;
 import org.apache.iotdb.consensus.iot.util.TestStateMachine;
+import org.apache.iotdb.rpc.RpcUtils;
+import org.apache.iotdb.rpc.TSStatusCode;
 
 import org.apache.ratis.util.FileUtils;
 import org.junit.After;
@@ -42,12 +48,24 @@ import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.ServerSocket;
-import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
 
 /**
  * Regression test for the snapshot-load-failure bug (a failed snapshot load on the AddPeer target
@@ -94,18 +112,23 @@ public class AddPeerSnapshotLoadFailureTest {
 
   private final List<IoTConsensus> servers = new ArrayList<>();
   private final List<ControllableStateMachine> stateMachines = new ArrayList<>();
+  private volatile UserDataTransferAuditHandler snapshotAudit = UserDataTransferAuditHandler.NO_OP;
 
   /**
-   * A {@link TestStateMachine} that takes a real (single-file) snapshot and whose snapshot load can
-   * be made to fail on demand. When not forced to fail, {@link #loadSnapshot} mirrors the real
-   * {@code SnapshotLoader} contract by reporting failure when the snapshot root does not exist —
-   * which is exactly what happens for the receive folders that never got a fragment of a snapshot
-   * in a multi-data-dir deployment.
+   * A {@link TestStateMachine} that takes a real snapshot and whose snapshot load can be made to
+   * fail on demand. When not forced to fail, {@link #loadSnapshot} mirrors the real {@code
+   * SnapshotLoader} contract by reporting failure when the snapshot root does not exist — which is
+   * exactly what happens for the receive folders that never got a fragment of a snapshot in a
+   * multi-data-dir deployment.
    */
   private static class ControllableStateMachine extends TestStateMachine {
     private volatile boolean failLoadSnapshot = false;
     private volatile boolean loadSnapshotInvoked = false;
     private volatile boolean emptySnapshot = false;
+    private boolean canFlushForMigration = true;
+    private boolean includeSecondFile;
+    private final CountDownLatch loading = new CountDownLatch(1);
+    private CountDownLatch continueLoad;
 
     void setFailLoadSnapshot(boolean failLoadSnapshot) {
       this.failLoadSnapshot = failLoadSnapshot;
@@ -122,12 +145,46 @@ public class AddPeerSnapshotLoadFailureTest {
     @Override
     public boolean loadSnapshot(File latestSnapshotRootDir) {
       loadSnapshotInvoked = true;
+      loading.countDown();
+      if (continueLoad != null) {
+        try {
+          if (!continueLoad.await(15, TimeUnit.SECONDS)) {
+            return false;
+          }
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          return false;
+        }
+      }
       if (failLoadSnapshot) {
         return false;
       }
       // Mirror SnapshotLoader: a receive folder that never received a fragment of this snapshot has
       // no snapshot root, so loading from it must report failure.
-      return latestSnapshotRootDir.exists();
+      if (!latestSnapshotRootDir.exists()) {
+        return false;
+      }
+      File data = new File(latestSnapshotRootDir, "snapshot.data");
+      if (data.exists()) {
+        try {
+          ByteBuffer entries = ByteBuffer.wrap(Files.readAllBytes(data.toPath()));
+          getRequestSet().clear();
+          while (entries.hasRemaining()) {
+            TestEntry entry = new TestEntry(entries.getInt(), Peer.deserialize(entries));
+            write(
+                new IndexedConsensusRequest(
+                    ConsensusReqReader.DEFAULT_SEARCH_INDEX, Collections.singletonList(entry)));
+          }
+        } catch (IOException e) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    @Override
+    public boolean flushForMigration() {
+      return canFlushForMigration;
     }
 
     @Override
@@ -137,12 +194,16 @@ public class AddPeerSnapshotLoadFailureTest {
         // materializes no snapshot under any receive folder, which must still load successfully.
         return true;
       }
-      // Write a real (single) snapshot file so the transfer actually moves data and the receiver
-      // materializes the snapshot under a subset of its receive folders.
-      try {
-        Files.write(
-            new File(snapshotDir, "snapshot.data").toPath(),
-            "snapshot".getBytes(StandardCharsets.UTF_8));
+      // Use a second small file when the test needs to pause between snapshot transfers.
+      try (OutputStream data =
+          Files.newOutputStream(new File(snapshotDir, "snapshot.data").toPath())) {
+        for (TestEntry entry : getData()) {
+          ByteBuffer bytes = entry.serializeToByteBuffer();
+          data.write(bytes.array(), bytes.arrayOffset() + bytes.position(), bytes.remaining());
+        }
+        if (includeSecondFile) {
+          Files.write(new File(snapshotDir, "second").toPath(), new byte[] {1});
+        }
         return true;
       } catch (IOException e) {
         return false;
@@ -191,25 +252,7 @@ public class AddPeerSnapshotLoadFailureTest {
     Assume.assumeTrue(checkPortAvailable());
     try {
       for (int i = 0; i < peers.size(); i++) {
-        int finalI = i;
-        servers.add(
-            (IoTConsensus)
-                ConsensusFactory.getConsensusImpl(
-                        ConsensusFactory.IOT_CONSENSUS,
-                        ConsensusConfig.newBuilder()
-                            .setThisNodeId(peers.get(i).getNodeId())
-                            .setThisNode(peers.get(i).getEndpoint())
-                            .setStorageDir(peersStorage.get(i).getAbsolutePath())
-                            .setRecvSnapshotDirs(peersRecvSnapshotDirs.get(i))
-                            .setConsensusGroupType(TConsensusGroupType.DataRegion)
-                            .build(),
-                        groupId -> stateMachines.get(finalI))
-                    .orElseThrow(
-                        () ->
-                            new IllegalArgumentException(
-                                String.format(
-                                    ConsensusFactory.CONSTRUCT_FAILED_MSG,
-                                    ConsensusFactory.IOT_CONSENSUS))));
+        servers.add(newServer(i));
       }
       for (int i = 0; i < peers.size(); i++) {
         servers.get(i).start();
@@ -223,6 +266,355 @@ public class AddPeerSnapshotLoadFailureTest {
         logger.error("Failed because", e);
         Assert.fail("Failed because " + e.getMessage());
       }
+    }
+  }
+
+  private IoTConsensus newServer(int node) {
+    return (IoTConsensus)
+        ConsensusFactory.getConsensusImpl(
+                ConsensusFactory.IOT_CONSENSUS,
+                ConsensusConfig.newBuilder()
+                    .setThisNodeId(peers.get(node).getNodeId())
+                    .setThisNode(peers.get(node).getEndpoint())
+                    .setStorageDir(peersStorage.get(node).getAbsolutePath())
+                    .setRecvSnapshotDirs(peersRecvSnapshotDirs.get(node))
+                    .setUserDataTransferAuditHandler(event -> snapshotAudit.onAttempt(event))
+                    .setUserDataTransferAuditClassifier((group, request) -> false)
+                    .setConsensusGroupType(TConsensusGroupType.DataRegion)
+                    .build(),
+                groupId -> stateMachines.get(node))
+            .orElseThrow(
+                () ->
+                    new IllegalArgumentException(
+                        String.format(
+                            ConsensusFactory.CONSTRUCT_FAILED_MSG,
+                            ConsensusFactory.IOT_CONSENSUS)));
+  }
+
+  @Test
+  public void singleReplicaAcceptsWritesBetweenSnapshotFragments() throws Exception {
+    Peer source = peers.get(0);
+    Peer target = peers.get(1);
+    long migrationId = 71;
+    IoTConsensus donor = servers.get(0);
+    IoTConsensus receiver = servers.get(1);
+    donor.createLocalPeer(gid, Collections.singletonList(source));
+    receiver.createLocalPeer(gid, peers);
+    TestEntry snapshotEntry = new TestEntry(1, source);
+    TestEntry tail = new TestEntry(2, source);
+    Assert.assertEquals(
+        TSStatusCode.SUCCESS_STATUS.getStatusCode(), donor.write(gid, snapshotEntry).getCode());
+
+    CountDownLatch fragmentSent = new CountDownLatch(1);
+    CountDownLatch resumeTransfer = new CountDownLatch(1);
+    snapshotAudit =
+        event -> {
+          fragmentSent.countDown();
+          try {
+            Assert.assertTrue(resumeTransfer.await(30, TimeUnit.SECONDS));
+          } catch (InterruptedException e) {
+            throw new AssertionError(e);
+          }
+        };
+    stateMachines.get(0).includeSecondFile = true;
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    try {
+      Future<?> add =
+          executor.submit(
+              () -> {
+                donor.addRemotePeerForMigration(gid, target, migrationId);
+                return null;
+              });
+      Assert.assertTrue(fragmentSent.await(30, TimeUnit.SECONDS));
+      // One fragment has arrived, the next has not been sent. The only original replica writes.
+      Assert.assertFalse(stateMachines.get(1).isLoadSnapshotInvoked());
+      Assert.assertEquals(
+          TSStatusCode.SUCCESS_STATUS.getStatusCode(), donor.write(gid, tail).getCode());
+      resumeTransfer.countDown();
+      add.get(30, TimeUnit.SECONDS);
+      File receipt = new File(receiver.getImpl(gid).getStorageDir(), "migration.target");
+      Assert.assertTrue(receipt.isFile());
+      receiver.removeRemotePeerForMigration(gid, source, migrationId);
+      Assert.assertTrue(receipt.isFile());
+      Assert.assertTrue(receiver.isRegionMigrationConfirmed(gid, source.getNodeId(), migrationId));
+      Assert.assertFalse(donor.getImpl(gid).isActive());
+      donor.deleteLocalPeerForMigration(gid, migrationId, () -> RpcUtils.SUCCESS_STATUS);
+      Assert.assertEquals(
+          new HashSet<>(Arrays.asList(snapshotEntry, tail)), stateMachines.get(1).getData());
+    } finally {
+      resumeTransfer.countDown();
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  public void failedTargetFlushCanBeRolledBackAfterTargetRestart() throws Exception {
+    Peer source = peers.get(0);
+    Peer target = peers.get(1);
+    long migrationId = 26;
+    IoTConsensus donor = servers.get(0);
+    IoTConsensus receiver = servers.get(1);
+    donor.createLocalPeer(gid, Collections.singletonList(source));
+    receiver.createLocalPeer(gid, peers);
+    donor.addRemotePeerForMigration(gid, target, migrationId);
+    stateMachines.get(1).canFlushForMigration = false;
+    Assert.assertThrows(
+        ConsensusException.class,
+        () -> receiver.removeRemotePeerForMigration(gid, source, migrationId));
+    Assert.assertTrue(donor.getImpl(gid).hasMigrationFence(migrationId));
+
+    receiver.stop();
+    // The source can reopen even though the target is down.
+    donor.rollbackRegionMigration(gid, target.getNodeId(), migrationId, true);
+    TestEntry next = new TestEntry(51, source);
+    Assert.assertEquals(
+        TSStatusCode.SUCCESS_STATUS.getStatusCode(), donor.write(gid, next).getCode());
+    IoTConsensus restarted = newServer(1);
+    servers.set(1, restarted);
+    restarted.recordCorrectPeerListBeforeStarting(Collections.singletonMap(gid, peers));
+    restarted.start();
+    Assert.assertFalse(restarted.isRegionMigrationConfirmed(gid, source.getNodeId(), migrationId));
+    restarted.rollbackRegionMigration(gid, source.getNodeId(), migrationId, false);
+    restarted.rollbackRegionMigration(gid, source.getNodeId(), migrationId, false);
+    Assert.assertThrows(ConsensusException.class, () -> restarted.read(gid, next));
+    Assert.assertEquals(
+        TSStatusCode.WRITE_PROCESS_REJECT.getStatusCode(), restarted.write(gid, next).getCode());
+    Assert.assertThrows(
+        ConsensusException.class,
+        () -> restarted.removeRemotePeerForMigration(gid, source, migrationId));
+    Assert.assertThrows(
+        ConsensusException.class,
+        () -> donor.deleteLocalPeerForMigration(gid, migrationId, () -> RpcUtils.SUCCESS_STATUS));
+    Assert.assertTrue(stateMachines.get(0).getData().contains(next));
+    Assert.assertThrows(ConsensusException.class, () -> restarted.addRemotePeer(gid, source));
+    restarted.resetPeerList(gid, Collections.singletonList(source));
+  }
+
+  @Test
+  public void restartedTargetWithoutConfirmationKeepsSourceWritable() throws Exception {
+    Peer source = peers.get(0);
+    IoTConsensus donor = servers.get(0);
+    donor.createLocalPeer(gid, Collections.singletonList(source));
+    servers.get(1).createLocalPeer(gid, peers);
+    long migrationId = 26;
+    donor.addRemotePeerForMigration(gid, peers.get(1), migrationId);
+    servers.get(1).stop();
+    IoTConsensus restarted = newServer(1);
+    servers.set(1, restarted);
+    restarted.recordCorrectPeerListBeforeStarting(Collections.singletonMap(gid, peers));
+    restarted.start();
+
+    Assert.assertThrows(
+        ConsensusException.class,
+        () -> restarted.removeRemotePeerForMigration(gid, source, migrationId));
+    Assert.assertFalse(donor.getImpl(gid).hasMigrationFence(migrationId));
+    Assert.assertEquals(
+        TSStatusCode.SUCCESS_STATUS.getStatusCode(),
+        donor.write(gid, new TestEntry(45, source)).getCode());
+    // CN withdrew the target while it was offline; no target-side cancellation was delivered.
+    restarted.stop();
+    donor.rollbackRegionMigration(gid, peers.get(1).getNodeId(), migrationId, true);
+    IoTConsensus unlisted = newServer(1);
+    servers.set(1, unlisted);
+    unlisted.recordCorrectPeerListBeforeStarting(Collections.emptyMap());
+    unlisted.start();
+    Assert.assertNull(unlisted.getImpl(gid));
+    unlisted.rollbackRegionMigration(gid, source.getNodeId(), migrationId, false);
+    Assert.assertTrue(IoTConsensus.mustRetainMigrationPeer(peersStorage.get(1), gid));
+    Assert.assertThrows(ConsensusException.class, () -> unlisted.createLocalPeer(gid, peers));
+    unlisted.stop();
+    IoTConsensus relisted = newServer(1);
+    servers.set(1, relisted);
+    relisted.recordCorrectPeerListBeforeStarting(Collections.singletonMap(gid, peers));
+    relisted.start();
+    Assert.assertFalse(relisted.getImpl(gid).isActive());
+    Assert.assertThrows(ConsensusException.class, () -> relisted.createLocalPeer(gid, peers));
+  }
+
+  @Test
+  public void verifiedMigrationIncludesWriteDuringTargetSnapshotLoad() throws Exception {
+    Peer source = peers.get(0);
+    Peer destination = peers.get(1);
+    IoTConsensus donor = servers.get(0);
+    IoTConsensus receiver = servers.get(1);
+    donor.createLocalPeer(gid, peers.subList(0, 1));
+    receiver.createLocalPeer(gid, peers);
+    long migrationId = 24;
+    ControllableStateMachine target = stateMachines.get(1);
+    target.continueLoad = new CountDownLatch(1);
+    ExecutorService executor = Executors.newSingleThreadExecutor();
+    try {
+      Future<?> add =
+          executor.submit(
+              () -> {
+                donor.addRemotePeerForMigration(gid, destination, migrationId);
+                return null;
+              });
+      Assert.assertTrue(target.loading.await(10, TimeUnit.SECONDS));
+      TestEntry tail = new TestEntry(42, source);
+      Assert.assertEquals(
+          TSStatusCode.SUCCESS_STATUS.getStatusCode(), donor.write(gid, tail).getCode());
+      target.continueLoad.countDown();
+      add.get(30, TimeUnit.SECONDS);
+      donor.addRemotePeerForMigration(gid, destination, migrationId);
+      Assert.assertThrows(
+          ConsensusException.class,
+          () -> donor.addRemotePeerForMigration(gid, destination, migrationId + 1));
+
+      receiver.removeRemotePeerForMigration(gid, source, migrationId);
+      Assert.assertTrue(target.getData().contains(tail));
+      donor.addRemotePeerForMigration(gid, destination, migrationId);
+      Assert.assertEquals(
+          TSStatusCode.WRITE_PROCESS_REJECT.getStatusCode(),
+          donor.write(gid, new TestEntry(43, source)).getCode());
+      receiver.removeRemotePeerForMigration(gid, source, migrationId);
+      // A late Remove can confirm data, but it cannot cut the channel to the source while CN
+      // is still deciding whether to use that confirmation.
+      Assert.assertTrue(receiver.getImpl(gid).getConfiguration().contains(source));
+      Assert.assertTrue(receiver.isRegionMigrationConfirmed(gid, source.getNodeId(), migrationId));
+      donor.rollbackRegionMigration(gid, destination.getNodeId(), migrationId, true);
+      receiver.rollbackRegionMigration(gid, source.getNodeId(), migrationId, false);
+      Assert.assertFalse(receiver.isRegionMigrationConfirmed(gid, source.getNodeId(), migrationId));
+      Assert.assertThrows(
+          ConsensusException.class,
+          () -> donor.deleteLocalPeerForMigration(gid, migrationId, () -> RpcUtils.SUCCESS_STATUS));
+      Assert.assertTrue(donor.getImpl(gid).isActive());
+    } finally {
+      target.continueLoad.countDown();
+      executor.shutdownNow();
+    }
+  }
+
+  @Test
+  public void delayedDeleteCannotRemoveARecreatedPeer() throws Exception {
+    IoTConsensus donor = servers.get(0);
+    donor.createLocalPeer(gid, peers);
+    IoTConsensusServerImpl old = donor.getImpl(gid);
+    int target = peers.get(1).getNodeId();
+    long migration = 71;
+    old.prepareMigration(migration, target);
+    old.freezeForMigration(migration, target);
+    AtomicInteger removalNotifications = new AtomicInteger();
+    Consumer<ConsensusGroupId> previous = IoTConsensus.onPeerRemoved;
+    IoTConsensus.onPeerRemoved = group -> removalNotifications.incrementAndGet();
+    FutureTask<TSStatus> delayed =
+        new FutureTask<>(
+            () ->
+                donor.deleteLocalPeerForMigration(
+                    gid,
+                    migration,
+                    () -> {
+                      throw new AssertionError("Deleted the replacement's storage");
+                    }));
+    Thread deletingThread = new Thread(delayed);
+    try {
+      IoTConsensusServerImpl replacement;
+      synchronized (old) {
+        deletingThread.start();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (deletingThread.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) {
+          TimeUnit.MILLISECONDS.sleep(1);
+        }
+        Assert.assertEquals(Thread.State.BLOCKED, deletingThread.getState());
+        donor.deleteLocalPeer(gid);
+        donor.createLocalPeer(gid, peers);
+        replacement = donor.getImpl(gid);
+        Assert.assertNotSame(old, replacement);
+        // The old object reads its fence by pathname. Make even that check match the new peer.
+        replacement.prepareMigration(migration, target);
+        replacement.freezeForMigration(migration, target);
+      }
+      ExecutionException rejected =
+          Assert.assertThrows(ExecutionException.class, () -> delayed.get(10, TimeUnit.SECONDS));
+      Assert.assertTrue(rejected.getCause() instanceof ConsensusException);
+      Assert.assertSame(replacement, donor.getImpl(gid));
+      Assert.assertTrue(replacement.hasMigrationFence(migration));
+      Assert.assertEquals(1, removalNotifications.get());
+    } finally {
+      delayed.cancel(true);
+      deletingThread.join(TimeUnit.SECONDS.toMillis(10));
+      IoTConsensus.onPeerRemoved = previous;
+    }
+  }
+
+  @Test
+  public void failedSourceStorageCleanupBlocksReuseAcrossRestart() throws Exception {
+    Peer source = peers.get(0);
+    Peer target = peers.get(1);
+    IoTConsensus donor = servers.get(0);
+    donor.createLocalPeer(gid, Collections.singletonList(source));
+    servers.get(1).createLocalPeer(gid, peers);
+    donor.addRemotePeerForMigration(gid, target, 71);
+    servers.get(1).removeRemotePeerForMigration(gid, source, 71);
+    CountDownLatch deleting = new CountDownLatch(1);
+    CountDownLatch finishDelete = new CountDownLatch(1);
+    ExecutorService worker = Executors.newSingleThreadExecutor();
+    try {
+      Future<TSStatus> cleanup =
+          worker.submit(
+              () ->
+                  donor.deleteLocalPeerForMigration(
+                      gid,
+                      71,
+                      () -> {
+                        deleting.countDown();
+                        try {
+                          Assert.assertTrue(finishDelete.await(10, TimeUnit.SECONDS));
+                        } catch (InterruptedException e) {
+                          throw new AssertionError(e);
+                        }
+                        return new TSStatus(TSStatusCode.DELETE_REGION_ERROR.getStatusCode());
+                      }));
+      Assert.assertTrue(deleting.await(10, TimeUnit.SECONDS));
+      Assert.assertThrows(
+          ConsensusException.class, () -> donor.checkMigrationPeerBeforeCreate(gid));
+      finishDelete.countDown();
+      Assert.assertEquals(
+          TSStatusCode.DELETE_REGION_ERROR.getStatusCode(),
+          cleanup.get(10, TimeUnit.SECONDS).getCode());
+    } finally {
+      finishDelete.countDown();
+      worker.shutdownNow();
+    }
+    Assert.assertNull(donor.getImpl(gid));
+    Assert.assertThrows(ConsensusException.class, () -> donor.createLocalPeer(gid, peers));
+    donor.stop();
+    IoTConsensus restarted = newServer(0);
+    servers.set(0, restarted);
+    restarted.recordCorrectPeerListBeforeStarting(Collections.emptyMap());
+    restarted.start();
+    Assert.assertNull(restarted.getImpl(gid));
+    Assert.assertThrows(ConsensusException.class, () -> restarted.createLocalPeer(gid, peers));
+    Assert.assertTrue(
+        new File(IoTConsensus.buildPeerDir(peersStorage.get(0), gid), "migration.source").isFile());
+  }
+
+  @Test
+  public void ordinaryExtendAndReconstructNeedNoMigrationFiles() throws Exception {
+    Peer source = peers.get(0);
+    Peer target = peers.get(1);
+    IoTConsensus donor = servers.get(0);
+    IoTConsensus receiver = servers.get(1);
+    donor.createLocalPeer(gid, Collections.singletonList(source));
+    receiver.createLocalPeer(gid, peers);
+    TestEntry row = new TestEntry(19, source);
+    Assert.assertEquals(
+        TSStatusCode.SUCCESS_STATUS.getStatusCode(), donor.write(gid, row).getCode());
+    donor.addRemotePeer(gid, target);
+    Assert.assertTrue(stateMachines.get(1).getData().contains(row));
+    donor.removeRemotePeer(gid, target);
+    receiver.deleteLocalPeer(gid);
+    TestEntry duringReconstruct = new TestEntry(20, source);
+    Assert.assertEquals(
+        TSStatusCode.SUCCESS_STATUS.getStatusCode(), donor.write(gid, duringReconstruct).getCode());
+    receiver.createLocalPeer(gid, peers);
+    donor.addRemotePeer(gid, target);
+    Assert.assertTrue(receiver.getImpl(gid).isActive());
+    Assert.assertTrue(stateMachines.get(1).getData().contains(row));
+    Assert.assertTrue(stateMachines.get(1).getData().contains(duringReconstruct));
+    for (IoTConsensus node : servers) {
+      Assert.assertFalse(new File(node.getImpl(gid).getStorageDir(), "migration.source").exists());
+      Assert.assertFalse(new File(node.getImpl(gid).getStorageDir(), "migration.target").exists());
     }
   }
 

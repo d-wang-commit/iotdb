@@ -20,6 +20,7 @@
 package org.apache.iotdb.confignode.it.regionmigration.pass.daily.datanodecrash.iotv1;
 
 import org.apache.iotdb.commons.utils.KillPoint.IoTConsensusInactivatePeerKillPoints;
+import org.apache.iotdb.commons.utils.KillPoint.KillNode;
 import org.apache.iotdb.confignode.it.regionmigration.IoTDBRegionMigrateDataNodeCrashITFrameworkForIoTV1;
 import org.apache.iotdb.it.framework.IoTDBTestRunner;
 import org.apache.iotdb.itbase.category.DailyIT;
@@ -34,11 +35,16 @@ public class IoTDBRegionMigrateOriginalCrashWhenRemoveRemotePeerForIoTV1IT
     extends IoTDBRegionMigrateDataNodeCrashITFrameworkForIoTV1 {
   @Test
   public void crashBeforeInactivate() throws Exception {
-    success(IoTConsensusInactivatePeerKillPoints.BEFORE_INACTIVATE);
+    rollbackAfterPeerCrash(
+        IoTConsensusInactivatePeerKillPoints.BEFORE_INACTIVATE, KillNode.ORIGINAL_DATANODE);
   }
 
   @Test
   public void crashAfterInactivate() throws Exception {
-    success(IoTConsensusInactivatePeerKillPoints.AFTER_INACTIVATE);
+    // The source has persisted its final index. A retry can return it after restart.
+    recoverAfterPeerCrash(
+        IoTConsensusInactivatePeerKillPoints.AFTER_INACTIVATE,
+        KillNode.ORIGINAL_DATANODE,
+        RecoveryExpectation.RESOLVE_REMOVE);
   }
 }

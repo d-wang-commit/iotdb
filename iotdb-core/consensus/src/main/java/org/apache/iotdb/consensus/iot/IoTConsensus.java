@@ -74,8 +74,10 @@ import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -88,14 +90,16 @@ import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 public class IoTConsensus implements IConsensus {
 
   private static final long READER_UPDATE_INTERVAL_IN_MINUTES = 3;
-  private final Logger logger = LoggerFactory.getLogger(IoTConsensus.class);
+  private static final Logger logger = LoggerFactory.getLogger(IoTConsensus.class);
 
   private final TEndPoint thisNode;
   private final int thisNodeId;
@@ -211,12 +215,21 @@ public class IoTConsensus implements IConsensus {
           ConsensusGroupId consensusGroupId =
               ConsensusGroupId.Factory.create(
                   Integer.parseInt(items[0]), Integer.parseInt(items[1]));
+          Peer local = new Peer(consensusGroupId, thisNodeId, thisNode);
+          if (correctPeerListBeforeStart != null
+              && !correctPeerListBeforeStart
+                  .getOrDefault(consensusGroupId, Collections.emptyList())
+                  .contains(local)
+              && mustRetainMigrationPeer(storageDir, consensusGroupId)) {
+            // Preserve failed source cleanup and rolled-back target data outside CN membership.
+            continue;
+          }
           IoTConsensusServerImpl consensus =
               new IoTConsensusServerImpl(
                   path.toString(),
                   recvSnapshotDirs,
                   recvFolderStrategyType,
-                  new Peer(consensusGroupId, thisNodeId, thisNode),
+                  local,
                   Collections.emptyList(),
                   registry.apply(consensusGroupId),
                   backgroundTaskService,
@@ -311,15 +324,18 @@ public class IoTConsensus implements IConsensus {
   @Override
   public DataSet read(ConsensusGroupId groupId, IConsensusRequest request)
       throws ConsensusException {
-    return Optional.ofNullable(stateMachineMap.get(groupId))
-        .orElseThrow(() -> new ConsensusGroupNotExistException(groupId))
-        .read(request);
+    IoTConsensusServerImpl impl =
+        Optional.ofNullable(stateMachineMap.get(groupId))
+            .orElseThrow(() -> new ConsensusGroupNotExistException(groupId));
+    checkServingReplica(groupId, impl);
+    return impl.read(request);
   }
 
   @SuppressWarnings("java:S2201")
   @Override
   public void createLocalPeer(ConsensusGroupId groupId, List<Peer> peers)
       throws ConsensusException {
+    checkMigrationPeerBeforeCreate(groupId);
     int consensusGroupSize = peers.size();
     if (consensusGroupSize == 0) {
       throw new IllegalPeerNumException(consensusGroupSize);
@@ -358,7 +374,7 @@ public class IoTConsensus implements IConsensus {
                             config,
                             userDataTransferAuditHandler,
                             userDataTransferAuditClassifier);
-                  } catch (DiskSpaceInsufficientException e) {
+                  } catch (DiskSpaceInsufficientException | IOException e) {
                     throw new RuntimeException(e);
                   }
                   impl.start();
@@ -379,6 +395,53 @@ public class IoTConsensus implements IConsensus {
       notifyPeerCreated(groupId, stateMachineMap.get(groupId));
     } finally {
       pendingPeerCreatedCallbacks.remove(groupId);
+    }
+  }
+
+  /** A retained replica must be reconciled before another operation reuses its storage. */
+  public void checkMigrationPeerBeforeCreate(ConsensusGroupId groupId) throws ConsensusException {
+    IoTConsensusServerImpl impl = stateMachineMap.get(groupId);
+    if (impl != null
+        ? impl.isMigrationFrozen() || impl.isUnavailableMigrationTarget()
+        : mustRetainMigrationPeer(storageDir, groupId)) {
+      throw new ConsensusException(
+          String.format(
+              IoTConsensusMessages
+                  .EXCEPTION_CANNOT_CREATE_A_PEER_FOR_ARG_WHILE_ITS_PREVIOUS_MIGRATION_REPLICA_AWAITS_CLEANUP_51B5EAEF,
+              groupId));
+    }
+  }
+
+  private static void checkServingReplica(ConsensusGroupId groupId, IoTConsensusServerImpl impl)
+      throws ConsensusGroupNotExistException {
+    if (impl.isUnavailableMigrationTarget()) {
+      throw unavailableTarget(groupId);
+    }
+  }
+
+  private static ConsensusGroupNotExistException unavailableTarget(ConsensusGroupId groupId) {
+    // Expose a retryable missing serving replica to reads using a stale route.
+    return new ConsensusGroupNotExistException(
+        String.format(
+            IoTConsensusMessages
+                .EXCEPTION_MIGRATION_TARGET_FOR_ARG_IS_UNAVAILABLE_WHILE_ITS_RETAINED_DATA_AWAITS_CLEANUP_88AD8F55,
+            groupId));
+  }
+
+  public static boolean mustRetainMigrationPeer(File consensusDir, ConsensusGroupId groupId) {
+    Path peerDirectory = new File(buildPeerDir(consensusDir, groupId)).toPath();
+    try {
+      MigrationSourceState source =
+          MigrationSourceState.load(peerDirectory.resolve("migration.source"));
+      return (source != null && source.finalIndex >= 0)
+          || new MigrationTargetProgress(peerDirectory.resolve("migration.target")).hasSnapshot();
+    } catch (IOException e) {
+      logger.error(
+          IoTConsensusMessages
+              .LOG_FAILED_TO_READ_OR_WRITE_MIGRATION_RECEIPT_FOR_REGION_ARG_24C67DE7,
+          groupId,
+          e);
+      return true;
     }
   }
 
@@ -404,8 +467,10 @@ public class IoTConsensus implements IConsensus {
 
   @Override
   public void deleteLocalPeer(ConsensusGroupId groupId) throws ConsensusException {
-    KillPoint.setKillPoint(IoTConsensusDeleteLocalPeerKillPoints.BEFORE_DELETE);
+    deleteLocalPeer(groupId, null, null);
+  }
 
+  private void notifyPeerRemoved(ConsensusGroupId groupId) {
     // Notify subscription system before stopping the peer, so that subscription queues can
     // properly unregister from the still-alive serverImpl.
     final Consumer<ConsensusGroupId> removeCallback = onPeerRemoved;
@@ -417,32 +482,119 @@ public class IoTConsensus implements IConsensus {
             IoTConsensusMessages.LOG_ONPEERREMOVED_CALLBACK_FAILED_GROUP_ARG_9B79CBAF, groupId, e);
       }
     }
+  }
 
-    AtomicBoolean exist = new AtomicBoolean(false);
+  private TSStatus deleteLocalPeer(
+      ConsensusGroupId groupId,
+      IoTConsensusServerImpl expectedSource,
+      Supplier<TSStatus> deleteStorage)
+      throws ConsensusException {
+    KillPoint.setKillPoint(IoTConsensusDeleteLocalPeerKillPoints.BEFORE_DELETE);
+    if (expectedSource == null) {
+      notifyPeerRemoved(groupId);
+    }
+    AtomicReference<TSStatus> cleanup = new AtomicReference<>();
     stateMachineMap.computeIfPresent(
         groupId,
         (k, v) -> {
-          exist.set(true);
+          if (expectedSource != null) {
+            // An ordinary Remove/Reconstruct may have replaced the source since its fence was read.
+            if (v != expectedSource) {
+              return v;
+            }
+            notifyPeerRemoved(groupId);
+            pendingPeerCreatedCallbacks.remove(groupId);
+          }
           v.stop();
+          cleanup.set(deleteStorage == null ? RpcUtils.SUCCESS_STATUS : deleteStorage.get());
+          // Keep the fence visible until storage has gone. A new peer must never open these
+          // files or be deleted by this source's delayed task.
+          if (deleteStorage != null
+              && cleanup.get().getCode() == TSStatusCode.SUCCESS_STATUS.getStatusCode()) {
+            cleanup.set(deleteFencedPeerDirectory(groupId));
+          }
           return null;
         });
-    if (!exist.get()) {
+    if (cleanup.get() == null) {
       throw new ConsensusGroupNotExistException(groupId);
     }
-    pendingPeerCreatedCallbacks.remove(groupId);
+    if (expectedSource == null) {
+      pendingPeerCreatedCallbacks.remove(groupId);
+      deleteLocalPeerDirectory(groupId);
+    }
+    KillPoint.setKillPoint(IoTConsensusDeleteLocalPeerKillPoints.AFTER_DELETE);
+    return cleanup.get();
+  }
+
+  private void deleteLocalPeerDirectory(ConsensusGroupId groupId) {
     FileUtils.deleteFileOrDirectoryWithRateLimiter(
         new File(buildPeerDir(storageDir, groupId)),
         RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
-    KillPoint.setKillPoint(IoTConsensusDeleteLocalPeerKillPoints.AFTER_DELETE);
+  }
+
+  private TSStatus deleteFencedPeerDirectory(ConsensusGroupId groupId) {
+    Path directory = new File(buildPeerDir(storageDir, groupId)).toPath();
+    Path fence = directory.resolve("migration.source");
+    try {
+      // The rate-limited remover logs individual failures. Check each entry before releasing
+      // the fence so a surviving checkpoint cannot be reused for a different replica.
+      try (DirectoryStream<Path> entries = Files.newDirectoryStream(directory)) {
+        for (Path entry : entries) {
+          if (!entry.equals(fence)) {
+            FileUtils.deleteFileOrDirectoryWithRateLimiter(
+                entry.toFile(), RegionMigrationFileRemoveRateLimiter.getInstance()::acquire);
+            if (!Files.notExists(entry, LinkOption.NOFOLLOW_LINKS)) {
+              throw new DirectoryNotEmptyException(directory.toString());
+            }
+          }
+        }
+      }
+      Files.delete(fence);
+      Files.delete(directory);
+      return RpcUtils.SUCCESS_STATUS;
+    } catch (IOException e) {
+      return RpcUtils.getStatus(TSStatusCode.MIGRATE_REGION_ERROR, e.toString());
+    }
   }
 
   @Override
   public void addRemotePeer(ConsensusGroupId groupId, Peer peer) throws ConsensusException {
+    addRemotePeer(groupId, peer, null);
+  }
+
+  public void addRemotePeerForMigration(ConsensusGroupId groupId, Peer peer, long migrationId)
+      throws ConsensusException {
+    addRemotePeer(groupId, peer, migrationId);
+  }
+
+  private void addRemotePeer(ConsensusGroupId groupId, Peer peer, Long migrationId)
+      throws ConsensusException {
     IoTConsensusServerImpl impl =
         Optional.ofNullable(stateMachineMap.get(groupId))
             .orElseThrow(() -> new ConsensusGroupNotExistException(groupId));
     synchronized (impl) {
+      checkServingReplica(groupId, impl);
+      if (migrationId != null) {
+        try {
+          impl.checkMigrationAddAllowed(migrationId, peer.getNodeId());
+        } catch (ConsensusGroupModifyPeerException e) {
+          throw new ConsensusException(e);
+        }
+      }
       if (impl.getConfiguration().contains(peer)) {
+        if (migrationId != null) {
+          // The same source lifetime remembers the completed Add. Across restarts only a
+          // durably frozen source can prove this migration's boundary.
+          if (impl.hasPreparedMigration(migrationId, peer.getNodeId())) {
+            return;
+          }
+          throw new ConsensusException(
+              String.format(
+                  IoTConsensusMessages
+                      .EXCEPTION_MIGRATION_ARG_CANNOT_VERIFY_THE_EXISTING_PEER_ARG_EA694D35,
+                  migrationId,
+                  peer));
+        }
         throw new PeerAlreadyInConsensusGroupException(groupId, peer);
       }
       try {
@@ -457,21 +609,29 @@ public class IoTConsensus implements IConsensus {
         // step 3: take snapshot
         logger.info(IoTConsensusMessages.START_TAKE_SNAPSHOT);
 
-        impl.takeSnapshot();
+        long snapshotIndex = -1;
+        if (migrationId == null) {
+          impl.takeSnapshot();
+        } else {
+          snapshotIndex = impl.takeMigrationSnapshot();
+        }
 
         // step 4: transit snapshot
         logger.info(IoTConsensusMessages.START_TRANSMIT_SNAPSHOT);
-        impl.transmitSnapshot(peer);
+        int fileCount = impl.transmitSnapshot(peer, migrationId != null);
 
         // step 5: let the new peer load snapshot
         logger.info(IoTConsensusMessages.TRIGGER_LOAD_SNAPSHOT);
-        impl.triggerSnapshotLoad(peer);
+        impl.triggerSnapshotLoad(peer, migrationId, snapshotIndex, fileCount);
         KillPoint.setKillPoint(DataNodeKillPoints.COORDINATOR_ADD_PEER_TRANSITION);
 
         // step 6: active new Peer
         logger.info(IoTConsensusMessages.ACTIVATE_NEW_PEER);
         impl.activePeer(peer);
         impl.waitNewPeerUntilSyncLogCompleted(peer);
+        if (migrationId != null) {
+          impl.prepareMigration(migrationId, peer.getNodeId());
+        }
 
         // step 7: notify remote peer to clean up transferred snapshot
         logger.info(IoTConsensusMessages.CLEANUP_REMOTE_SNAPSHOT);
@@ -483,14 +643,112 @@ public class IoTConsensus implements IConsensus {
         KillPoint.setKillPoint(DataNodeKillPoints.COORDINATOR_ADD_PEER_DONE);
 
       } catch (ConsensusGroupModifyPeerException e) {
-        logger.info(IoTConsensusMessages.ADD_REMOTE_PEER_FAILED_CLEANUP);
-        // try to clean up the sync log channel
-        impl.notifyPeersToRemoveSyncLogChannel(peer);
+        if (migrationId == null) {
+          logger.info(IoTConsensusMessages.ADD_REMOTE_PEER_FAILED_CLEANUP);
+          impl.notifyPeersToRemoveSyncLogChannel(peer);
+        }
         throw new ConsensusException(e);
       } finally {
         logger.info(IoTConsensusMessages.CLEANUP_LOCAL_SNAPSHOT);
         impl.cleanupLocalSnapshot();
       }
+    }
+  }
+
+  public void removeRemotePeerForMigration(ConsensusGroupId groupId, Peer source, long migrationId)
+      throws ConsensusException {
+    IoTConsensusServerImpl impl =
+        Optional.ofNullable(stateMachineMap.get(groupId))
+            .orElseThrow(() -> new ConsensusGroupNotExistException(groupId));
+    synchronized (impl) {
+      try {
+        KillPoint.setKillPoint(IoTConsensusRemovePeerCoordinatorKillPoints.INIT);
+        // A target that restarted before confirmation cannot certify its old in-memory prefix.
+        // Refuse locally while the source is still writable.
+        if (!impl.hasTargetMigrationBaseline(migrationId, source.getNodeId())) {
+          throw new ConsensusException(
+              String.format(
+                  IoTConsensusMessages
+                      .EXCEPTION_MIGRATION_ARG_CANNOT_VERIFY_THE_SNAPSHOT_ON_ARG_4FB0EEC8,
+                  migrationId,
+                  impl.getThisNode()));
+        }
+        long finalIndex = impl.freezeRemoteSource(source, migrationId);
+        KillPoint.setKillPoint(IoTConsensusRemovePeerCoordinatorKillPoints.AFTER_INACTIVE_PEER);
+        // Wait for the source dispatchers while all channels are still present. The destination's
+        // own durable confirmation below is required even on replay after a membership change.
+        impl.waitTargetPeerUntilSyncLogCompleted(source, true);
+        if (!impl.confirmMigrationCatchUp(migrationId, source.getNodeId(), finalIndex)) {
+          throw new ConsensusException(
+              String.format(
+                  IoTConsensusMessages
+                      .EXCEPTION_MIGRATION_ARG_CANNOT_VERIFY_SNAPSHOT_COVERAGE_THROUGH_INDEX_ARG_99DE0F71,
+                  migrationId,
+                  finalIndex));
+        }
+        // CN removes channels when it reconciles the final peer list. A late Remove must leave
+        // replication to the source intact if CN has already chosen to roll back.
+        KillPoint.setKillPoint(IoTConsensusRemovePeerCoordinatorKillPoints.AFTER_CONFIRMATION);
+        impl.waitReleaseAllRegionRelatedResource(source);
+        KillPoint.setKillPoint(IoTConsensusRemovePeerCoordinatorKillPoints.FINISH);
+      } catch (ConsensusGroupModifyPeerException e) {
+        throw new ConsensusException(e);
+      }
+    }
+  }
+
+  public boolean isRegionMigrationConfirmed(
+      ConsensusGroupId groupId, int sourceNodeId, long migrationId) {
+    IoTConsensusServerImpl impl = stateMachineMap.get(groupId);
+    return impl != null && impl.isMigrationConfirmed(migrationId, sourceNodeId);
+  }
+
+  public void rollbackRegionMigration(
+      ConsensusGroupId groupId, int otherNodeId, long migrationId, boolean isSource)
+      throws ConsensusException {
+    IoTConsensusServerImpl impl = stateMachineMap.get(groupId);
+    try {
+      if (isSource) {
+        if (impl == null) {
+          throw new ConsensusGroupNotExistException(groupId);
+        }
+        impl.rollbackMigration(migrationId, otherNodeId);
+      } else if (impl != null) {
+        impl.cancelMigrationTarget(migrationId, otherNodeId);
+      } else {
+        // An unlisted target stays on disk after restart. Persist its cancellation before
+        // acknowledging it, so even a later Create cannot reopen this replica as healthy.
+        MigrationTargetProgress retained =
+            new MigrationTargetProgress(
+                new File(buildPeerDir(storageDir, groupId), "migration.target").toPath());
+        if (retained.hasSnapshot()) {
+          retained.abort(migrationId, otherNodeId);
+        }
+      }
+    } catch (IOException | ConsensusGroupModifyPeerException e) {
+      throw new ConsensusException(e);
+    }
+  }
+
+  public TSStatus deleteLocalPeerForMigration(
+      ConsensusGroupId groupId, long migrationId, Supplier<TSStatus> deleteStorage)
+      throws ConsensusException {
+    IoTConsensusServerImpl impl =
+        Optional.ofNullable(stateMachineMap.get(groupId))
+            .orElseThrow(() -> new ConsensusGroupNotExistException(groupId));
+    synchronized (impl) {
+      try {
+        if (!impl.hasMigrationFence(migrationId)) {
+          throw new ConsensusException(
+              String.format(
+                  IoTConsensusMessages
+                      .EXCEPTION_SOURCE_MIGRATION_FENCE_DOES_NOT_MATCH_MIGRATION_ARG_5AE240E7,
+                  migrationId));
+        }
+      } catch (IOException e) {
+        throw new ConsensusException(e);
+      }
+      return deleteLocalPeer(groupId, impl, deleteStorage);
     }
   }
 
@@ -539,7 +797,9 @@ public class IoTConsensus implements IConsensus {
         Optional.ofNullable(stateMachineMap.get(groupId))
             .orElseThrow(() -> new ConsensusGroupNotExistException(groupId));
     try {
-      impl.takeSnapshot();
+      synchronized (impl) {
+        impl.takeSnapshot();
+      }
     } catch (ConsensusGroupModifyPeerException e) {
       throw new ConsensusException(e.getMessage());
     }
@@ -621,6 +881,11 @@ public class IoTConsensus implements IConsensus {
 
     Peer localPeer = new Peer(groupId, thisNodeId, thisNode);
     if (!correctPeers.contains(localPeer)) {
+      if (impl.isMigrationFrozen() || impl.isUnavailableMigrationTarget()) {
+        // Resetting membership does not clean Region storage. Only its matching Delete may
+        // discard the fence.
+        return;
+      }
       logger.info(ConsensusMessages.RESET_PEER_LIST_NOT_IN_CORRECT, groupId);
       deleteLocalPeer(groupId);
       return;

@@ -108,6 +108,11 @@ public abstract class Procedure<Env> implements Comparable<Procedure<Env>> {
     return true;
   }
 
+  /** Whether the current step must be committed before the executor can advance. */
+  protected boolean requiresDurableState(Env env) {
+    return false;
+  }
+
   /**
    * Drops the bookkeeping of the states this procedure has executed. The persisted stack indexes
    * are what a recovered rollback rebuilds its stack from, so dropping them is what makes the

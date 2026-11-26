@@ -53,7 +53,7 @@ import static org.apache.iotdb.confignode.procedure.env.RegionMaintainHandler.si
 import static org.apache.iotdb.confignode.procedure.state.AddRegionPeerState.UPDATE_REGION_LOCATION_CACHE;
 import static org.apache.iotdb.rpc.TSStatusCode.SUCCESS_STATUS;
 
-public class AddRegionPeerProcedure extends RegionOperationProcedure<AddRegionPeerState> {
+public class AddRegionPeerProcedure extends RegionPeerProcedure<AddRegionPeerState> {
   private static final Logger LOGGER = LoggerFactory.getLogger(AddRegionPeerProcedure.class);
   private static final int MAX_RESET_PEER_LIST_RETRY = 3;
   private static final long RESET_PEER_LIST_RETRY_INTERVAL_MS = 5_000;
@@ -76,11 +76,9 @@ public class AddRegionPeerProcedure extends RegionOperationProcedure<AddRegionPe
   }
 
   @Override
-  protected Flow executeFromState(ConfigNodeProcedureEnv env, AddRegionPeerState state)
+  protected Flow executePeerState(
+      ConfigNodeProcedureEnv env, AddRegionPeerState state, Long migrationId)
       throws InterruptedException {
-    if (regionId == null) {
-      return Flow.NO_MORE_STATE;
-    }
     RegionMaintainHandler handler = env.getRegionMaintainHandler();
     try {
       outerSwitch:
@@ -91,13 +89,26 @@ public class AddRegionPeerProcedure extends RegionOperationProcedure<AddRegionPe
               getProcId(),
               regionId,
               simplifiedLocation(targetDataNode));
-          handler.addRegionLocation(regionId, targetDataNode);
-          handler.forceUpdateRegionCache(regionId, targetDataNode, RegionStatus.Adding);
+          if (migrationId == null) {
+            registerAddingPeer(handler);
+          }
           TSStatus status = handler.createNewRegionPeer(regionId, targetDataNode);
           setKillPoint(state);
           if (status.getCode() != SUCCESS_STATUS.getStatusCode()) {
+            if (migrationId != null) {
+              setFailure(
+                  new ProcedureException(
+                      String.format(
+                          ProcedureMessages.EXCEPTION_ARG_RESULT_IS_ARG_03198AFB, state, status)));
+              return Flow.NO_MORE_STATE;
+            }
             return warnAndRollBackAndNoMoreState(
                 env, handler, ProcedureMessages.EXCEPTION_CREATE_NEW_REGION_PEER_FAIL_2FE4FBAA);
+          }
+          if (migrationId != null) {
+            // A target retained after rollback must not rejoin the replica set if Create rejects
+            // it.
+            registerAddingPeer(handler);
           }
           setNextState(AddRegionPeerState.CREATE_CONSENSUS_PIPES);
           break;
@@ -108,6 +119,17 @@ public class AddRegionPeerProcedure extends RegionOperationProcedure<AddRegionPe
           break;
         case DO_ADD_REGION_PEER:
           handler.forceUpdateRegionCache(regionId, targetDataNode, RegionStatus.Adding);
+          if (migrationId != null) {
+            return runVerifiedTask(
+                handler,
+                state,
+                UPDATE_REGION_LOCATION_CACHE,
+                coordinator,
+                () ->
+                    handler.submitAddRegionPeerTask(
+                        getProcId(), targetDataNode, regionId, coordinator, migrationId),
+                RegionMaintainKillPoints.WAIT_TASK_FINISH_POLLING);
+          }
           // Only submit the AddRegionPeerTask on the very first entry of this state. We must NOT
           // re-submit when:
           //   - the state was restored from disk after a leader change / ConfigNode reboot
@@ -189,27 +211,24 @@ public class AddRegionPeerProcedure extends RegionOperationProcedure<AddRegionPe
       }
     } catch (Exception e) {
       LOGGER.error(ProcedureMessages.PID_ADDREGION_STATE_FAILED, getProcId(), state, e);
+      if (migrationId != null) {
+        setFailure(new ProcedureException(e));
+      }
       return Flow.NO_MORE_STATE;
     }
     LOGGER.info(ProcedureMessages.PID_ADDREGION_STATE_COMPLETE, getProcId(), state);
     return Flow.HAS_MORE_STATE;
   }
 
-  private Flow warnAndRollBackAndNoMoreState(
-      ConfigNodeProcedureEnv env, RegionMaintainHandler handler, String reason)
-      throws ProcedureException {
-    return warnAndRollBackAndNoMoreState(env, handler, reason, null);
+  private void registerAddingPeer(RegionMaintainHandler handler) {
+    handler.addRegionLocation(regionId, targetDataNode);
+    handler.forceUpdateRegionCache(regionId, targetDataNode, RegionStatus.Adding);
   }
 
   private Flow warnAndRollBackAndNoMoreState(
-      ConfigNodeProcedureEnv env, RegionMaintainHandler handler, String reason, Exception e)
+      ConfigNodeProcedureEnv env, RegionMaintainHandler handler, String reason)
       throws ProcedureException {
-    if (e != null) {
-      LOGGER.warn(
-          ProcedureMessages.PID_ADDREGION_START_TO_ROLL_BACK_BECAUSE, getProcId(), reason, e);
-    } else {
-      LOGGER.warn(ProcedureMessages.PID_ADDREGION_START_TO_ROLL_BACK_BECAUSE, getProcId(), reason);
-    }
+    LOGGER.warn(ProcedureMessages.PID_ADDREGION_START_TO_ROLL_BACK_BECAUSE, getProcId(), reason);
     handler.removeRegionLocation(regionId, targetDataNode);
 
     List<TDataNodeLocation> correctDataNodeLocations =

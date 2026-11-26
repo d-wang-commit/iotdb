@@ -630,10 +630,10 @@ public class ProcedureExecutor<Env> {
   private void updateStoreOnExecution(
       RootProcedureStack rootProcStack, Procedure<Env> proc, Procedure<Env>[] subprocs)
       throws InterruptedException {
-    if (requiresDurableDeletionState(proc)) {
+    if (requiresDurableDeletionState(proc) || proc.requiresDurableState(environment)) {
       // In particular, persist RECREATE_DATABASES before recreating a database, and persist the
       // terminal state before admitting a conflicting task or exposing successful completion.
-      persistDeletionState(proc);
+      persistStateBeforeContinuing(proc);
       return;
     }
     if (subprocs != null && !proc.isFailed()) {
@@ -867,7 +867,7 @@ public class ProcedureExecutor<Env> {
       // recovered by a new leader leaves this procedure out. Endless retry since this step is not
       // idempotent.
       if (requiresDurableDeletionState(procedure)) {
-        persistDeletionState(procedure);
+        persistStateBeforeContinuing(procedure);
       } else {
         RetryUtils.executeWithEndlessBackoffRetry(
             () -> store.update(procedure),
@@ -948,7 +948,7 @@ public class ProcedureExecutor<Env> {
         procedure.setState(ProcedureState.ROLLEDBACK);
         procedure.updateMetricsOnFinish(getEnvironment(), procedure.elapsedTime(), false);
       }
-      persistDeletionState(procedure);
+      persistStateBeforeContinuing(procedure);
       return;
     }
     if (procedure.removeStackIndex()) {
@@ -1008,7 +1008,7 @@ public class ProcedureExecutor<Env> {
                 && !(procedure instanceof DropViewColumnProcedure)));
   }
 
-  private void persistDeletionState(Procedure<Env> procedure) throws InterruptedException {
+  private void persistStateBeforeContinuing(Procedure<Env> procedure) throws InterruptedException {
     long backoffMs = 100;
     while (isRunning() && store.isRunning()) {
       try {
@@ -1022,7 +1022,7 @@ public class ProcedureExecutor<Env> {
         backoffMs = Math.min(backoffMs * 2, 1000);
       }
     }
-    // Leave the last durable state for the next leader; do not clean up this root or its slot.
+    // Stop this worker before any effect of a state the next leader cannot recover.
     throw new InterruptedException();
   }
 
